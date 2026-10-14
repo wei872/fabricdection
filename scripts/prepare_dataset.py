@@ -168,24 +168,34 @@ def convert_boxes(boxes_px, tx0, ty0, tile, keep_ratio, frag_lo):
 # ---------------------------------------------------------------- 写出
 def save_tile(dst: Path, fabric: str, split: str, kind: str, name: str,
               img: np.ndarray, boxes: list, ignore: np.ndarray | None,
-              lists: dict, stats: dict) -> None:
-    """kind: normal|abnormal|synth；写图片/标签/掩膜并登记 split 清单。"""
-    idir = dst / kind / fabric / "images"
+              lists: dict, stats: dict, layout: str = "yolo") -> Path:
+    """kind: normal|abnormal|synth；写图片/标签/掩膜并登记 split 清单；返回图片路径。
+
+    layout="yolo"（最终数据集格式，与用户 source5 同构）：
+        dst/images/{split}/<name>.png + dst/labels/{split}/<name>.txt(仅有标注者)
+        + dst/ignore_masks/{split}/<name>.png(可选)；正常图=无标签 txt。
+    layout="internal"（旧内部布局）：dst/{kind}/{fabric}/{images,labels}。
+    """
+    if layout == "yolo":
+        idir, ldir, mdir = (dst / "images" / split, dst / "labels" / split,
+                            dst / "ignore_masks" / split)
+    else:
+        idir, ldir, mdir = (dst / kind / fabric / "images", dst / kind / fabric / "labels",
+                            dst / "ignore_masks" / fabric)
     idir.mkdir(parents=True, exist_ok=True)
     Image.fromarray(img).save(idir / name)
     lists[f"{split}_{kind}"].append(str((idir / name).resolve()))   # 绝对路径：ultralytics txt 清单要求
     if kind != "normal":
-        ldir = dst / kind / fabric / "labels"
         ldir.mkdir(parents=True, exist_ok=True)
         h, w = img.shape[:2]
         (ldir / name.replace(".png", ".txt")).write_text(
             "\n".join(f"{c} {(x0+x1)/2/w:.6f} {(y0+y1)/2/h:.6f} {(x1-x0)/w:.6f} {(y1-y0)/h:.6f}"
                       for c, x0, y0, x1, y1 in boxes))
     if ignore is not None and ignore.sum() > 0:
-        mdir = dst / "ignore_masks" / fabric
         mdir.mkdir(parents=True, exist_ok=True)
         Image.fromarray((ignore * 255).astype(np.uint8)).save(mdir / name)
     stats["tiles_" + kind] += 1
+    return idir / name
 
 
 # ---------------------------------------------------------------- 模式 A：YOLO 接入
@@ -289,15 +299,15 @@ def run_yolo_mode(args, dst: Path) -> None:
                     per_class[c]["imgs"].add(rec["i"])
                     if (x1 - x0) * (y1 - y0) >= args.large_area:
                         per_class[c]["large"] += 1
-                save_tile(dst, fabric, rec["split"], "abnormal", name, patch, kept,
-                          ign if ign.any() else None, lists, stats)
+                p = save_tile(dst, fabric, rec["split"], "abnormal", name, patch, kept,
+                              ign if ign.any() else None, lists, stats, args.layout)
                 if any((x1 - x0) * (y1 - y0) >= args.large_area for _, x0, y0, x1, y1 in kept):
-                    lists["calib_large"].append(str((dst / "abnormal" / fabric / "images" / name).resolve()))
+                    lists["calib_large"].append(str(p.resolve()))
             elif margin:
                 stats["skipped_margin"] += 1        # 缺陷近邻块：不入正常集（防污染）
             else:
                 save_tile(dst, fabric, rec["split"], "normal", name, patch, [],
-                          ign if ign.any() else None, lists, stats)
+                          ign if ign.any() else None, lists, stats, args.layout)
                 if ign.any():
                     stats["normal_with_ignore"] += 1
             stats["tiles_total"] += 1
@@ -325,7 +335,7 @@ def run_yolo_mode(args, dst: Path) -> None:
                           np.dstack([r.image.astype(np.uint8)] * 3),
                           [(CLS_ID[kind], (b[1]-b[3]/2)*1280, (b[2]-b[4]/2)*1280,
                             (b[1]+b[3]/2)*1280, (b[2]+b[4]/2)*1280) for b in r.boxes],
-                          None, lists, stats)
+                          None, lists, stats, args.layout)
                 per_class[c]["boxes"] += 1
 
     # ---- splits / 元数据 / ultralytics 入口 / 报告 ----
@@ -342,10 +352,14 @@ def run_yolo_mode(args, dst: Path) -> None:
     (splits / "calib_large.txt").write_text("\n".join(dict.fromkeys(lists["calib_large"])))
     (dst / "fabric_meta.yaml").write_text(yaml.safe_dump(
         {"global": {"note": "免登记；来源目录: " + str(root)}}, allow_unicode=True))
+    train_lists = [str((splits / "train_det.txt").resolve())]
+    val_lists = [str((splits / "val_det.txt").resolve())]
+    if args.layout == "yolo":      # 正常图作背景负样本进 S 训练/验证（控误报）
+        train_lists.append(str((splits / "train_normal.txt").resolve()))
+        val_lists.append(str((splits / "val_normal.txt").resolve()))
     (dst / "data_ultralytics.yaml").write_text(yaml.safe_dump({
         "path": str(dst.resolve()),
-        "train": [str((splits / "train_det.txt").resolve())],
-        "val": [str((splits / "val_det.txt").resolve())],
+        "train": train_lists, "val": val_lists,
         "nc": len(CLASSES), "names": {i: n for i, n in enumerate(CLASSES)}},
         allow_unicode=True))
     report = {"source": str(root), "src_classes": src_names,
@@ -448,7 +462,8 @@ def main() -> None:
         defs = {k: v for k, v in {
             "yolo": src.get("yolo_root"), "normal_dir": src.get("normal_dir"),
             "class_map": pr.get("class_map", "configs/class_map.yaml"),
-            "dst": pr.get("dst", "dataset_fabric"), "tile": pr.get("tile", 1280),
+            "dst": pr.get("dst", "dataset_fabric"), "layout": pr.get("layout", "yolo"),
+            "tile": pr.get("tile", 1280),
             "overlap": pr.get("overlap", 0.15), "keep_ratio": pr.get("keep_ratio", 0.6),
             "frag_lo": pr.get("frag_lo", 0.02), "large_area": pr.get("large_area", 2500.0),
             "min_per_class": pr.get("min_per_class", 50),
@@ -463,6 +478,8 @@ def main() -> None:
     ap.add_argument("--src", default=None, help="BMP 条带目录（模式 B）")
     ap.add_argument("--dst", default="dataset_fabric")
     ap.add_argument("--class-map", default="configs/class_map.yaml")
+    ap.add_argument("--layout", choices=["yolo", "internal"], default="yolo",
+                    help="最终数据集布局：yolo=images/{train,val}+labels/{train,val}（默认，与源同构）")
     ap.add_argument("--tile", type=int, default=1280)
     ap.add_argument("--overlap", type=float, default=0.15)
     ap.add_argument("--keep-ratio", type=float, default=0.6)

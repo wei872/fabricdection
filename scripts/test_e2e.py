@@ -57,6 +57,8 @@ def to_tensor(x: np.ndarray, size: int, dev: torch.device) -> torch.Tensor:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", default="data")
+    ap.add_argument("--images-list", default=None,
+                    help="图片清单 txt（绝对路径，如 splits/val_det.txt）：逐图直测，替代条带")
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--backbone", default="dinov3_vitsp16")
     ap.add_argument("--decoder", default="runs/ustream/ustream_decoder.pt")
@@ -111,20 +113,34 @@ def main() -> None:
         det = YOLO(args.det)
         print(f"[load] detector ← {args.det}")
 
-    ff = FlatFieldCorrector()
-    strips = sorted(Path(args.src).glob("*.bmp"))[: args.max_strips]
-    assert strips, f"no BMP under {args.src}"
+    # ---- 输入源：条带 BMP（产线形态）或 图片清单（最终数据集 val 直测） ----
+    groups: list[tuple[str, list]] = []
+    if args.images_list:
+        from types import SimpleNamespace
+        for ln in Path(args.images_list).read_text().splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            p = Path(ln)
+            arr = np.asarray(Image.open(p).convert("L")).astype(np.float32)
+            groups.append((p.stem, [SimpleNamespace(image=arr, x0=0, y0=0,
+                                                    fabric_id="global")]))
+    else:
+        ff = FlatFieldCorrector()
+        strips = sorted(Path(args.src).glob("*.bmp"))[: args.max_strips]
+        assert strips, f"no BMP under {args.src}"
+        for bmp in strips:
+            gray = np.asarray(Image.open(bmp).convert("L")).astype(np.float32)
+            ff.observe(gray)
+            groups.append((bmp.name, slice_tiles(ff.correct(gray), 1280,
+                                                 cfg["input"]["overlap"],
+                                                 roi=detect_fabric_roi(gray),
+                                                 fabric_id=bmp.stem[:7])))
     jl = open(out / "verdicts.jsonl", "w", encoding="utf-8")
     lat: dict[str, list[float]] = {}
-    tile_scale = 1280.0 / args.size                     # U 分支网格 → tile 局部坐标
 
-    for bmp in strips:
+    for gname, tiles in groups:
         t_strip = time.perf_counter()
-        gray = np.asarray(Image.open(bmp).convert("L")).astype(np.float32)
-        ff.observe(gray)
-        flat = ff.correct(gray)
-        tiles = slice_tiles(flat, 1280, cfg["input"]["overlap"],
-                            roi=detect_fabric_roi(flat), fabric_id=bmp.stem[:7])
         strip_verdicts: list[Verdict] = []
         for t in tiles:
             t_tile = time.perf_counter()
@@ -155,9 +171,10 @@ def main() -> None:
                               self_normalize(a_knn, bg_q))
             regions = extract_regions(a, tau_u=tau_u,
                                       min_area=cfg["fhead"]["min_anom_area"])
-            for r in regions:                                       # S 空间 → tile 局部 1280
-                r.x0, r.y0, r.x1, r.y1 = (r.x0 * tile_scale, r.y0 * tile_scale,
-                                          r.x1 * tile_scale, r.y1 * tile_scale)
+            sx = t.image.shape[1] / args.size                     # U 网格 → tile 原生坐标
+            sy = t.image.shape[0] / args.size
+            for r in regions:
+                r.x0, r.y0, r.x1, r.y1 = (r.x0 * sx, r.y0 * sy, r.x1 * sx, r.y1 * sy)
             tm["fusion_ms"] = (time.perf_counter() - t0) * 1000
 
             dets: list[DetBox] = []
@@ -183,28 +200,27 @@ def main() -> None:
             for k, v in tm.items():
                 lat.setdefault(k, []).append(v)
 
-            jl.write(json.dumps({"strip": bmp.name, "tile_xy": [t.x0, t.y0],
+            jl.write(json.dumps({"strip": gname, "tile_xy": [t.x0, t.y0],
                                  "peak_score": float(a.max()),
                                  "verdicts": [v.to_json() for v in vs],
                                  "timing_ms": {k: round(v, 2) for k, v in tm.items()}},
                                 ensure_ascii=False) + "\n")
 
             # ---- overlay（tile 局部坐标） ----
-            vis = np.asarray(Image.fromarray(
-                np.clip(t.image, 0, 255).astype(np.uint8)).resize((1280, 1280)))
+            vis = np.clip(t.image, 0, 255).astype(np.uint8)       # 原生尺寸 overlay
             pim = ImageDraw.Draw(pim_img := Image.fromarray(np.dstack([vis] * 3)))
             for v in vs:
                 x0, y0, x1, y1 = v.box
                 c = GRADE_COLOR[v.grade]
                 pim.rectangle([x0, y0, x1, y1], outline=c, width=3)
                 pim.text((x0 + 4, y0 + 4), f"{v.cls}:{v.conf:.2f}", fill=c)
-            pim_img.save(out / "overlay" / f"{bmp.stem}_t{t.x0}_{t.y0}.png")
+            pim_img.save(out / "overlay" / f"{gname}_t{t.x0}_{t.y0}.png")
 
         glob = [Verdict(box=tuple(v.evidence["global"]), cls=v.cls, conf=v.conf,
                         anomaly_score=v.anomaly_score, grade=v.grade,
                         evidence=v.evidence) for v in strip_verdicts]
         bg = FHead.stitch(glob, iou_th=cfg["fhead"]["cross_tile_iou"])
-        print(f"[{bmp.name}] tiles={len(tiles)} verdicts={len(strip_verdicts)} "
+        print(f"[{gname}] tiles={len(tiles)} verdicts={len(strip_verdicts)} "
               f"stitched={len(bg)} strip_wall_ms={(time.perf_counter()-t_strip)*1000:.0f}")
     jl.close()
 

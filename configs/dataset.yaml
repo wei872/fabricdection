@@ -9,6 +9,7 @@ source:
                               # 支持子目录 train/val；没有则自动从 train 正常图留置 val
 prepare:
   dst: dataset_fabric
+  layout: yolo                # 最终数据集=标准 YOLO 目录：images/{train,val}+labels/{train,val}
   class_map: configs/class_map.yaml
   tile: 1280
   overlap: 0.15

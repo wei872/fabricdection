@@ -42,21 +42,28 @@ def iou(a, b) -> float:
 
 
 def load_gt(root: Path) -> dict[str, np.ndarray]:
-    """strip stem → [K,5] cls,x1,y1,x2,y2（全局坐标：tile 偏移已含在文件名 _t{x}_{y}）。"""
+    """图像 stem → [K,5] cls,x1,y1,x2,y2（像素、tile 原生坐标）。
+
+    以 splits/val_det.txt 索引（yolo/internal 两布局通用：标签 = 图像路径
+    images/→labels/）；评估对象为最终数据集 val（test_e2e --images-list 直测）。
+    """
     gt: dict[str, list] = defaultdict(list)
-    for lab in sorted((root / "abnormal").rglob("labels/*.txt")) if (root / "abnormal").exists() else []:
-        stem = lab.stem
-        # 文件名 <strip>_t<xx>_<x0>_<y0>；GT 框为 tile 内归一化 → 还原全局
-        parts = stem.split("_")
-        try:
-            x0, y0 = float(parts[-2]), float(parts[-1])
-        except ValueError:
-            x0 = y0 = 0.0
-        strip = "_".join(parts[:-4]) if len(parts) > 4 else stem
+    vd = root / "splits" / "val_det.txt"
+    paths: list[Path] = ([Path(l) for l in vd.read_text().splitlines() if l.strip()]
+                         if vd.exists() else [])
+    if not paths and (root / "abnormal").exists():
+        paths = sorted((root / "abnormal").rglob("images/*.png"))
+    from PIL import Image as _I
+    for p in paths:
+        lab = Path(str(p).replace("/images/", "/labels/")
+                   .replace("\\images\\", "\\labels\\")).with_suffix(".txt")
+        if not lab.exists():
+            continue
+        w, h = _I.open(p).size
         for ln in lab.read_text().strip().splitlines():
-            c, xc, yc, w, h = map(float, ln.split())
-            gx, gy = (xc - w / 2) * 1280 + x0, (yc - h / 2) * 1280 + y0
-            gt[strip].append([c, gx, gy, gx + w * 1280, gy + h * 1280])
+            c, xc, yc, bw, bh = map(float, ln.split())
+            gt[p.stem].append([c, (xc - bw / 2) * w, (yc - bh / 2) * h,
+                               (xc + bw / 2) * w, (yc + bh / 2) * h])
     return {k: np.array(v, np.float32) for k, v in gt.items()}
 
 

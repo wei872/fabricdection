@@ -14,6 +14,9 @@ import torch
 from torch.utils.data import Dataset
 
 
+IMG_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+
+
 def _load_grayscale3(path: str | Path) -> np.ndarray:
     from PIL import Image
 
@@ -25,25 +28,49 @@ def _load_grayscale3(path: str | Path) -> np.ndarray:
 class NormalTileDataset(Dataset):
     """正常 tiles（U 分支训练 / 记忆库构建）。
 
-    root/<fabric_id>/images/*.png；ignore_masks/<fabric_id>/ 同名掩膜像素置
-    NaN-like 丢弃（训练时直接换成批内另一正常块的内容，避免引入偏置）。
+    两种布局自动识别：
+    A) 标准 YOLO 布局（最终数据集格式，用户 source5 同构）：
+       root/images/{train,val}/*.png + root/labels/{train,val}/*.txt
+       **无对应标签 txt 或空 txt 的图 = 正常样本**；ignore 掩膜可选
+       root/ignore_masks/{split}/<同名>.png。
+    B) 旧内部布局：root/normal/<fabric_id>/images/*.png，ignore 掩膜
+       ignore_root/<fabric_id>/<同名>.png。
     """
 
     def __init__(self, root: str | Path, size: int = 896, fabrics: list[str] | None = None,
                  ignore_root: str | Path | None = None, max_per_fabric: int | None = None):
-        self.root = Path(root) / "normal"
+        self.root = Path(root)
         self.size = size
         self.ignore_root = Path(ignore_root) if ignore_root else None
-        self.items: list[tuple[Path, str]] = []
-        fid_dirs = [d for d in sorted(self.root.iterdir()) if d.is_dir()]
-        for d in fid_dirs:
-            if fabrics and d.name not in fabrics:
-                continue
-            imgs = sorted((d / "images").glob("*.png"))
-            if max_per_fabric:
-                imgs = imgs[:max_per_fabric]
-            self.items += [(p, d.name) for p in imgs]
+        self.items: list[tuple[Path, str, Path | None]] = []
+        if (self.root / "images").is_dir():                       # 布局 A
+            for split in ("train", "val"):
+                idir = self.root / "images" / split
+                if not idir.is_dir():
+                    continue
+                for p in sorted(x for x in idir.iterdir()
+                                if x.suffix.lower() in IMG_SUFFIXES):
+                    lab = self.root / "labels" / split / (p.stem + ".txt")
+                    if lab.exists() and lab.read_text().strip():
+                        continue                                   # 有标注 = 异常图，跳过
+                    mask = self.root / "ignore_masks" / split / p.name
+                    self.items.append((p, split, mask if mask.exists() else None))
+        else:                                                     # 布局 B
+            for d in sorted(self.root.joinpath("normal").iterdir()):
+                if not d.is_dir() or (fabrics and d.name not in fabrics):
+                    continue
+                imgs = sorted((d / "images").glob("*.png"))
+                if max_per_fabric:
+                    imgs = imgs[:max_per_fabric]
+                for p in imgs:
+                    mask = None
+                    if self.ignore_root:
+                        m = self.ignore_root / d.name / p.name
+                        mask = m if m.exists() else None
+                    self.items.append((p, d.name, mask))
         assert self.items, f"no normal images under {self.root}"
+        if max_per_fabric and (self.root / "images").is_dir():
+            self.items = self.items[:max_per_fabric]
 
     def __len__(self) -> int:
         return len(self.items)
@@ -58,22 +85,20 @@ class NormalTileDataset(Dataset):
         return np.repeat(a[..., None], 3, axis=-1)
 
     def __getitem__(self, i: int) -> dict:
-        img_path, fabric_id = self.items[i]
+        img_path, key, mask_path = self.items[i]
         x = _load_grayscale3(img_path)
         x = self._resize(x)
-        if self.ignore_root:                                 # 忽略区替换为偏移正常区
-            m = self.ignore_root / fabric_id / img_path.name
-            if m.exists():
-                from PIL import Image
-                mask = np.asarray(Image.open(m).convert("L"), dtype=np.float32) > 0.5
-                if mask.shape[:2] != (self.size, self.size):
-                    mask = np.asarray(Image.fromarray(mask.astype(np.uint8) * 255).resize(
-                        (self.size, self.size), Image.NEAREST), np.float32) > 127
-                rolled = np.roll(x, (mask.shape[0] // 3, mask.shape[1] // 3), (0, 1))
-                x[mask] = rolled[mask]
+        if mask_path is not None:                            # 忽略区替换为偏移正常区
+            from PIL import Image
+            mask = np.asarray(Image.open(mask_path).convert("L"), dtype=np.float32) > 0.5
+            if mask.shape[:2] != (self.size, self.size):
+                mask = np.asarray(Image.fromarray(mask.astype(np.uint8) * 255).resize(
+                    (self.size, self.size), Image.NEAREST), np.float32) > 127
+            rolled = np.roll(x, (mask.shape[0] // 3, mask.shape[1] // 3), (0, 1))
+            x[mask] = rolled[mask]
         t = torch.from_numpy(x).permute(2, 0, 1).float()
         t = (t - 0.5) / 0.5                                  # [-1,1]（ViT 侧再按需标准化）
-        return {"image": t, "fabric_id": fabric_id, "path": str(img_path)}
+        return {"image": t, "fabric_id": key, "path": str(img_path)}
 
 
 class DetEvalDataset(Dataset):
@@ -81,15 +106,27 @@ class DetEvalDataset(Dataset):
 
     def __init__(self, root: str | Path, which: str = "abnormal",
                  fabrics: list[str] | None = None, size: int = 1280):
-        self.root = Path(root) / which
+        self.root = Path(root)
         self.size = size
         self.items: list[tuple[Path, Path | None, str]] = []
-        for d in sorted(self.root.iterdir()):
-            if not d.is_dir() or (fabrics and d.name not in fabrics):
-                continue
-            for p in sorted((d / "images").glob("*.png")):
-                lab = d / "labels" / (p.stem + ".txt")
-                self.items.append((p, lab if lab.exists() else None, d.name))
+        if (self.root / "images").is_dir():                  # 标准 YOLO 布局：有标签者=异常
+            for split in ("train", "val"):
+                idir = self.root / "images" / split
+                if not idir.is_dir():
+                    continue
+                for p in sorted(x for x in idir.iterdir()
+                                if x.suffix.lower() in IMG_SUFFIXES):
+                    lab = self.root / "labels" / split / (p.stem + ".txt")
+                    if lab.exists() and lab.read_text().strip():
+                        self.items.append((p, lab, split))
+        else:                                                # 旧内部布局
+            base = self.root / which
+            for d in sorted(base.iterdir()):
+                if not d.is_dir() or (fabrics and d.name not in fabrics):
+                    continue
+                for p in sorted((d / "images").glob("*.png")):
+                    lab = d / "labels" / (p.stem + ".txt")
+                    self.items.append((p, lab if lab.exists() else None, d.name))
 
     def __len__(self) -> int:
         return len(self.items)

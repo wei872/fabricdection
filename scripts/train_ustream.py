@@ -151,7 +151,7 @@ def dl_limited(args, ds, dev, split: str = "val_normal.txt"):
     if not split_path.exists() or not split_path.read_text().strip():
         split_path = Path(args.root) / "splits" / "train_normal.txt"
     files = {Path(p).resolve() for p in split_path.read_text().strip().splitlines() if p.strip()}
-    idx = [i for i, (p, _f) in enumerate(ds.items) if p.resolve() in files]
+    idx = [i for i, it in enumerate(ds.items) if it[0].resolve() in files]
     sub = torch.utils.data.Subset(ds, idx)
     return DataLoader(sub, batch_size=max(1, args.bs // 2), shuffle=False,
                       num_workers=0)

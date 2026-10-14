@@ -7,40 +7,39 @@
 
 ---
 
-## 1. 目录树（最终形态）
+## 1. 目录树（最终形态 = 标准 YOLO 目录，与 source5 同构）
 
 ```
-dataset_fabric/                              # ← 训练根目录（--root / data 配置指向这里）
+dataset_fabric/                              # ← 最终数据集（训练根目录）
 │
-├── normal/global/images/                    # 【U 分支】正常样本，仅图片
-│   ├── src5_train_003_t00_0_0.png           #   1280×1280，灰度存 3 通道 PNG
-│   ├── src5_train_014_t01_1088_0.png        #   命名：<源图stem>_t<块号>_<x>_<y>
-│   └── ...                                  #   ≥ 1000 张（见 §4）
+├── images/
+│   ├── train/                               # 缺陷图 + 正常图混放
+│   │   ├── src5_train_000_t00_0_0.png       #   缺陷 tile：1280×1280 灰度3通道
+│   │   ├── src5_train_003_t00_0_0.png       #   正常 tile：**只有图片、无标签 txt**
+│   │   └── ...                              #   命名：<源图stem>_t<块号>_<x>_<y>
+│   └── val/
+│       ├── src5_val_000_t00_0_0.png
+│       └── ...
 │
-├── abnormal/global/images/                  # 【S 分支监督 + 评估】缺陷 tiles
-│   ├── src5_train_000_t00_0_0.png
-│   └── ...
-├── abnormal/global/labels/                  #   与 images 同名 .txt，YOLO 归一化框
-│   ├── src5_train_000_t00_0_0.txt           #   例：0 0.512500 0.335000 0.045000 0.090000
-│   └── ...
+├── labels/                                  # 仅缺陷图有标签（正常图无 txt = 正常）
+│   ├── train/
+│   │   └── src5_train_000_t00_0_0.txt       #   例：0 0.512500 0.335000 0.045000 0.090000
+│   └── val/
+│       └── src5_val_000_t00_0_0.txt
 │
-├── synth/global/images/                     # 【可选】合成缺陷补足池（缺量类才生成）
-│   └── synth_hole_00042.png
-├── synth/global/labels/
-│   └── synth_hole_00042.txt
+├── ignore_masks/                            # 【可选】笔迹/跨块碎片忽略区 uint8 0|255
+│   ├── train/…png                           #   与 images 同名同尺寸
+│   └── val/…png
 │
-├── ignore_masks/global/                     # 【可选】笔迹/跨块碎片忽略区，uint8 0|255
-│   └── src5_train_014_t01_1088_0.png        #   与 normal/abnormal 图片同名同尺寸
+├── splits/                                  # 角色清单（绝对路径，一行一个；机器生成）
+│   ├── train_normal.txt                     #   U 分支训练：train 中的无标签图
+│   ├── val_normal.txt                       #   U 分支标定 τ_u：val 中的无标签图
+│   ├── train_det.txt                        #   S 分支训练：train 有标签图
+│   ├── val_det.txt                          #   验收评估 GT：val 有标签图
+│   └── calib_large.txt                      #   τ_large 标定：含大缺陷的 val 图
 │
-├── splits/                                  # 清单（绝对路径，一行一个）
-│   ├── train_normal.txt                     #   U 分支训练：normal 的 train 部分
-│   ├── val_normal.txt                       #   U 分支标定 τ_u：normal 的 val 部分
-│   ├── train_det.txt                        #   S 分支训练：abnormal(train)+synth
-│   ├── val_det.txt                          #   S 分支/验收评估：仅真实 abnormal(val)
-│   └── calib_large.txt                      #   τ_large 标定：含大缺陷的 val tiles
-│
-├── data_ultralytics.yaml                    # S 分支训练入口（txt 清单式）
-├── fabric_meta.yaml                         # 免登记：仅来源追溯信息
+├── data_ultralytics.yaml                    # S 分支入口：train=[det+normal]、val=[det+normal]
+├── fabric_meta.yaml                         # 免登记：仅来源追溯
 ├── dataset_report.json                      # 质量报告（§6 门禁依据）
 │
 └── （标定产物，训练后回写 configs/，随数据集版本管理）
@@ -48,14 +47,17 @@ dataset_fabric/                              # ← 训练根目录（--root / da
     configs/class_calibration.yaml           #   逐类置信度温度 + 严重度权重
 ```
 
+> 合成补足（缺量类）直接写入 images/labels 的 train，并在 report 标注 synth 占比；
+> 不再单独 synth 目录（保持与源同构的两目录格式）。
+
 **谁读什么**：
 
 | 脚本 | 读 |
 |---|---|
-| `train_ustream.py --root dataset_fabric` | splits/train_normal（训练）、splits/val_normal（标定）、ignore_masks |
-| `train_sstream.py --data dataset_fabric/data_ultralytics.yaml` | splits/train_det / val_det（经 yaml） |
-| `test_e2e.py` | configs/thresholds.yaml、class_calibration.yaml、记忆库/解码器权重 |
-| `eval_metrics.py --root dataset_fabric` | abnormal/*/labels（GT）+ verdicts.jsonl |
+| `train_ustream.py --root dataset_fabric` | images/ 中无标签图（经 splits/train_normal 过滤）+ ignore_masks |
+| `train_sstream.py --data dataset_fabric/data_ultralytics.yaml` | images+labels（正常图作背景负样本） |
+| `test_e2e.py --images-list dataset_fabric/splits/val_det.txt` | val 图直测 + thresholds/class_calibration |
+| `eval_metrics.py --root dataset_fabric --preds …/verdicts.jsonl` | labels/val（GT，经 val_det 索引） |
 
 ---
 
@@ -100,8 +102,8 @@ dataset_fabric/                              # ← 训练根目录（--root / da
 
 ```yaml
 path: /srv/dataset_fabric
-train: [/srv/dataset_fabric/splits/train_det.txt]
-val:   [/srv/dataset_fabric/splits/val_det.txt]
+train: [/srv/dataset_fabric/splits/train_det.txt, /srv/dataset_fabric/splits/train_normal.txt]
+val:   [/srv/dataset_fabric/splits/val_det.txt,   /srv/dataset_fabric/splits/val_normal.txt]
 nc: 14
 names: {0: broken_warp, 1: broken_weft, 2: thin_thick_weft, 3: double_pick,
         4: slub, 5: skip_draw, 6: hole, 7: knot, 8: stain_oil, 9: foreign_fiber,
@@ -170,6 +172,11 @@ names: {0: broken_warp, 1: broken_weft, 2: thin_thick_weft, 3: double_pick,
 
 ```bash
 # configs/dataset.yaml 已指向 D:/tyhn/yolo/dataset/source5_augmented
-python scripts/prepare_dataset.py
-# 检查 dataset_fabric/dataset_report.json → 过 §6 门禁 → 开训
+python scripts/prepare_dataset.py            # 产出 dataset_fabric/（标准 YOLO 目录）
+# 检查 dataset_fabric/dataset_report.json → 过 §6 门禁 → 开训：
+python scripts/train_ustream.py --root dataset_fabric --device 0
+python scripts/train_sstream.py --data dataset_fabric/data_ultralytics.yaml --device 0
+# 验收：val 直测 + 指标
+python scripts/test_e2e.py --images-list dataset_fabric/splits/val_det.txt --det runs/sstream/det/weights/best.pt --device 0
+python scripts/eval_metrics.py --mode fhead --preds runs/test/<ts>/verdicts.jsonl --root dataset_fabric
 ```
