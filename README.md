@@ -3,6 +3,8 @@
 实时布匹缺陷检测系统设计项目。
 
 - **总体设计文档**：[`docs/FADNet-RT_design.md`](docs/FADNet-RT_design.md)（必读）
+- **最终数据集规格**：[`docs/FINAL_DATASET.md`](docs/FINAL_DATASET.md)（目录/格式/数量/门禁唯一权威）
+- 数据集接入流程：[`docs/DATASET_SPEC.md`](docs/DATASET_SPEC.md)
 - 目标三要素：① 大缺陷零漏检　② 已知缺陷分类精准　③ 1280×1280 实时（≥30 FPS）
 - 架构：预处理层 + 监督检测分支（YOLO27s 风格）+ 无监督异常分支（Dinomaly 重构 × PatchCore 记忆库）+ **免登记布种自适应**（逐 tile 自归一化/特征中心化，全局单库单阈值）+ 融合裁决 F-Head（**逐类置信度标定，置信度↔严重度**）
 - 强制参考：[Dinomaly](https://github.com/guojiajeremy/Dinomaly)（CVPR 2025）、[PatchCore](https://github.com/amazon-science/patchcore-inspection)、[Ultralytics YOLO27](https://docs.ultralytics.com/models/yolo27/)
