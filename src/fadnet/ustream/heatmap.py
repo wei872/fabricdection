@@ -34,6 +34,20 @@ def fuse_heatmaps(a_rec: torch.Tensor, a_knn: torch.Tensor, norm: RobustNorm,
     return torch.maximum(norm.z(a_rec, fabric_id, "rec"), norm.z(a_knn, fabric_id, "knn"))
 
 
+def self_normalize(a: torch.Tensor, bg_quantile: float = 90.0) -> torch.Tensor:
+    """逐 tile 自归一化 —— "免布种登记"的关键（用户要求 2026-10：模型自适应所有布种）。
+
+    Dinomaly/PatchCore 已完成"缺陷前景 vs 布料背景"分离：背景分分布只由传感噪声与
+    纹理残差决定，其**相对尺度**跨布种/跨光照高度一致。故以本 tile 背景中位数为基线、
+    (p{bg_quantile} - p50) 为尺度，把分数换算成"背景尺度倍数"(z)，阈值 tau_u 全局通用，
+    无需逐布种标定/登记。大缺陷占 tile ≤30% 时中位数仍由背景主导，估计稳健。
+    """
+    flat = a.flatten(1).float()
+    med = flat.median(dim=1).values
+    scale = (torch.quantile(flat, bg_quantile / 100.0, dim=1) - med).clamp_min(1e-6)
+    return ((flat - med[:, None]) / scale[:, None]).reshape(a.shape)
+
+
 @dataclass
 class AnomRegion:
     x0: int

@@ -36,20 +36,24 @@ ustream:
     reweight_n: 4            # PatchCore 最近邻重加权参考数
   fusion: max                # 双信号级联：max（召回优先）；可选 logistic 标定
 
-fabric_conditioner:
-  enabled: true
-  embed_dim: 32
-  fft_bins: 64               # FFT 对数谱特征分辨率
-  use_mes_fabric_code: false # Q5：MES 可提供布种代码则置 true
-  thresholds_table: configs/fabric_thresholds.yaml
+fabric_invariance:           # 免布种登记的布种自适应（用户要求 2026-10）
+  # 思路：Dinomaly/PatchCore 前景-背景分离 + 逐 tile 自归一化 + 特征逐 tile 中心化
+  # → 单一全局记忆库 + 全局通用阈值，换布种零配置。
+  mode: self_norm            # 逐 tile 背景中位/p90 自归一化（heatmap.self_normalize）
+  bg_quantile: 90
+  style_center: true         # PatchCore 特征逐 tile 中心化（剥离布种风格偏移）
+  memory_bank: global        # 单一全局记忆库（不分桶、不登记）
+  thresholds: configs/thresholds.yaml
+  mes_fabric_code: false     # 仅作台账字段，不参与模型/阈值
 
 fhead:                     # F-Head 融合裁决规则（design §3.6）
-  min_anom_area: 9           # 异常连通域最小面积(px@tile)
-  large_area: 2500           # ≥ 视为大缺陷必报 [待 Q6 标定]
-  iou_match: 0.0             # 框-区 IoU>0 即关联
-  cross_tile_iou: 0.5        # 跨块归并 IoU
+  min_anom_area: 9         # 异常连通域最小面积(px@tile)
+  large_area: 2500         # ≥ 视为大缺陷必报 [待 Q6 标定]
+  iou_match: 0.0           # 框-区 IoU>0 即关联
+  cross_tile_iou: 0.5      # 跨块归并 IoU
   unknown_class: unknown_anomaly
   promote_critical: true
+  calibration: configs/class_calibration.yaml   # 逐类置信度标定（置信度↔严重度）
 
 runtime:
   precision: fp16            # fp16 → int8

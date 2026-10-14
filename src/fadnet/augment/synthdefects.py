@@ -15,6 +15,10 @@ CLASSES = ["broken_warp", "broken_weft", "thin_thick_weft", "double_pick", "slub
            "skip_draw", "hole", "knot", "stain_oil", "foreign_fiber", "streak_bar",
            "edge_defect", "other_known", "unknown_anomaly"]
 
+# 合成引擎已实现的形态（prepare_dataset 注入池仅从此采样；其余类待 M2 扩充）
+IMPLEMENTED_KINDS = ["broken_warp", "broken_weft", "thin_thick_weft",
+                     "foreign_fiber", "stain_oil", "hole", "knot"]
+
 
 def _autocorr_pitch(profile: np.ndarray, min_lag: int = 1, max_lag: int = 64,
                     thresh: float = 0.15, fallback: float = 3.0) -> float:

@@ -43,9 +43,17 @@ class FlatFieldCorrector:
         return np.asarray(im, dtype=np.float32)
 
     def observe(self, gray: np.ndarray) -> None:
-        """把（假设为正常布面的）历史帧加入照明场估计。"""
+        """把（假设为正常布面的）历史帧加入照明场估计。
+
+        条带宽度可变：场统一重采样到首个观测帧的网格后再累加。
+        """
         field = self._pool(gray, self.downsample)
-        self._acc = field if self._acc is None else self._acc + field
+        if self._acc is None:
+            self._acc = field
+        else:
+            if field.shape != self._acc.shape:
+                field = self._upsample(field, self._acc.shape)
+            self._acc = self._acc + field
         self._n += 1
         if self._n > self.win_frames:  # 简单截断；生产用 EMA 更稳
             self._acc, self._n = self._acc * 0.95, int(self.win_frames * 0.95)

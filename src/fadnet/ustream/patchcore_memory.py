@@ -2,27 +2,40 @@
 
 对应 PatchCore (CVPR 2022, https://github.com/amazon-science/patchcore-inspection)：
   * 中层特征 + 邻域感知聚合（3×3, stride 1）→ locally-aware patch features
-  * 正常样本记忆库 → 随机 10% → 贪心 k-center Coreset（≈8k 中心）
+  * 正常样本记忆库 → 贪心 k-center Coreset（≈8k 中心）
   * 测试：1-NN 距离 + 最近 4 邻重加权 → 上采样 + 高斯 σ=4 → A_knn
-记忆库按布种分桶（FC 布种 ID 查桶），GPU 分块 cdist <1 ms。
+
+免登记布种自适应（用户要求 2026-10）：入库/查询前对**每个 tile 做特征中心化**
+（style_center，减去该 tile 的均值特征方向），把"布种风格"（经纬密/粗细/反光造成的
+整体特征偏移）从特征中剥离，只留缺陷前景-背景相对结构 → **单一全局记忆库**即可
+覆盖所有布种，无需布种 ID / 分桶 / 登记。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 
 
 def neighborhood_aware(features: torch.Tensor, p: int = 3) -> torch.Tensor:
-    """PatchCore 邻域感知块特征：特征图 3×3 均值池化(stride 1) 与中心特征拼接后投影。
+    """PatchCore 邻域感知块特征：特征图 3×3 均值池化(stride 1) 与中心特征取平均。
 
-    features: [B, D, gh, gw]（token 网格重排）→ [B, D, gh, gw]（简化：均值池化
-    特征与中心特征取平均；与骨干维数对齐，免去额外投影层）。
+    features: [B, D, gh, gw]（token 网格重排）→ 同形状（与骨干维数对齐，免投影层）。
     """
     pooled = F.avg_pool2d(features, kernel_size=p, stride=1, padding=p // 2)
     return 0.5 * (features + pooled)
+
+
+def style_center(features: torch.Tensor) -> torch.Tensor:
+    """逐 tile 特征中心化：剥离布种风格偏移（免登记泛化的特征侧手段）。
+
+    支持 [B, D, gh, gw] 与 [N, D]（后者视为单 tile）。
+    """
+    if features.dim() == 4:
+        return features - features.mean(dim=(2, 3), keepdim=True)
+    return features - features.mean(dim=0, keepdim=True)
 
 
 def greedy_coreset(features: torch.Tensor, n_centers: int, seed: int = 0) -> torch.Tensor:
@@ -44,40 +57,37 @@ def greedy_coreset(features: torch.Tensor, n_centers: int, seed: int = 0) -> tor
 
 @dataclass
 class MemoryBank:
-    """布种分桶记忆库（buckets: fabric_id → [M,D] Tensor）。"""
+    """全局单一记忆库（centers: [M, D]；style_center 后布种无关）。"""
 
     dim: int
-    buckets: dict[str, torch.Tensor] = field(default_factory=dict)
+    centers: torch.Tensor | None = None
 
-    def build(self, fabric_id: str, feats: torch.Tensor, n_centers: int = 8192,
-              seed: int = 0) -> None:
-        """feats: [N,D]（已做邻域感知聚合）→ Coreset 入库。"""
+    def build(self, feats: torch.Tensor, n_centers: int = 8192, seed: int = 0) -> None:
+        """feats: [N, D]（已 style_center + 邻域感知）→ Coreset 入库。"""
         feats = F.normalize(feats, dim=-1)
-        self.buckets[fabric_id] = greedy_coreset(feats, min(n_centers, feats.shape[0]), seed)
+        self.centers = greedy_coreset(feats, min(n_centers, feats.shape[0]), seed)
 
-    def bucket(self, fabric_id: str) -> torch.Tensor:
-        if fabric_id not in self.buckets:  # 未知布种：用首个桶兜底 + 告警上抛
-            fabric_id = next(iter(self.buckets))
-        return self.buckets[fabric_id]
+    def bucket(self, fabric_id: str = "*") -> torch.Tensor:
+        """兼容旧调用名；现全局单库，忽略 fabric_id。"""
+        assert self.centers is not None, "MemoryBank 未构建/加载"
+        return self.centers
 
     def save(self, path: str) -> None:
-        torch.save({k: v.cpu() for k, v in self.buckets.items()}, path)
+        torch.save({"dim": self.dim, "centers": self.centers.cpu()}, path)
 
     def load(self, path: str, device: str = "cuda") -> None:
-        self.buckets = {k: v.to(device) for k, v in torch.load(path).items()}
+        d = torch.load(path, map_location=device)
+        self.dim, self.centers = d["dim"], d["centers"].to(device)
 
 
 def knn_anomaly_scores(
-    queries: torch.Tensor,     # [N, D] token 网格铺平
+    queries: torch.Tensor,     # [N, D] token 网格铺平（已 style_center）
     coreset: torch.Tensor,     # [M, D]
     k: int = 1,
     reweight_n: int = 4,
     chunk: int = 4096,
 ) -> torch.Tensor:
-    """PatchCore 打分：1-NN 距离 + 近邻重加权。
-
-    返回 [N] 距离分（含重加权）。GPU 分块，8k×384 规模 <1 ms。
-    """
+    """PatchCore 打分：1-NN 距离 + 近邻重加权。返回 [N]（含重加权）。"""
     scores = torch.empty(queries.shape[0], device=queries.device)
     for s in range(0, queries.shape[0], chunk):
         q = F.normalize(queries[s:s + chunk], dim=-1)
@@ -87,7 +97,7 @@ def knn_anomaly_scores(
         near = coreset[nn_idx[:, 0]]                     # [b, D]
         d_nb = torch.cdist(near, coreset).topk(reweight_n + 1, largest=False).values[:, 1:]
         w = 1 - (d_min[:, 0].exp() / (d_nb.exp().sum(1) + 1e-12))
-        scores[s:s + chunk] = (1 - 0) * w * d_min[:, 0]  # s* = (1 - max s_b)·d_min
+        scores[s:s + chunk] = w * d_min[:, 0]            # s* = (1 - max s_b)·d_min
     return scores
 
 

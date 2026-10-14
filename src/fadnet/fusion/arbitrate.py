@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 
 from ..ustream.heatmap import AnomRegion
+from .calibrate import PerClassCalibrator
 
 UNKNOWN_CLASS = "unknown_anomaly"
 
@@ -32,10 +33,11 @@ class DetBox:
 class Verdict:
     box: tuple[float, float, float, float]
     cls: str
-    conf: float
+    conf: float                       # 逐类标定后置信度（≈P(该类缺陷存在)，与严重度单调）
     anomaly_score: float
-    grade: str                      # critical | major | minor | review
-    evidence: dict = field(default_factory=dict)   # {"det": bool, "anom": bool}
+    grade: str                        # critical | major | minor | review
+    evidence: dict = field(default_factory=dict)   # {"det": bool, "anom": bool, ...}
+    severity: float = 0.0             # 该类独立的严重度 ∈[0,1]（conf+异常强度+尺寸）
 
     def to_json(self) -> dict:
         return {"box_xywh": [self.box[0], self.box[1],
@@ -56,9 +58,16 @@ def _iou(a, b) -> float:
 
 class FHead:
     def __init__(self, tau_det_low: float = 0.05, tau_det_heavy: float = 0.5,
-                 large_area: int = 2500, tau_large: float = 0.9, w: float = 1.0):
+                 large_area: int = 2500, tau_large: float = 0.9, w: float = 1.0,
+                 calib: PerClassCalibrator | None = None):
         self.tau_det_low, self.tau_det_heavy = tau_det_low, tau_det_heavy
         self.large_area, self.tau_large, self.w = large_area, tau_large, w
+        self.calib = calib or PerClassCalibrator()      # 逐类置信度标定（缺省=未拟合先验）
+
+    def _cal(self, cls: str, conf_raw: float, anom_z: float, area: float
+             ) -> tuple[float, float]:
+        cc = self.calib.cal_conf(cls, conf_raw)
+        return cc, self.calib.severity(cls, cc, anom_z, area)
 
     def fuse(self, dets: list[DetBox], regions: list[AnomRegion]) -> list[Verdict]:
         verdicts: list[Verdict] = []
@@ -66,6 +75,7 @@ class FHead:
         dets = [d for d in dets if d.conf >= self.tau_det_low]           # 截面先低阈值
         for d in dets:
             db = (d.x0, d.y0, d.x1, d.y1)
+            area_d = (d.x1 - d.x0) * (d.y1 - d.y0)
             hit, hit_i = 0.0, -1
             for i, r in enumerate(regions):
                 rb = (r.x0, r.y0, r.x1, r.y1)
@@ -75,24 +85,35 @@ class FHead:
             if hit_i >= 0:                                               # 规则 3
                 r = regions[hit_i]
                 used_r.add(hit_i)
-                conf = max(d.conf, self.w * r.score)
-                grade = "critical" if r.area >= self.large_area or r.score >= self.tau_large \
-                    else ("major" if conf >= self.tau_det_heavy else "minor")
-                verdicts.append(Verdict(db, d.cls, conf, r.score, grade,
-                                        {"det": True, "anom": True}))
+                conf_raw = max(d.conf, self.w * r.score)
+                cc, sev = self._cal(d.cls, conf_raw, r.score, r.area)
+                if r.area >= self.large_area or r.score >= self.tau_large:
+                    grade = "critical"                                   # 规则 2：必报不降级
+                else:
+                    grade = self.calib.grade(d.cls, sev)                 # 严重度→等级
+                verdicts.append(Verdict(db, d.cls, cc, r.score, grade,
+                                        {"det": True, "anom": True,
+                                         "raw_conf": conf_raw}, sev))
             elif d.conf >= self.tau_det_heavy:
-                verdicts.append(Verdict(db, d.cls, d.conf, 0.0, "major",
-                                        {"det": True, "anom": False}))
+                cc, sev = self._cal(d.cls, d.conf, 0.0, area_d)
+                verdicts.append(Verdict(db, d.cls, cc, 0.0,
+                                        self.calib.grade(d.cls, sev),
+                                        {"det": True, "anom": False,
+                                         "raw_conf": d.conf}, sev))
             else:
-                verdicts.append(Verdict(db, d.cls, d.conf, 0.0, "review",   # 规则 5
-                                        {"det": True, "anom": False}))
+                cc, sev = self._cal(d.cls, d.conf, 0.0, area_d)
+                verdicts.append(Verdict(db, d.cls, cc, 0.0, "review",   # 规则 5
+                                        {"det": True, "anom": False,
+                                         "raw_conf": d.conf}, sev))
         for i, r in enumerate(regions):                                   # 规则 4/2
             if i in used_r:
                 continue
-            grade = "critical" if (r.area >= self.large_area or r.score >= self.tau_large) \
-                else "review"
+            cc, sev = self._cal(UNKNOWN_CLASS, r.score, r.score, r.area)
+            grade = "critical" if (r.area >= self.large_area
+                                   or r.score >= self.tau_large) else "review"
             verdicts.append(Verdict((r.x0, r.y0, r.x1, r.y1), UNKNOWN_CLASS,
-                                    r.score, r.score, grade, {"det": False, "anom": True}))
+                                    cc, r.score, grade,
+                                    {"det": False, "anom": True}, sev))
         return verdicts
 
     @staticmethod

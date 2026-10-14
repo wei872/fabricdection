@@ -7,3 +7,5 @@ runs/
 *.engine
 *.onnx
 wandb/
+dataset_fabric/
+dataset_*/
