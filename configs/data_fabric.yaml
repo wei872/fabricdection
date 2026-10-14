@@ -1,0 +1,35 @@
+# 数据集与类别（Q1/Q2 修订后冻结）
+path: data
+# 目录约定：
+#   normal/{fabric_id}/...        正常（U 分支训练 + S 分支背景）
+#   abnormal/{fabric_id}/...      异常 PNG/BMP + YOLO 框标注（labels/）
+#   abnormal_masks/...            大缺陷像素掩膜（标定用）
+train_normal_ratio: 0.85
+
+names:
+  0: broken_warp        # 断经
+  1: broken_weft        # 断纬
+  2: thin_thick_weft    # 稀纬/密纬（档）
+  3: double_pick        # 双纬
+  4: slub               # 竹节
+  5: skip_draw          # 跳花/错花
+  6: hole               # 破洞
+  7: knot               # 结头
+  8: stain_oil          # 油污渍
+  9: foreign_fiber      # 异纤/飞花（含线状异物；Q1 待定弧线若真设此）
+  10: streak_bar        # 条影/经柳纬档
+  11: edge_defect       # 边疵
+  12: other_known       # 其它已知
+  13: unknown_anomaly   # 系统兜底类：不人工标注训练框
+
+direction_pair: [[broken_warp, broken_weft]]  # 翻转增强时类名联动
+
+# 三要素增强（design §4.3）
+augment:
+  freq_shift: 0.2        # 主频 ±20%：经纬密/粗细变化
+  linewidth_jitter: 0.3
+  shading_field: {enabled: true, max_ratio: 0.4}   # 反光/暗角场
+  specular_spot: {enabled: true, alpha: 0.3}
+  hflip: true
+  vflip: true
+  sync_direction_class: true  # 翻转时断经⇄断纬联动
