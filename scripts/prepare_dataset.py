@@ -77,7 +77,13 @@ def load_class_map(path: str | None, names: list[str]) -> dict[str, int]:
 
 
 def discover_yolo(root: Path) -> tuple[list[dict], list[str]]:
-    """返回 (样本列表[{img, label}], 源类别名列表)。兼容三种常见布局。"""
+    """返回 (样本列表[{img, label, split}], 源类别名列表)。
+
+    兼容布局：root/images/{train,val}+root/labels/{train,val}（用户 source5 布局）；
+    root/images+root/labels；root/{train,val}/images+labels；有 data.yaml/classes.txt 更佳。
+    路径中含 train/val 目录名 → 记录 split hint（**尊重用户已有划分，不重划**）。
+    无对应标签 txt 的图 = 正常样本。
+    """
     names: list[str] = []
     if (root / "data.yaml").exists():
         d = yaml.safe_load((root / "data.yaml").read_text())
@@ -91,14 +97,20 @@ def discover_yolo(root: Path) -> tuple[list[dict], list[str]]:
             continue
         if any(part in ("labels",) for part in p.parts):
             continue
-        lab = None
+        lab, hint = None, None
         for cand in (p.parent.parent / "labels" / p.parent.name / (p.stem + ".txt"),
+                     p.parent.parent.parent / "labels" / p.parent.name / (p.stem + ".txt"),
                      p.parent.parent / "labels" / (p.stem + ".txt"),
                      p.with_suffix(".txt")):
             if cand.exists():
                 lab = cand
                 break
-        imgs.append({"img": p, "label": lab})
+        low = {q.lower() for q in p.parts}
+        for s in ("train", "val", "test"):
+            if s in low:
+                hint = "val" if s == "test" else s
+                break
+        imgs.append({"img": p, "label": lab, "split": hint})
     if not names:
         ids = set()
         for s in imgs:
@@ -188,39 +200,62 @@ def run_yolo_mode(args, dst: Path) -> None:
     per_class: dict[int, dict] = {i: {"boxes": 0, "areas": [], "large": 0, "imgs": set()}
                                   for i in range(len(CLASSES))}
     unmapped: dict[str, int] = defaultdict(int)
-    img_records: list[dict] = []     # 源图级：{key, split, per-class boxes, tiles}
+    img_records: list[dict] = []     # 源图级：{i, split, mapped}
 
-    # ---- 划分目标（按源图分层，保证每类 val 有量） ----
+    # ---- 正常样本附加目录（只给图片、无标签；可选） ----
+    if args.normal_dir:
+        nd = Path(args.normal_dir)
+        n0 = len(samples)
+        for p in sorted(nd.rglob("*")):
+            if p.suffix.lower() in IMG_EXT and p.is_file():
+                low = {q.lower() for q in p.parts}
+                hint = next(("val" if s == "test" else s
+                             for s in ("train", "val", "test") if s in low), None)
+                samples.append({"img": p, "label": None, "split": hint})
+        print(f"[yolo] +normal_dir {nd} → +{len(samples)-n0} 正常图")
+
+    # ---- 类别映射 + 总量统计 ----
     rng = np.random.default_rng(args.seed)
-    order = list(range(len(samples)))
-    rng.shuffle(order)
-    split_of: dict[int, str] = {}
-    val_boxes: dict[int, int] = defaultdict(int)
+    mapped_of: list[list] = []
     tot_boxes: dict[int, int] = defaultdict(int)
-    for i in order:
-        for c, xc, yc, w, h in read_boxes(samples[i]["label"]):
-            name = src_names[c] if c < len(src_names) else f"class_{c}"
-            cid = alias.get(str(name).strip().lower())
-            if cid is not None:
-                tot_boxes[cid] += 1
-    for i in order:
-        boxes = read_boxes(samples[i]["label"])
+    for i in range(len(samples)):
         mapped = []
-        for c, xc, yc, w, h in boxes:
+        for c, xc, yc, w, h in read_boxes(samples[i]["label"]):
             name = src_names[c] if c < len(src_names) else f"class_{c}"
             cid = alias.get(str(name).strip().lower())
             if cid is None:
                 unmapped[name] += 1
             else:
                 mapped.append((cid, xc, yc, w, h))
-        want_val = any(val_boxes[c] < max(1, int(args.val_ratio * tot_boxes[c]))
-                       for c, *_ in mapped) or (not mapped and stats["val_imgs"] < 2)
-        split = "val" if want_val else "train"
-        split_of[i] = split
-        stats[split + "_imgs"] += 1
-        for c, xc, yc, w, h in mapped:
+                tot_boxes[cid] += 1
+        mapped_of.append(mapped)
+
+    # ---- 划分：优先尊重源 train/val；无 hint 的按分层贪心 / 正常图按比例 ----
+    order = list(range(len(samples)))
+    rng.shuffle(order)
+    val_boxes: dict[int, int] = defaultdict(int)
+    for i in order:                                   # 已有 hint=val 的框先计入
+        if samples[i]["split"] == "val":
+            for cid, *_ in mapped_of[i]:
+                val_boxes[cid] += 1
+    n_normal_nohint = sum(1 for i in order
+                          if samples[i]["split"] is None and not mapped_of[i])
+    normal_val_target = max(2, int(args.val_ratio * n_normal_nohint))
+    for i in order:
+        hint, mapped = samples[i]["split"], mapped_of[i]
+        if hint:
+            split = hint                              # ← 用户已有划分，原样保留
+        elif mapped:
+            split = ("val" if any(val_boxes[c] < max(1, int(args.val_ratio * tot_boxes[c]))
+                                  for c, *_ in mapped) else "train")
             if split == "val":
-                val_boxes[c] += 1
+                for c, *_ in mapped:
+                    val_boxes[c] += 1
+        else:
+            split = "val" if stats["val_normal_imgs"] < normal_val_target else "train"
+            if split == "val":
+                stats["val_normal_imgs"] += 1
+        stats[split + "_imgs"] += 1
         img_records.append({"i": i, "split": split, "mapped": mapped})
 
     # ---- 切块 + 框转换 + 写出 ----
@@ -294,6 +329,11 @@ def run_yolo_mode(args, dst: Path) -> None:
                 per_class[c]["boxes"] += 1
 
     # ---- splits / 元数据 / ultralytics 入口 / 报告 ----
+    if not lists["val_normal"] and lists["train_normal"]:   # 源无正常 val：自动留置
+        n = max(1, int(len(lists["train_normal"]) * args.val_ratio))
+        lists["val_normal"] = lists["train_normal"][:n]
+        lists["train_normal"] = lists["train_normal"][n:]
+        print(f"[warn] 源数据正常样本无 val 划分：自动留置 {n} 张正常 tile 作 val_normal")
     splits = dst / "splits"; splits.mkdir(exist_ok=True)
     (splits / "train_normal.txt").write_text("\n".join(lists["train_normal"]))
     (splits / "val_normal.txt").write_text("\n".join(lists["val_normal"]))
@@ -397,8 +437,29 @@ def run_strip_mode(args, dst: Path) -> None:
 
 
 def main() -> None:
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--cfg", default="configs/dataset.yaml")
+    preargs, _ = pre.parse_known_args()
     ap = argparse.ArgumentParser()
+    defs: dict = {}
+    if Path(preargs.cfg).exists():                    # 数据集配置作默认值（CLI 可覆盖）
+        c = yaml.safe_load(Path(preargs.cfg).read_text()) or {}
+        src, pr = c.get("source", {}), c.get("prepare", {})
+        defs = {k: v for k, v in {
+            "yolo": src.get("yolo_root"), "normal_dir": src.get("normal_dir"),
+            "class_map": pr.get("class_map", "configs/class_map.yaml"),
+            "dst": pr.get("dst", "dataset_fabric"), "tile": pr.get("tile", 1280),
+            "overlap": pr.get("overlap", 0.15), "keep_ratio": pr.get("keep_ratio", 0.6),
+            "frag_lo": pr.get("frag_lo", 0.02), "large_area": pr.get("large_area", 2500.0),
+            "min_per_class": pr.get("min_per_class", 50),
+            "inject_topup": bool(pr.get("inject_topup", False)),
+            "pen": bool(pr.get("pen", False)),
+            "val_ratio": pr.get("val_ratio", 0.15)}.items() if v is not None}
+        print(f"[cfg] 使用数据集配置 {preargs.cfg}")
+    ap.add_argument("--cfg", default=preargs.cfg, help="数据集配置文件")
     ap.add_argument("--yolo", default=None, help="已标注 YOLO 数据集根目录（模式 A）")
+    ap.add_argument("--normal-dir", default=None,
+                    help="正常样本目录（只给图片无标签；混在 images/ 无标签亦可，二者可叠加）")
     ap.add_argument("--src", default=None, help="BMP 条带目录（模式 B）")
     ap.add_argument("--dst", default="dataset_fabric")
     ap.add_argument("--class-map", default="configs/class_map.yaml")
@@ -414,9 +475,10 @@ def main() -> None:
     ap.add_argument("--pen", action="store_true", help="启用疑似笔迹 ignore 检测")
     ap.add_argument("--val-ratio", type=float, default=0.15)
     ap.add_argument("--seed", type=int, default=0)
+    ap.set_defaults(**defs)                           # 配置默认值最后注入（CLI 仍可覆盖）
     args = ap.parse_args()
     dst = Path(args.dst)
-    assert args.yolo or args.src, "需要 --yolo 或 --src 之一"
+    assert args.yolo or args.src, "需要 --yolo 或 --src 之一（或在 configs/dataset.yaml 配置 source.yolo_root）"
     if args.yolo:
         run_yolo_mode(args, dst)
     else:

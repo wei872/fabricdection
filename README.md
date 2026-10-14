@@ -38,7 +38,7 @@ print(inject_defect(tile.image, 'broken_warp').boxes)
 ## 脚本
 
 ```bash
-python scripts/prepare_dataset.py --src data --dst dataset_fabric --inject 1 --flatfield  # 原始条带→规范数据集
+python scripts/prepare_dataset.py                      # 读 configs/dataset.yaml（source5 YOLO 源；正常图只给图片）
 python scripts/train_ustream.py  --root dataset_fabric --device cuda      # U分支：重构训练+全局记忆库+全局阈值标定
 python scripts/train_sstream.py  --data dataset_fabric/data_ultralytics.yaml --device 0   # S分支：YOLO27s风格(未发布自动回退yolo26)
 python scripts/test_e2e.py       --src data --det runs/.../best.pt --device cuda           # 端到端测试：verdicts/overlay/时延

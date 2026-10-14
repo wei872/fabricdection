@@ -14,8 +14,9 @@
 
 | 项 | 要求 |
 |---|---|
-| 布局 | 任选：`root/images + root/labels`；`root/{train,val}/images + labels`；有 `root/data.yaml` 或 `root/classes.txt` 更好 |
-| 标签 | YOLO txt：`cls xc yc w h`（0~1 归一化、中心式）；**空 txt / 缺 txt = 正常图** |
+| 布局 | 任选（自动发现）：① **`root/images/{train,val} + root/labels/{train,val}`（source5 现用布局）**；② `root/images + root/labels`；③ `root/{train,val}/images + labels`；有 `root/data.yaml` 或 `root/classes.txt` 更好 |
+| 已有划分 | 路径含 train/val 目录 → **原样尊重，不重划**；仅对无划分来源做分层贪心划分 |
+| 标签 | YOLO txt：`cls xc yc w h`（0~1 归一化、中心式）；**正常样本只给图片**：无对应 txt（或空 txt）即正常图；也可用 `--normal-dir`/`source.normal_dir` 单独目录只放图片 |
 | 类别名 | 通过 `classes.txt`/`data.yaml` 给出；与本项目 14 类的对应关系写 `configs/class_map.yaml`（别名支持中英文）；未映射类别会告警入报告 |
 | 图像 | 尺寸任意（大图自动重叠切块）；灰度/彩色均可（内部转灰度三通道）；jpg/png/bmp/webp |
 | 框 | 贴缺陷外接矩形；细长可旋转缺陷允许分段多框；**大缺陷（≥A_large，默认 50×50px）务必整框标全**（召回红线标定依赖） |
@@ -54,7 +55,8 @@ r = (框 ∩ tile) / 框面积：
 
 ## 4. 划分与标定清单
 
-- **按源图分层**划分 train/val（同一源图的 tiles 不跨 split，防泄漏）；贪心保证每类 val 框数 ≥ max(1, 15%×该类总数)。
+- 源已有 train/val（如 source5_augmented）→ **原样保留**；注意：增强副本（同一源图的 aug 变体）不要跨 train/val，否则验证偏乐观。
+- 无划分来源：**按源图分层**划分 train/val（同一源图的 tiles 不跨 split，防泄漏）；贪心保证每类 val 框数 ≥ max(1, 15%×该类总数)；正常图按 15% 自动留置 val_normal（源正常图已在 val 的优先用）。
 - `val_det.txt` 只含**真实**标注（synth 不入 val，验证不掺水）。
 - U 分支正常集 = 无框 tiles（含 ignore 掩膜者仅 U 可用，S 背景清单不含）。
 - τ_u：val_normal 自归一化 z 的 p99（全局唯一，免登记）；τ_large：calib_large 上大缺陷最小 z −5% 裕量。
@@ -71,9 +73,11 @@ r = (框 ∩ tile) / 框面积：
 ## 6. 命令
 
 ```bash
-# 主路径：你的 YOLO 数据集
-python scripts/prepare_dataset.py --yolo /path/to/labeled --class-map configs/class_map.yaml \
-    --min-per-class 50 --inject-topup --pen
+# 主路径：读 configs/dataset.yaml（已配好 source5 的 Windows 路径；换机改 yolo_root 即可）
+python scripts/prepare_dataset.py
+# 或显式指定（正常图混放无标签 / 单独目录 二选一或叠加）
+python scripts/prepare_dataset.py --yolo D:/tyhn/yolo/dataset/source5_augmented
+python scripts/prepare_dataset.py --yolo ... --normal-dir D:/tyhn/yolo/dataset/normal
 # 备选：相机条带（无标注）
-python scripts/prepare_dataset.py --src data --dst dataset_fabric --inject 1 --flatfield
+python scripts/prepare_dataset.py --cfg /dev/null --src data --dst dataset_fabric --inject 1 --flatfield
 ```

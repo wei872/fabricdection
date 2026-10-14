@@ -1,0 +1,14 @@
+broken_warp
+broken_weft
+thin_thick_weft
+double_pick
+slub
+skip_draw
+hole
+knot
+stain_oil
+foreign_fiber
+streak_bar
+edge_defect
+other_known
+unknown_anomaly

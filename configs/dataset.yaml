@@ -1,0 +1,21 @@
+# ===== 当前生产数据集接入配置（prepare_dataset.py 默认读取本文件） =====
+# 用户机（Windows）源数据：D:\tyhn\yolo\dataset\source5_augmented
+#   ├─images/{train,val}   异常图（YOLO 标注配对）+ 正常图（只给图片、无标签 txt）
+#   └─labels/{train,val}   YOLO txt（cls xc yc w h 归一化）
+# 在本机/服务器跑时把 yolo_root 改成实际挂载路径即可，其余不用动。
+source:
+  yolo_root: D:/tyhn/yolo/dataset/source5_augmented   # 异常+正常混放（正常无标签）
+  normal_dir: null            # 若正常图单独目录（只给图片），填这里，如 D:/tyhn/yolo/dataset/normal
+                              # 支持子目录 train/val；没有则自动从 train 正常图留置 val
+prepare:
+  dst: dataset_fabric
+  class_map: configs/class_map.yaml
+  tile: 1280
+  overlap: 0.15
+  keep_ratio: 0.6             # 跨块框保留阈值 r=框∩tile/框
+  frag_lo: 0.02               # r 下限：低于丢弃，之间进 ignore 掩膜
+  large_area: 2500            # 大缺陷面积(px²)：召回红线标定用 [Q6 待确认]
+  min_per_class: 50           # 每类最低真实框数，不足告警
+  inject_topup: false         # 缺量类合成补足(≤2:1)；真实数据充足时保持 false
+  pen: false                  # 疑似笔迹 ignore 检测（Q1 确认后决定）
+  val_ratio: 0.15             # 仅对"源未划分"的样本生效；source5 已有 train/val → 原样尊重
