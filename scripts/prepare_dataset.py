@@ -161,7 +161,7 @@ def save_tile(dst: Path, fabric: str, split: str, kind: str, name: str,
     idir = dst / kind / fabric / "images"
     idir.mkdir(parents=True, exist_ok=True)
     Image.fromarray(img).save(idir / name)
-    lists[f"{split}_{kind}"].append(str(idir / name))
+    lists[f"{split}_{kind}"].append(str((idir / name).resolve()))   # 绝对路径：ultralytics txt 清单要求
     if kind != "normal":
         ldir = dst / kind / fabric / "labels"
         ldir.mkdir(parents=True, exist_ok=True)
@@ -257,7 +257,7 @@ def run_yolo_mode(args, dst: Path) -> None:
                 save_tile(dst, fabric, rec["split"], "abnormal", name, patch, kept,
                           ign if ign.any() else None, lists, stats)
                 if any((x1 - x0) * (y1 - y0) >= args.large_area for _, x0, y0, x1, y1 in kept):
-                    lists["calib_large"].append(str(dst / "abnormal" / fabric / "images" / name))
+                    lists["calib_large"].append(str((dst / "abnormal" / fabric / "images" / name).resolve()))
             elif margin:
                 stats["skipped_margin"] += 1        # 缺陷近邻块：不入正常集（防污染）
             else:
@@ -304,8 +304,8 @@ def run_yolo_mode(args, dst: Path) -> None:
         {"global": {"note": "免登记；来源目录: " + str(root)}}, allow_unicode=True))
     (dst / "data_ultralytics.yaml").write_text(yaml.safe_dump({
         "path": str(dst.resolve()),
-        "train": [str(splits / "train_det.txt")],
-        "val": [str(splits / "val_det.txt")],
+        "train": [str((splits / "train_det.txt").resolve())],
+        "val": [str((splits / "val_det.txt").resolve())],
         "nc": len(CLASSES), "names": {i: n for i, n in enumerate(CLASSES)}},
         allow_unicode=True))
     report = {"source": str(root), "src_classes": src_names,
@@ -381,15 +381,15 @@ def run_strip_mode(args, dst: Path) -> None:
     splits = dst / "splits"; splits.mkdir(exist_ok=True)
     rng.shuffle(records)
     n_val = max(1, int(len(records) * args.val_ratio))
-    (splits / "train_normal.txt").write_text("\n".join(str(r["tile"]) for r in records[n_val:]))
-    (splits / "val_normal.txt").write_text("\n".join(str(r["tile"]) for r in records[:n_val]))
-    (splits / "train_det.txt").write_text("\n".join(str(r["tile"]) for r in synth_records))
+    (splits / "train_normal.txt").write_text("\n".join(str(r["tile"].resolve()) for r in records[n_val:]))
+    (splits / "val_normal.txt").write_text("\n".join(str(r["tile"].resolve()) for r in records[:n_val]))
+    (splits / "train_det.txt").write_text("\n".join(str(r["tile"].resolve()) for r in synth_records))
     (splits / "val_det.txt").write_text("")
     (splits / "calib_large.txt").write_text("")
     names = CLASSES
     (dst / "data_ultralytics.yaml").write_text(yaml.safe_dump(
-        {"path": str(dst.resolve()), "train": [str(splits / "train_det.txt")],
-         "val": [str(splits / "train_det.txt")], "nc": len(names),
+        {"path": str(dst.resolve()), "train": [str((splits / "train_det.txt").resolve())],
+         "val": [str((splits / "train_det.txt").resolve())], "nc": len(names),
          "names": {i: n for i, n in enumerate(names)}}, allow_unicode=True))
     print(f"[splits] normal train={len(records)-n_val} val={n_val} | synth_det={len(synth_records)}")
     print(f"[done] dataset at {dst} | fabrics={sorted({fabric_id_of(b.name) for b in bmps})}")
