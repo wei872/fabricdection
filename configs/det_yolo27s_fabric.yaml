@@ -1,0 +1,41 @@
+# S 分支：YOLO27s 风格检测器（self-trained，按 YOLO27 官方预览文档设计要点）
+# 要点映射：① 细+粗双尺度检测头（去中间头）② 加宽早期高分辨率 stage
+#          ③ 前景对齐监督（仅训练期）④ 部署一对一 NMS-free 头
+# YOLO27 官方权重发布后：替换 pretrained/nc/尺度定义即可，接口不变
+scale: s
+nc: 14                       # 待 Q2 类别终版
+imgsz: 1280
+pretrained: null             # YOLO27s 官方权重路径（发布后填）
+
+backbone:
+  style: yolo27_cnn          # N/S 档：精简卷积；L 档为 UltraViT（本案不需要）
+  widen_first_stage: 1.25    # 早期高分辨率 stage 加宽，强化 ~8px 级小疵点
+  min_target_px: 8
+
+neck:
+  type: pan_fpn
+
+head:
+  scales: [fine, coarse]     # 关键：双尺度头，无中间尺度
+  fine_stride: 4             # fine 头：断经/断纬/小疵点
+  coarse_stride: 32          # coarse 头：大片污渍/稀弄/档
+  scale_balance: fixed       # 融合特征固定缩放保持两尺度平衡（YOLO27 要点）
+  nms_free: true             # 部署：一对一检测头，无 NMS
+  one_to_many_train: true    # 训练期 one-to-many 监督
+
+train_only:
+  fg_alignment: true         # 前景对齐监督分支，导出/部署时裁掉（零成本）
+  fg_branch_depth: 2
+
+train:
+  epochs: 300
+  optimizer: auto
+  class_balance_sampler: true
+  hard_example_mining: {enabled: true, interval_epochs: 5, topk_fp: 64}
+  synthetic_ratio: 0.66      # 合成缺陷:真实异常 ≈ 2:1
+  patience: 50
+
+export:
+  format: tensorrt
+  half: true
+  drop_train_branches: [fg_alignment]  # 训练期分支部署裁掉

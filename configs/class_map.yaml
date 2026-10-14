@@ -1,0 +1,18 @@
+# 用户数据集类别名 → 本项目 CLASSES 别名映射（prepare_dataset.py --class-map）
+# 键为本项目类名（configs/data_fabric.yaml 编号），值为该类的全部别名（大小写不敏感）。
+# 与 CLASSES 同名的类别无需列出（自动直通）。未映射的源类别会告警并计入 dataset_report.json。
+broken_warp: [断经, jingduan, warp_break, end_out]
+broken_weft: [断纬, weft_break, weft_crack, pick_out]
+thin_thick_weft: [粗纬, 细纬, 粗细纬, thick_pick, slub_weft]
+hole: [破洞, 洞, hole_defect]
+knot: [结头, 结, knot_defect, slub_knot]
+stain_oil: [油污, 油渍, 污渍, oil_stain, stain]
+foreign_fiber: [异纤, 飞花, 杂物, foreign_yarn, contamination]
+streak_bar: [条痕, 横档, 档子, bar_mark, streak]
+edge_defect: [边缺, 破边, selvedge_defect]
+skip_draw: [漏针, 跳纱]
+double_pick: [双纬, 双引纬]
+slub: [竹节, 棉结]
+streak_bar: [条痕, 横档, 档子, 条影, 经柳, bar_mark, streak]
+edge_defect: [边缺, 破边, 边疵, selvedge_defect]
+other_known: [其它, 其他已知]

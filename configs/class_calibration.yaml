@@ -1,0 +1,5 @@
+# 逐类独立置信度标定表 —— 由验证集匹配记录拟合后覆写
+# （scripts/eval_metrics.py 导出记录 → PerClassCalibrator.fit_temperatures）
+# temperature: 该类独立温度系数；sev_w: (conf, 异常z, 尺寸) 严重度权重；
+# sev_crit/sev_maj: 该类严重度等级门限。未列出的类用代码内先验 (1.0,(0.5,0.3,0.2),0.7,0.45)
+broken_warp: {temperature: 1.0, sev_w: [0.5, 0.3, 0.2], sev_crit: 0.7, sev_maj: 0.45}
