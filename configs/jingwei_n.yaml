@@ -1,0 +1,127 @@
+# =============================================================================
+# 经纬 JingWei-N : 实时优先 (1280x1280). 目标 ~30+ FPS @ mid-range GPU / FP16.
+# 所有通道数在 model.width 上线性缩放; 结构细节见 docs/DESIGN.md
+# =============================================================================
+name: jingwei_n
+input_size: [1280, 1280]
+
+data:
+  nc: 19
+  dataset_yaml: configs/fabric19.yaml
+  names: ['纬线杂质', '断纬', '多股线', '纬线不直', '包边不重叠', '捻接器接头',
+          '小尾巴', '经线毛球', '包边不良', '手工接头', '纬斜', '短废纱线',
+          '单根包不进', '棉团', '蚊虫小黑点', '小布头', '稀缝', '油点线', '飘絮']
+
+model:
+  width: 1.0                 # n: 384ch @ P5; s 见 jingwei_s.yaml
+  depth: 1.0
+  stem_ch: 24                # stride2
+  detail_ch: 48              # stride4, 加宽浅层 (YOLO27 "strengthened HR features")
+  p3_ch: 96                  # stride8  -> 160x160, 微小缺陷
+  p4_ch: 192                 # stride16 -> 80x80,  仅融合
+  p5_ch: 384                 # stride32 -> 40x40,  大缺陷 + 全局上下文
+  num_blocks: [2, 2, 1]
+  neck_blocks: 1
+  head_width: 0.5
+  attn_p5: true              # P5 轴向自注意力 (UltraViT 思路, 只放在最深层)
+  attn_heads: 6
+  reflection_norm: true      # 局部对比度归一化 -> 去反光 / 光照变化
+  lcn_k: 15
+  balance_p3: 1.0            # 双尺度固定缩放, 保持两尺度平衡
+  balance_p5: 1.0
+  top_k: 300                 # NMS-free: 固定上限 -> 延迟确定
+  score_thresh: 0.05
+  reg_scale: 1.0
+  fg_align: true             # 前景对齐辅助分支, 训练时才有, 导出即删
+
+normality:
+  enabled: true
+  grid: 80                   # 记忆库 / 重建残差的基准网格 (stride16)
+  out_grid: 160              # 输出异常图 (stride8), 供检测头与安全网使用
+  patch_dim: 128             # 块特征维度 D
+  local_pool: 3              # PatchCore 局部聚合 3x3
+  n_prototypes: 8            # 布种原型数 K_f (用 normaltrain 聚类得到)
+  n_centroids: 256           # 每个原型压缩后的记忆库中心数 K
+  coreset_ratio: 0.1
+  bank_method: spherical_kmeans   # spherical_kmeans | coreset
+  seed: 0
+  recon_dim: 256             # Dinomaly 重建器 token 维度
+  recon_blocks: 4            # 线性注意力块数 (原 Dinomaly 用 8, 这里为实时性减半)
+  recon_heads: 8
+  recon_mlp_ratio: 2.0
+  recon_ratio: 4.0           # 噪声瓶颈膨胀比
+  dropout: 0.2               # bMlp 的 dropout = 噪声注入
+  jitter: 0.3                # FeatureJitter 强度
+  rec_tau: 0.10              # 重建残差校准阈值 (由 normalval 标定)
+  rec_slope: 12.0
+  fusion: gate               # gate | fixed
+  alpha: 0.6                 # 记忆库信号初始权重
+  beta: 0.4                  # 重建残差信号初始权重
+  target_fpr: 0.005          # normalval 上的目标误报率
+
+fusion:
+  anomaly_logit_gain: 1.0    # 异常图加到 objectness logit 的增益
+  anomaly_thresh: 0.5
+  large_area_ratio: 0.001    # 大缺陷定义: 面积 >= 0.1% 图幅 (1280^2 -> 1638 px)
+  min_iou_overlap: 0.1
+  score_boost: 0.35
+  box_margin: 1.15
+  min_box_px: 24
+  unknown_score_scale: 0.9
+  final_score_thresh: 0.15
+  roi_head: true             # 二级 ROI 分类 (精细分类 + 未知类)
+  roi_hidden: 256
+  roi_prior_weight: 0.5
+
+train:
+  loss_weights: {cls_o2m: 1.0, box_o2m: 2.0, obj_o2m: 1.0,
+                 cls_o2o: 1.5, box_o2o: 2.0, obj_o2o: 1.5, fg_align: 0.5}
+  class_weights: null        # 可填 19 个类的权重, 处理类别不均衡
+  o2o_candidates: 1600
+  rec_p_final: 0.9
+  rec_warmup: 1000
+  rec_factor: 0.1
+  rec_weight: 0.5
+  # ---- 脚本默认超参 ----
+  detector_epochs: 150
+  detector_batch: 8
+  detector_lr: 0.002
+  normality_iters: 10000
+  normality_batch: 8
+  normality_lr: 0.0005
+  weight_decay: 0.0005
+
+# Stage 0 (optional but recommended): offline DINOv2 teacher distillation.
+# The teacher is NOT in the deployed graph; see docs/DINO_PRETRAIN.md.
+dino:
+  teacher: dinov2_vits14       # ViT-S/14, Apache-2.0 standard weights
+  repo: facebookresearch/dinov2
+  weights: null                # local .pth for offline machines
+  crop: 448                    # multiple of patch=14 and stride=32
+  iters: 5000
+  batch: 4
+  lr: 0.0005
+  loss_weights: {n3: 1.0, n5: 1.0, rec: 1.0, patch: 0.5}
+
+# 前景/背景 + 布幅边缘折入抑制（见 docs/FOREGROUND.md）
+foreground:
+  enabled: true
+  hidden: 32                  # 缺陷前景小头隐层通道
+  edge_band_px: 64            # 布边内侧折入带宽度（像素）
+  edge_attenuation: 0.80      # 折入带内异常衰减强度
+  texture_thresh: 0.20        # 纹理能量→布幅掩膜阈值
+  slope: 30.0
+  target_shrink: 0.08         # YOLO 框内缩后作前景正样本
+  pos_weight: 5.0
+  loss_weight: 0.5
+  fabric_mask_thresh: 0.30    # 安全网判定“在布幅内”
+  edge_band_thresh: 0.08
+  defect_fg_thresh: 0.25      # 学习到的缺陷前景阈值
+  min_fabric_frac: 0.50
+  fold_aspect_ratio: 3.0      # 长宽比 > 此值视为折入状
+  edge_peak_override: 0.80    # 异常峰值高于此值仍强制报警
+
+deploy:
+  half: true
+  int8: false
+  opset: 17

@@ -1,0 +1,44 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# ---- Training artifacts (large, keep out of git) ----
+runs/
+weights/
+checkpoints/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.plan
+*.trt
+*.ckpt
+memory_banks/
+*.npz
+*.npy
+wandb/
+mlruns/
+
+# ---- Data (your dataset lives outside the repo; dataset.yaml only holds paths) ----
+dataset/images/
+dataset/labels/
+dataset/normal/
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+!docs/assets/*.png
+!docs/assets/*.jpg
+
+# ---- OS / editor ----
+.DS_Store
+.idea/
+.vscode/
+*.swp

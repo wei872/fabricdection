@@ -1,0 +1,28 @@
+# =============================================================================
+# 布匹缺陷数据集 (19 类). 类别名与 dataset/dataset.yaml 完全一致。
+# TODO: 把下面四个路径改成你机器上的实际路径 (原 yaml 中是 Windows 路径:
+#   D:/tyhn/yolo/dataset/source5_augmented/... )
+# 推荐目录结构:
+#   DATASET_ROOT/
+#     images/train/  images/val/            <- YOLO 图片
+#     labels/train/  labels/val/            <- YOLO .txt (cls cx cy w h, 归一化)
+#     normal/images/train/  normal/images/val/  <- 纯正常图, 无标签
+# =============================================================================
+path: dataset
+train: dataset/images/train
+val: dataset/images/val
+normaltrain: dataset/normal/images/train
+normalval: dataset/normal/images/val
+
+nc: 19
+names: ['纬线杂质', '断纬', '多股线', '纬线不直', '包边不重叠', '捻接器接头',
+        '小尾巴', '经线毛球', '包边不良', '手工接头', '纬斜', '短废纱线',
+        '单根包不进', '棉团', '蚊虫小黑点', '小布头', '稀缝', '油点线', '飘絮']
+
+# 缺陷形态分组 —— 用于评估与损失加权 (大缺陷必须不漏)
+small_like: ['蚊虫小黑点', '小尾巴', '棉团', '小布头', '飘絮', '短废纱线', '经线毛球']
+line_like: ['断纬', '多股线', '纬线不直', '油点线', '捻接器接头', '手工接头', '纬线杂质']
+large_like: ['包边不重叠', '包边不良', '单根包不进', '纬斜', '稀缝', '断纬']
+
+# 大缺陷判定: bbox 面积 / 图幅面积 >= 此值
+large_area_ratio: 0.001
