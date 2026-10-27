@@ -159,7 +159,7 @@ anomaly (1,1,G,G)     context (1,3,G,G)   # pico: 8 outputs total
 - `test_22`：合成布幅 + 折入图，`fabric_mask` 正确区分布面/背景，
   `edge_band` 只出现在布边内侧；
 - `test_23`：安全网拒绝正常折入，但保留中央大缺陷和高前景的边缘缺陷；
-- 27 项单元测试全过（含中文 / Unicode 路径 / 非方形布幅图 / 训练日志 / 断点续训回归）；ONNX 导出 8 个静态输出（pico）通过 `onnx.checker`；
+- 28 项单元测试全过（含中文 / Unicode 路径 / 非方形布幅图 / 训练日志 / 断点续训 / numpy RNG 回归）；ONNX 导出 8 个静态输出（pico）通过 `onnx.checker`；
 - `train_detector.py` 训练图中新增 `fg_context` 损失，反向传播有限。
 
 ## 9. 边界

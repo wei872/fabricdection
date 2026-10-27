@@ -25,7 +25,7 @@
 
 **已验证**（见 §13）：参考实现在 1280×1280 下 n 变体 **6.32 M 参数 / 17.12 G MACs**，
 无 Tensor Core 卡专用的 pico 变体 **2.87 M / 8.42 G MACs**，
-27 项单元测试全过（含中文 / Unicode 路径 / 非方形图 / 训练日志 / 断点续训回归），ONNX 导出成功且输出全为静态形状。
+28 项单元测试全过（含中文 / Unicode 路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG 回归），ONNX 导出成功且输出全为静态形状。
 
 > ⚠️ **诚实声明**：仓库里目前只有 `dataset/dataset.yaml`（路径指向你本机的
 > `D:/tyhn/yolo/...`），**没有真实图片**。因此本文所有的精度数字都是**设计目标 / 验收指标**，
@@ -735,7 +735,7 @@ tools/           阶段 0 + A–E 的 CLI（pretrain_dino / train / build / cali
                  evaluate / predict / export / benchmark / bench_device）
 tools/_common.py 共享数据/模型加载 + log()/format_eta() 进度日志 +
                  save_checkpoint()/resume_checkpoint()/RNG 断点续训工具
-tests/test_model.py  27 项单元测试（含中文路径 / 非方形图 / 训练日志 / 断点续训回归）
+tests/test_model.py  28 项单元测试（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG 回归）
 docs/DESIGN.md   本文
 docs/TRAINING.md 训练与数据准备手册
 docs/DEPLOYMENT.md 实时部署手册
@@ -865,9 +865,15 @@ Windows 控制台 / 重定向日志还会缓冲 `print`，于是用户会以为�
    若想延长训练，只需把 `--epochs` 或 `--iters` 调大。
 5. **RNG 精确恢复**：不仅恢复 torch / CUDA / Python RNG，也恢复数据集增广用的
    `np.random.Generator` 状态；并以 `weights_only=True` 友好的纯容器保存，不触发
-   PyTorch 2.6+ 的 `FutureWarning`。
+   PyTorch 2.6+ 的 `FutureWarning`。`tools/_common.py::_to_plain` 会递归把
+   `BitGenerator.state` 里的 `np.ndarray` / `np.generic` 转成 `dtype + list` 的纯
+   Python 结构：PCG64/PCG64DXSM 的 `state` 是 dict、Philox/SFC64/MT19937 的
+   `counter/key` 是 ndarray、旧版 numpy 可能直接给 uint32 ndarray，三种形态都能
+   正确 round-trip。恢复时用 `_from_plain` 还原 dtype；checkpoint 加
+   `__jingwei_rng_format__=2` 标记，旧格式仍兼容。
 6. `test_27_resume_training` 覆盖三个阶段的“训练 1 步 → 中断 → 完整恢复 → 继续”，
-   以及 `dino_init.pt` 的 weight-only 热启动。
+   以及 `dino_init.pt` 的 weight-only 热启动；`test_28_numpy_rng_state_checkpoint`
+   覆盖五种 BitGenerator 与真实 `NormalImageDataset` 的 `.rng` 保存 / 恢复。
 
 典型用法：
 
@@ -884,6 +890,11 @@ python tools/train_normality.py --cfg configs/jingwei_p.yaml \
     --resume runs/normality/last.pt --iters 10000
 ```
 
+长时间训练建议显式缩短保存间隔，例如阶段 0 加 `--save-interval 100`、
+阶段 A 加 `--save-interval 5`；默认阶段 0/B 为 500 iters、阶段 A 每 epoch。
+若保存 checkpoint 时进程崩溃，崩溃点之前最近的 `last.pt` / 编号快照仍可用于
+`--resume`；崩溃发生在 `save_checkpoint` 之前则不会生成新文件。
+
 ---
 
 ## 13. 已验证结果（实测，非目标值）
@@ -891,7 +902,7 @@ python tools/train_normality.py --cfg configs/jingwei_p.yaml \
 执行 `python -m unittest discover -s tests -v`（CPU 即可，无需数据/GPU）：
 
 ```
-Ran 27 tests in ~105 s — OK
+Ran 28 tests in ~106 s — OK
 
   params = 6.32 M        MACs @1280 = 17.12 G   (jingwei_n)
   pico   = 2.87 M        MACs @1280 =  8.42 G   (jingwei_p)
@@ -899,6 +910,7 @@ Ran 27 tests in ~105 s — OK
   non-square 1040x2448-like fabric frame augmentation = OK
   stage 0 / A / B startup + per-iteration progress logs = OK
   stage 0 / A / B full checkpoint resume + weight-only warm start = OK
+  numpy BitGenerator RNG state (PCG64/Philox/SFC64/MT19937) = OK
 ```
 
 覆盖内容：
@@ -932,6 +944,7 @@ Ran 27 tests in ~105 s — OK
 | 25 | **非方形 / 长条布幅图（如 1040×2448）在反光增广下的广播正确性** |
 | 26 | 阶段 0 / A / B 训练脚本的启动日志与按 iteration 的进度 / ETA 日志 |
 | 27 | 阶段 0 / A / B 完整 checkpoint 断点续训（optimizer / scheduler / RNG / epoch / iter）与 weight-only 热启动 |
+| 28 | numpy `BitGenerator.state` 的 dict / ndarray 形态在 `weights_only=True` checkpoint 中递归保存与恢复（Windows / numpy 2.x `.tolist()` 崩溃回归） |
 
 **布种描述符实测**（合成织纹，周期 5/9/13/19 px、亮度 100/170、反光 0/0.9）：
 
@@ -944,8 +957,10 @@ Ran 27 tests in ~105 s — OK
 `calibrate_fusion` / `evaluate` / `predict` / `export` 全部跑通；`predict` 另在
 中文图片名、中文输出目录、中文 `.npz` 原型、中文视频名下跑通（见 §12.5 / 测试 24）。
 `pretrain_dino` / `train_detector` / `train_normality` 另验证启动日志、
-`--log-interval` batch 进度与 ETA（见 §12.7 / 测试 26），以及完整 checkpoint
-断点续训与 weight-only 热启动（见 §12.8 / 测试 27）。
+`--log-interval` batch 进度与 ETA（见 §12.7 / 测试 26），完整 checkpoint
+断点续训与 weight-only 热启动（见 §12.8 / 测试 27），以及用真实
+`NormalImageDataset` / `YOLODefectDataset` 写 / 恢复 numpy RNG state
+（见 §12.8 / 测试 28）。
 
 **ONNX 导出**：`tools/export.py` 成功导出 1280² 静态图，
 `onnx.checker` 通过；`roi_head=false`（pico）为 8 个输出（+context），

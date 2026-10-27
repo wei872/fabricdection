@@ -7,8 +7,8 @@ Run from the repo root::
 No pytest / no GPU / no real data needed. It checks shapes at the required
 1280x1280 input, trainability, the deterministic safety net, fabric-type
 invariance, memory-bank algebra, the dataset readers, Chinese / Unicode
-file paths, non-square fabric augmentation, training progress logs, and
-full checkpoint resume (27 tests).
+file paths, non-square fabric augmentation, training progress logs,
+full checkpoint resume, and numpy RNG state checkpointing (28 tests).
 """
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tools"))   # import tools/_common.py helpers
 
 from jingwei import build_model, load_config                       # noqa: E402
 from jingwei.fabric import (fabric_descriptor, fit_fabric_prototypes,  # noqa: E402
@@ -746,6 +747,61 @@ class TestModel(unittest.TestCase):
                               "--out", str(out / "warm")))
             self.assertIn("mode=weights-only", warm)
             self.assertIn("starting from epoch 1", warm)
+
+    # ------------------------------------------------------- numpy RNG state
+    def test_28_numpy_rng_state_checkpoint(self):
+        """BitGenerator state must survive weights_only=True on Windows / numpy 2.x.
+
+        Regression for:
+          AttributeError: 'dict' object has no attribute 'tolist'
+        PCG64/PCG64DXSM expose ``state`` as a dict; Philox/SFC64/MT19937 use
+        ndarray fields.  The checkpoint must contain no raw numpy arrays.
+        """
+        from _common import (_generator_state, _restore_generator_state,
+                             collect_rng_state, restore_rng_state,
+                             save_checkpoint)
+        from jingwei.data import NormalImageDataset
+
+        for name in ("PCG64", "PCG64DXSM", "Philox", "SFC64", "MT19937"):
+            cls = getattr(np.random, name, None)
+            if cls is None:
+                continue
+            rng = np.random.Generator(cls())
+            for _ in range(5):
+                rng.random()
+            st = _generator_state(rng)
+            self.assertEqual(st.get("__jingwei_rng_format__"), 2)
+            expected = [rng.random() for _ in range(4)]
+            with tempfile.TemporaryDirectory() as d:
+                p = Path(d) / "rng.pt"
+                save_checkpoint({"rng": st}, p)
+                loaded = torch_load(p, map_location="cpu")["rng"]
+            _restore_generator_state(rng, loaded)
+            self.assertEqual([rng.random() for _ in range(4)], expected,
+                             f"state mismatch for {name}")
+
+        # Real dataset object, not the smoke dataset (which has no .rng).
+        with tempfile.TemporaryDirectory() as d:
+            img_dir = Path(d) / "normaltrain" / "images"
+            img_dir.mkdir(parents=True)
+            for i in range(3):
+                imwrite_unicode(str(img_dir / f"img_{i}.jpg"),
+                                np.full((64, 96, 3), 40 + i * 30,
+                                        dtype=np.uint8))
+            ds = NormalImageDataset(img_dir, img_size=64, augment=True,
+                                    seed=11, with_descriptor=False)
+            self.assertTrue(hasattr(ds, "rng"))
+            for _ in range(3):
+                ds.rng.random()
+            state = collect_rng_state(ds)
+            self.assertIn("numpy", state)
+            with tempfile.TemporaryDirectory() as d2:
+                p = Path(d2) / "ckpt.pt"
+                save_checkpoint({"rng": state}, p)
+                loaded = torch_load(p, map_location="cpu")["rng"]
+            expected = [ds.rng.random() for _ in range(5)]
+            restore_rng_state(loaded, ds)
+            self.assertEqual([ds.rng.random() for _ in range(5)], expected)
 
 
 if __name__ == "__main__":

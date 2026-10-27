@@ -32,7 +32,7 @@
 | `jingwei/` | 参考实现：主干 / 双尺度头 / 记忆库 / 线性注意力重建 / 安全网 / 损失 / 数据集 / **Unicode 安全图像 I/O** / **安全 checkpoint 加载** / DINO teacher 工具 |
 | `configs/` | `jingwei_n.yaml`（实时优先）、`jingwei_s.yaml`（精度优先）、**`jingwei_p.yaml`（GTX 1660 SUPER 等无 Tensor Core 卡专用）**、`fabric19.yaml`（数据）；均含 `dino:` 阶段 0 配置 |
 | `tools/` | **DINOv2 蒸馏预训练**、训练（启动 / batch 级日志 + **完整断点续训**）、建库、标定、评估、推理、导出、算力剖析、**真实设备延迟实测** CLI |
-| `tests/test_model.py` | 27 项单元测试（含中文路径 / 非方形图 / 训练日志 / 断点续训回归） |
+| `tests/test_model.py` | 28 项单元测试（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG 回归） |
 
 > `dataset/dataset.yaml` 保持原样，作为 19 个类别名的真源。
 
@@ -43,7 +43,7 @@
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m unittest discover -s tests -v     # 应输出 OK (27 tests，含中文路径 / 非方形图 / 训练日志 / 断点续训回归)
+python -m unittest discover -s tests -v     # 应输出 OK (28 tests，含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG 回归)
 python tools/benchmark.py --both            # 参数量 / MACs / 延迟估算
 ```
 
@@ -93,7 +93,7 @@ python tools/train_normality.py  --cfg configs/jingwei_n.yaml --resume runs/norm
 
 ```
 python -m unittest discover -s tests -v
-Ran 27 tests in ~105 s — OK
+Ran 28 tests in ~106 s — OK
   jingwei_n = 6.32 M / 17.12 G MACs @1280
   jingwei_p = 2.87 M /  8.42 G MACs @1280
   stage 0 DINOv2 distillation + foreground/fold context = smoke OK
@@ -101,6 +101,7 @@ Ran 27 tests in ~105 s — OK
   non-square 1040x2448-like fabric frame augmentation = OK
   stage 0 / A / B startup + per-iteration progress logs = OK
   stage 0 / A / B full checkpoint resume + weight-only warm start = OK
+  numpy BitGenerator RNG state (PCG64/Philox/SFC64/MT19937) = OK
 ```
 
 | 变体 | 参数 | 1280² MACs | 640² MACs | RTX 4090 估算 | Jetson AGX Orin 估算 | **GTX 1660 SUPER 估算** |
@@ -143,6 +144,9 @@ JingWei-n 在 1280² 仍只用了约六成的计算量。
 - **断点续训**：`last.pt` 现在保存模型 + 优化器 + scheduler + RNG + epoch/iter
   完整状态；`--resume` 自动识别完整 checkpoint 与 weight-only 热启动。
   `--save-interval` 保留编号快照，写入使用临时文件 + `os.replace` 原子替换。
+  numpy `BitGenerator.state` 的 dict / ndarray 形态会递归转成纯 Python 容器，
+  兼容 Windows / numpy 2.x 且仍是 `weights_only=True` 友好；不再因
+  `'dict' object has no attribute 'tolist'` 在保存 checkpoint 时崩溃。
   详见 [docs/DESIGN.md §12.8](docs/DESIGN.md)。
 
 ---

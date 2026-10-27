@@ -110,22 +110,66 @@ def is_resumable(state: dict, stage: str) -> bool:
 
 # --------------------------------------------------------------------------------------
 # RNG state (kept weights_only=True friendly: no raw numpy arrays / custom objects)
+#
+# numpy's bit_generator.state is version / BitGenerator dependent.  PCG64 / PCG64DXSM
+# store ``state`` as a *dict* of Python ints, Philox / SFC64 store ndarray fields,
+# MT19937 stores a big uint32 ``key`` ndarray, while older numpy builds may expose a
+# plain uint32 ndarray directly.  The old code assumed ndarray.tolist() and crashed on
+# Windows / numpy 2.x with:
+#   AttributeError: 'dict' object has no attribute 'tolist'
+# We now recursively convert every ndarray / numpy scalar to pure Python containers.
 # --------------------------------------------------------------------------------------
+_RNG_FORMAT_KEY = "__jingwei_rng_format__"
+_NP_ARRAY_KEY = "__jingwei_np_array__"
+
+
+def _to_plain(obj):
+    """Recursively turn numpy arrays / scalars into weights_only-safe Python data."""
+    if isinstance(obj, np.ndarray):
+        return {
+            _NP_ARRAY_KEY: True,
+            "dtype": str(obj.dtype),
+            "data": obj.tolist(),
+        }
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, dict):
+        return {k: _to_plain(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_plain(v) for v in obj]
+    if isinstance(obj, (int, float, str, bytes, bool)) or obj is None:
+        return obj
+    # Unknown objects must not be pickled into a weights_only checkpoint.
+    return str(obj)
+
+
+def _from_plain(obj):
+    """Inverse of :func:`_to_plain` for numpy BitGenerator state dicts."""
+    if isinstance(obj, dict):
+        if obj.get(_NP_ARRAY_KEY) is True and "dtype" in obj and "data" in obj:
+            return np.asarray(obj["data"], dtype=np.dtype(obj["dtype"]))
+        return {k: _from_plain(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_from_plain(v) for v in obj]
+    return obj
+
+
 def _generator_state(rng) -> dict:
-    st = rng.bit_generator.state
-    return {
-        "bit_generator": str(st["bit_generator"]),
-        "state": st["state"].tolist(),
-        "has_uint32": int(st["has_uint32"]),
-        "uinteger": int(st["uinteger"]),
-    }
+    st = _to_plain(rng.bit_generator.state)
+    st[_RNG_FORMAT_KEY] = 2
+    return st
 
 
 def _restore_generator_state(rng, st: dict) -> None:
-    state = dict(st)
-    state["state"] = np.asarray(state["state"], dtype=np.uint32)
-    state["has_uint32"] = int(state["has_uint32"])
-    state["uinteger"] = int(state["uinteger"])
+    if st.get(_RNG_FORMAT_KEY) == 2:
+        state = _from_plain({k: v for k, v in st.items()
+                             if k != _RNG_FORMAT_KEY})
+    else:
+        # Backward compatibility with v1 checkpoints written before the fix.
+        state = dict(st)
+        state["state"] = np.asarray(state["state"], dtype=np.uint32)
+        state["has_uint32"] = int(state["has_uint32"])
+        state["uinteger"] = int(state["uinteger"])
     rng.bit_generator.state = state
 
 
@@ -162,8 +206,9 @@ def restore_rng_state(state: dict, dataset=None) -> None:
         if rng is not None and hasattr(rng, "bit_generator"):
             try:
                 _restore_generator_state(rng, state["numpy"])
-            except (KeyError, TypeError, ValueError):
-                pass
+            except Exception as exc:  # pragma: no cover - corrupt / foreign ckpt
+                log(f"[!] could not restore numpy RNG state ({exc}); "
+                    "training continues with the seeded generator")
 
 
 def resume_checkpoint(state_or_path, stage: str, model, optimizer=None,

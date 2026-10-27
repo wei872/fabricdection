@@ -126,7 +126,7 @@ python tools/pretrain_dino.py --smoke 4 --iters 2 --cfg configs/jingwei_p.yaml
 ```
 
 单元测试 `tests/test_model.py::test_20/21`（另见 `test_22/23` 前景/折入）覆盖同一路径：
-`python -m unittest discover -s tests -v` 应输出 `OK (27 tests)`（含中文路径 / 非方形图 / 训练日志 / 断点续训回归）。
+`python -m unittest discover -s tests -v` 应输出 `OK (28 tests)`（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG 回归）。
 本地 teacher 权重与 checkpoint 统一通过 `jingwei.utils.torch_load` 读取，默认
 `weights_only=True`，不再触发 PyTorch 2.6+ 的 `FutureWarning`。
 阶段 0 启动即打印 teacher / 数据 / device / 参数量，并按
@@ -139,7 +139,7 @@ python tools/pretrain_dino.py --smoke 4 --iters 2 --cfg configs/jingwei_p.yaml
 
 ```bash
 python tools/pretrain_dino.py --cfg configs/jingwei_p.yaml \
-    --resume runs/dino/last.pt --log-interval 100
+    --resume runs/dino/last.pt --log-interval 100 --save-interval 100
 ```
 
 完整 checkpoint 会恢复 student、dino adaptor、optimizer、RNG、已完成的
@@ -198,6 +198,8 @@ teacher 会连同随机权重一起保存，保证 smoke 复现。详见
 | OOM | teacher 太大 / crop 太大 / batch 太大 | 换 `dinov2_vits14`；`--batch 2`；`--crop 224` |
 | loss 不下降 | 学习率太小 / iters 太少 / 数据太单一 | 先跑 5000 iters；`--lr 0.0005`；确认 normaltrain 覆盖多布种 |
 | `no valid crop` | crop 不是 patch 和 32 的公倍数 | 用 224/448/672/896/1120；脚本会自动回退到 448 |
+| `AttributeError: 'dict' object has no attribute 'tolist'`（第 500 iter 保存 `last.pt` 时） | `BitGenerator.state['state']` 在 Windows / numpy 2.x 下是 dict，不是 ndarray | 已修复为递归纯 Python 序列化；拉最新代码后重跑。崩溃发生在写文件之前，所以该次没有产生可用 `last.pt`；建议加 `--save-interval 100`，见 [DESIGN.md §12.8](DESIGN.md) |
+| `UserWarning: xFormers is not available (SwiGLU/Attention/Block)` | DINOv2 hub 未检测到 xFormers，回退到标准 attention | 仅警告，不影响蒸馏；可忽略 |
 | 想用自己无标签图做 DINO 自监督预训练 | 可行但昂贵 | 需要自己跑 DINOv2/DINO 训练；本工具的 teacher 权重是官方预训练好的，成本更低 |
 | 能不能直接把 DINOv2 当 backbone | 不建议 | 1280² 下 ViT-B/14 >100 G MACs，1660S 无法实时；蒸馏后推理图不变 |
 

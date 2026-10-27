@@ -15,7 +15,7 @@ pip install onnx tensorrt ultralytics
 
 最低验证环境（本仓库实测）：Python 3.11 + torch 2.2.2 (CPU 即可) +
 numpy 1.26 + opencv-python-headless + PyYAML + scipy + tqdm。
-跑 `python -m unittest discover -s tests -v` 应输出 `OK`（27 项）。
+跑 `python -m unittest discover -s tests -v` 应输出 `OK`（28 项）。
 阶段 0 的 `--smoke` 模式用 synthetic teacher，不需要下载 DINOv2 权重。
 
 ## 2. 数据准备
@@ -222,6 +222,10 @@ python tools/train_normality.py --cfg configs/jingwei_n.yaml \
 - 仅权重的 checkpoint（如 `dino_init.pt`）→ 日志显示 `mode=weights-only`，
   只热启动模型，从第 1 个 epoch/iter 开始。
 
+长任务建议加 `--save-interval 100`（阶段 0 / B）或 `--save-interval 5`（阶段 A），
+避免默认 500 iters / 每 epoch 才写一次导致中断损失过多。保存发生在
+`save_checkpoint` 原子写之前若崩溃，不会产生新的 `last.pt`，此时重新运行即可。
+
 恢复阶段 0 时，teacher / crop / batch / lr / loss weights 会优先使用 checkpoint
 里的配置；若 CLI 传入冲突参数会给出警告。阶段 A/B 若 cfg、data、seed、batch、lr
 与 checkpoint 不同也会警告。详见 [DESIGN.md §12.8](DESIGN.md)。
@@ -229,7 +233,7 @@ python tools/train_normality.py --cfg configs/jingwei_n.yaml \
 ## 4. 快速自检（无真实数据）
 
 ```bash
-python -m unittest discover -s tests -v                 # 27 项，约 105 s（含中文路径 / 非方形图 / 训练日志 / 断点续训回归）
+python -m unittest discover -s tests -v                 # 28 项，约 106 s（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG 回归）
 python tools/benchmark.py --all                         # p/n/s 参数量 / MACs / 延迟估算
 python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both  # 在你的 GPU 上实测
 python tools/train_detector.py   --smoke 2 --epochs 1 --batch 1 --device cpu --log-interval 1
@@ -254,6 +258,8 @@ python tools/export.py --check --out runs/export/jingwei_n.onnx
 | 训练时长时间没有任何日志 | 旧版只在 epoch 结束打印；Windows 控制台 / 重定向 stdout 还会缓冲 | 已加入启动日志 + `--log-interval` batch 日志 + `flush=True`；用 `--log-interval 20`（默认）观察进度，`--log-interval 0` 关闭 iter 日志；仍不显示时用 `python -u tools/train_detector.py ...` 或设置 `PYTHONUNBUFFERED=1`，见 [DESIGN.md §12.7](DESIGN.md) |
 | 训练中断后要从头开始 | 旧版 `last.pt` 只有模型权重 | 现在 `last.pt` 含优化器 / scheduler / RNG / epoch/iter；用 `--resume .../last.pt` 继续，日志出现 `mode=full` 才表示完整恢复；见 [DESIGN.md §12.8](DESIGN.md) |
 | `--resume dino_init.pt` 显示 `weights-only` | `dino_init.pt` 是阶段 0 交给阶段 A 的权重文件，不含训练状态 | 这是正常的 weight-only 热启动；若要继续阶段 0 训练，应 `--resume runs/dino/last.pt` |
+| `AttributeError: 'dict' object has no attribute 'tolist'`（在 `_generator_state` / `collect_rng_state` 保存 checkpoint 时） | `np.random.Generator.bit_generator.state` 的 `state` 字段在不同 numpy / BitGenerator 下可能是 dict 或 ndarray；旧代码假设 ndarray 并调用 `.tolist()` | 已修复为递归 `_to_plain` / `_from_plain` 转换，纯 Python 容器保存且 `weights_only=True` 友好；`test_28` 覆盖 PCG64/PCG64DXSM/Philox/SFC64/MT19937 与真实 `NormalImageDataset`。若崩溃发生在写 `last.pt` 之前，则没有生成新 checkpoint，拉最新代码后重新运行即可；建议加 `--save-interval 100` 缩短中断损失。见 [DESIGN.md §12.8](DESIGN.md) |
+| xFormers is not available (SwiGLU / Attention / Block) UserWarning | DINOv2 hub 代码检测到未安装 xFormers，自动回退到标准 PyTorch attention | 仅警告，不影响 teacher 加载或蒸馏正确性；可忽略，或安装与 torch/CUDA 匹配的 xFormers |
 | 标签全空 | `labels` 目录推断失败 | 显式传 `--labels`（工具会自动把 `/images/` 换成 `/labels/`）；中文标签文件名同样支持 |
 | `rec_loss` → 0 | 主干没冻结，出现塌缩解 | 检查阶段 B 只把 `normality_parameters()` 加入优化器 |
 | 全图误报 | 记忆库没标定 / 用了未训练权重 | 必须先跑阶段 C；`tau` 由 `normalval` 标定 |
