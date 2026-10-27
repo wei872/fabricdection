@@ -7,7 +7,8 @@ Run from the repo root::
 No pytest / no GPU / no real data needed. It checks shapes at the required
 1280x1280 input, trainability, the deterministic safety net, fabric-type
 invariance, memory-bank algebra, the dataset readers, Chinese / Unicode
-file paths, and non-square fabric augmentation (25 tests).
+file paths, non-square fabric augmentation, and training progress logs
+(26 tests).
 """
 from __future__ import annotations
 
@@ -597,6 +598,44 @@ class TestModel(unittest.TestCase):
             item2 = nd[0]
             self.assertEqual(tuple(item2["image"].shape), (3, 64, 64))
             self.assertEqual(tuple(item2["descriptor"].shape), (8,))
+
+    # ---------------------------------------------------------- training logs
+    def test_26_training_progress_logs(self):
+        """Stage 0 / A / B must print startup + per-iteration progress."""
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "ascii:backslashreplace"
+
+        def run(cmd):
+            proc = subprocess.run(cmd, cwd=str(ROOT), env=env,
+                                  capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=180)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return proc.stdout
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+
+            det = run([sys.executable, "tools/train_detector.py",
+                       "--cfg", CFG_P, "--smoke", "1", "--epochs", "1",
+                       "--batch", "1", "--device", "cpu", "--num-workers", "0",
+                       "--log-interval", "1", "--out", str(out / "det")])
+            for token in ("JingWei stage A", "batches/epoch", "log_interval",
+                          "epoch   1/1  iter", "eta=", "checkpoint ->", "saved ->"):
+                self.assertIn(token, det)
+
+            norm = run([sys.executable, "tools/train_normality.py",
+                        "--cfg", CFG_P, "--smoke", "1", "--iters", "1",
+                        "--batch", "1", "--device", "cpu",
+                        "--log-interval", "1", "--out", str(out / "norm")])
+            for token in ("JingWei stage B", "iter      1/1", "eta=", "saved ->"):
+                self.assertIn(token, norm)
+
+            dino = run([sys.executable, "tools/pretrain_dino.py",
+                        "--cfg", CFG_P, "--smoke", "1", "--iters", "1",
+                        "--batch", "1", "--log-interval", "1",
+                        "--out", str(out / "dino")])
+            for token in ("JingWei stage 0", "iter      1/1", "eta=", "next:"):
+                self.assertIn(token, dino)
 
 
 if __name__ == "__main__":

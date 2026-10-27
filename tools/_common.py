@@ -1,10 +1,12 @@
 """Shared helpers for the CLI tools.
 
 Image / video reads go through :mod:`jingwei.image_io`, so Chinese / Unicode
-dataset paths work on Windows as well as Linux.
+dataset paths work on Windows as well as Linux.  Training scripts use
+:func:`log` so progress appears immediately even when stdout is buffered.
 """
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -24,6 +26,30 @@ from jingwei.data import NormalImageDataset, YOLODefectDataset, collate, list_im
 from jingwei.fabric import fabric_descriptor, fit_fabric_prototypes
 from jingwei.image_io import console_safe, imread_unicode
 from jingwei.utils import torch_load
+
+
+def log(msg: str = "", *, flush: bool = True) -> None:
+    """Print an ASCII-safe training line and flush immediately.
+
+    Windows consoles and redirected logs often buffer ``print`` output, which
+    makes a long epoch look like a hang.  ``flush=True`` makes every line show
+    up as soon as it is produced.
+    """
+    print(console_safe(msg), flush=flush)
+
+
+def format_eta(seconds: float) -> str:
+    """Human-readable duration for progress / ETA logs."""
+    if not math.isfinite(seconds) or seconds < 0:
+        return "n/a"
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m{s:02d}s"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
 
 
 def data_paths(cfg, override: str | None = None) -> dict:

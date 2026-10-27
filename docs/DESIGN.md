@@ -25,7 +25,7 @@
 
 **已验证**（见 §13）：参考实现在 1280×1280 下 n 变体 **6.32 M 参数 / 17.12 G MACs**，
 无 Tensor Core 卡专用的 pico 变体 **2.87 M / 8.42 G MACs**，
-25 项单元测试全过（含中文 / Unicode 路径 / 非方形图回归），ONNX 导出成功且输出全为静态形状。
+26 项单元测试全过（含中文 / Unicode 路径 / 非方形图 / 训练日志回归），ONNX 导出成功且输出全为静态形状。
 
 > ⚠️ **诚实声明**：仓库里目前只有 `dataset/dataset.yaml`（路径指向你本机的
 > `D:/tyhn/yolo/...`），**没有真实图片**。因此本文所有的精度数字都是**设计目标 / 验收指标**，
@@ -733,7 +733,8 @@ jingwei/
   model.py       JingWei 顶层（训练 / 推理 / 导出）
 tools/           阶段 0 + A–E 的 CLI（pretrain_dino / train / build / calibrate /
                  evaluate / predict / export / benchmark / bench_device）
-tests/test_model.py  25 项单元测试（含中文路径 / 非方形图回归）
+tools/_common.py 共享数据/模型加载 + log()/format_eta() 进度日志（flush=True）
+tests/test_model.py  26 项单元测试（含中文路径 / 非方形图 / 训练日志回归）
 docs/DESIGN.md   本文
 docs/TRAINING.md 训练与数据准备手册
 docs/DEPLOYMENT.md 实时部署手册
@@ -809,6 +810,27 @@ PyTorch 2.6+ 对 `torch.load` 默认 `weights_only=False` 会发 `FutureWarning`
 `weights_only=True`；若第三方 DINOv1 权重里含 `argparse.Namespace` 等对象，
 则回退到 `weights_only=False` 并给出 `RuntimeWarning`（仅加载可信文件）。
 
+### 12.7 训练日志与进度显示
+
+旧版 `train_detector.py` 只在**每个 epoch 结束**时打印一行；阶段 0 / B 也
+只在每 100 / 200 iters 打印一次。真实数据集一个 epoch 可能跑几十分钟到几小时，
+Windows 控制台 / 重定向日志还会缓冲 `print`，于是用户会以为程序卡死、没有日志。
+
+现在 `tools/_common.py` 提供 `log()`（ASCII 安全 + `flush=True`）和
+`format_eta()`，并接入 `pretrain_dino.py` / `train_detector.py` /
+`train_normality.py`：
+
+1. **启动日志**：配置、数据 yaml、device/GPU、resume/ckpt、输出目录、模型参数量、
+   可训练参数量、图片数、batch、lr、workers、log_interval；
+2. **batch / iteration 日志**：当前 epoch/iter、区间平均 loss、当前 lr、it/s、
+   已耗时、剩余 ETA；
+3. **每 epoch 汇总 + checkpoint 保存路径**；
+4. `--log-interval N` 可调，默认 detector 20 batches、阶段 0 / B 100 iters；
+   `--log-interval 0` 只保留启动/epoch/保存日志；
+5. 所有日志立即 flush；若 IDE / 管道仍缓冲，可加 `python -u` 或
+   `PYTHONUNBUFFERED=1`。`test_26_training_progress_logs` 覆盖三个脚本的
+   启动日志、iteration 日志与 ETA。
+
 ---
 
 ## 13. 已验证结果（实测，非目标值）
@@ -816,12 +838,13 @@ PyTorch 2.6+ 对 `torch.load` 默认 `weights_only=False` 会发 `FutureWarning`
 执行 `python -m unittest discover -s tests -v`（CPU 即可，无需数据/GPU）：
 
 ```
-Ran 25 tests in ~55 s — OK
+Ran 26 tests in ~67 s — OK
 
   params = 6.32 M        MACs @1280 = 17.12 G   (jingwei_n)
   pico   = 2.87 M        MACs @1280 =  8.42 G   (jingwei_p)
   Chinese/Unicode image, folder, video and .npz paths = OK
   non-square 1040x2448-like fabric frame augmentation = OK
+  stage 0 / A / B startup + per-iteration progress logs = OK
 ```
 
 覆盖内容：
@@ -853,6 +876,7 @@ Ran 25 tests in ~55 s — OK
 | 23 | 安全网拒绝正常折入，但保留中央大缺陷与高前景边缘缺陷 |
 | 24 | **中文 / Unicode 图片、目录、视频、`.npz` 原型路径 + `predict.py` 端到端** |
 | 25 | **非方形 / 长条布幅图（如 1040×2448）在反光增广下的广播正确性** |
+| 26 | 阶段 0 / A / B 训练脚本的启动日志与按 iteration 的进度 / ETA 日志 |
 
 **布种描述符实测**（合成织纹，周期 5/9/13/19 px、亮度 100/170、反光 0/0.9）：
 
@@ -864,6 +888,8 @@ Ran 25 tests in ~55 s — OK
 `pretrain_dino` / `train_detector` / `train_normality` / `build_memory_bank` /
 `calibrate_fusion` / `evaluate` / `predict` / `export` 全部跑通；`predict` 另在
 中文图片名、中文输出目录、中文 `.npz` 原型、中文视频名下跑通（见 §12.5 / 测试 24）。
+`pretrain_dino` / `train_detector` / `train_normality` 另验证启动日志、
+`--log-interval` batch 进度与 ETA（见 §12.7 / 测试 26）。
 
 **ONNX 导出**：`tools/export.py` 成功导出 1280² 静态图，
 `onnx.checker` 通过；`roi_head=false`（pico）为 8 个输出（+context），

@@ -88,14 +88,14 @@ python tools/pretrain_dino.py \
     --cfg configs/jingwei_n.yaml \
     --data configs/fabric19.yaml \
     --teacher dinov2_vits14 \
-    --iters 5000 --out runs/dino
+    --iters 5000 --log-interval 100 --out runs/dino
 
 # 用蒸馏权重热启动阶段 A（注意是 --resume，不是 --ckpt）
 python tools/train_detector.py \
     --cfg configs/jingwei_n.yaml \
     --data configs/fabric19.yaml \
     --resume runs/dino/dino_init.pt \
-    --epochs 150 --out runs/detector
+    --epochs 150 --log-interval 20 --out runs/detector
 ```
 
 `jingwei_s` 默认 `dinov2_vitb14`（更强 teacher），`jingwei_p` 默认
@@ -112,7 +112,7 @@ python tools/pretrain_dino.py \
     --teacher dinov2_vitb14 \
     --repo /opt/dinov2 \
     --weights /opt/weights/dinov2_vitb14_pretrain.pth \
-    --iters 5000 --out runs/dino
+    --iters 5000 --log-interval 100 --out runs/dino
 ```
 
 `--repo` 也接受 `facebookresearch/dinov2:main` 之类的 hub slug；`--weights`
@@ -126,9 +126,11 @@ python tools/pretrain_dino.py --smoke 4 --iters 2 --cfg configs/jingwei_p.yaml
 ```
 
 单元测试 `tests/test_model.py::test_20/21`（另见 `test_22/23` 前景/折入）覆盖同一路径：
-`python -m unittest discover -s tests -v` 应输出 `OK (25 tests)`（含中文路径 / 非方形图回归）。
+`python -m unittest discover -s tests -v` 应输出 `OK (26 tests)`（含中文路径 / 非方形图 / 训练日志回归）。
 本地 teacher 权重与 checkpoint 统一通过 `jingwei.utils.torch_load` 读取，默认
 `weights_only=True`，不再触发 PyTorch 2.6+ 的 `FutureWarning`。
+阶段 0 启动即打印 teacher / 数据 / device / 参数量，并按
+`--log-interval` 打印 `distill_cosine`、lr、it/s 与 ETA；默认 100 iters。
 
 ## 6. teacher 选择
 

@@ -20,9 +20,9 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from _common import ROOT, data_paths, load_model, resolve
+from _common import ROOT, data_paths, format_eta, load_model, log, resolve
 from jingwei.data import YOLODefectDataset, collate
-from jingwei.image_io import console_safe
+from jingwei.utils import count_parameters
 
 
 def main():
@@ -37,6 +37,8 @@ def main():
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--smoke", type=int, default=0, help="synthetic images for a dry run")
     ap.add_argument("--resume", default=None)
+    ap.add_argument("--log-interval", type=int, default=20,
+                    help="print a progress line every N batches (0 disables iter logs)")
     args = ap.parse_args()
 
     model, cfg = load_model(args.cfg, args.resume, args.device)
@@ -76,11 +78,31 @@ def main():
 
     out = Path(args.out) if Path(args.out).is_absolute() else ROOT / args.out
     out.mkdir(parents=True, exist_ok=True)
+
+    n_batches = len(loader)
+    trainable = sum(p.numel() for p in params) / 1e6
+    log("=" * 72)
+    log("JingWei stage A - supervised detector training")
+    log(f"cfg={args.cfg}  data={args.data or cfg.data.dataset_yaml}  device={args.device}")
+    log(f"resume={args.resume or 'none'}  out={out}")
+    if args.device.startswith("cuda") and torch.cuda.is_available():
+        log(f"gpu={torch.cuda.get_device_name(0)}")
+    log(f"model={count_parameters(model) / 1e6:.2f} M params  "
+        f"trainable={trainable:.2f} M  img_size={size}")
+    log(f"images={len(train_ds)}  batches/epoch={n_batches}  epochs={epochs}  "
+        f"batch={batch}  lr={lr:g}  workers={0 if args.smoke else args.num_workers}")
+    log(f"log_interval={args.log_interval}  "
+        "(use --log-interval 0 to disable iter logs; python -u disables buffering)")
+    log("=" * 72)
+
     it = 0
+    global_t0 = time.time()
     for ep in range(epochs):
         t0 = time.time()
+        interval_t0 = t0
         running = {}
-        for batch_data in loader:
+        interval_loss, interval_n = 0.0, 0
+        for bi, batch_data in enumerate(loader):
             images = batch_data["image"].to(args.device, non_blocking=True)
             targets = [dict(boxes=b.to(args.device), labels=l.to(args.device))
                        for b, l in zip(batch_data["boxes"], batch_data["labels"])]
@@ -95,14 +117,33 @@ def main():
             sched.step()
             for k, v in result["losses"].items():
                 running[k] = running.get(k, 0.0) + float(v.detach())
+            total_loss = float(result["losses"]["total"].detach())
+            interval_loss += total_loss
+            interval_n += 1
             it += 1
+
+            if args.log_interval and (it == 1 or
+                                      (bi + 1) % args.log_interval == 0 or
+                                      (bi + 1) == n_batches):
+                elapsed = max(time.time() - interval_t0, 1e-6)
+                ips = interval_n / elapsed
+                remain = (n_batches - (bi + 1)) + (epochs - ep - 1) * n_batches
+                eta = remain / max(ips, 1e-6)
+                avg = interval_loss / max(interval_n, 1)
+                lr_now = float(opt.param_groups[0]["lr"])
+                log(f"epoch {ep + 1:3d}/{epochs}  iter {bi + 1:5d}/{n_batches}  "
+                    f"loss={avg:.4f}  lr={lr_now:.2e}  {ips:.2f} it/s  "
+                    f"elapsed={format_eta(time.time() - t0)}  eta={format_eta(eta)}")
+                interval_t0, interval_loss, interval_n = time.time(), 0.0, 0
+
         n = max(1, len(loader))
         msg = " | ".join(f"{k}={v / n:.3f}" for k, v in running.items() if k != "total")
-        print(f"epoch {ep + 1:3d}/{epochs}  {msg}  total={running.get('total', 0) / n:.3f} "
-              f"({time.time() - t0:.1f}s)")
+        log(f"epoch {ep + 1:3d}/{epochs}  {msg}  total={running.get('total', 0) / n:.3f} "
+            f"({time.time() - t0:.1f}s)  elapsed_total={format_eta(time.time() - global_t0)}")
         torch.save({"model": model.state_dict(), "epoch": ep, "cfg": args.cfg},
                    out / "last.pt")
-    print(console_safe(f"saved -> {out / 'last.pt'}"))
+        log(f"checkpoint -> {out / 'last.pt'}")
+    log(f"saved -> {out / 'last.pt'}")
 
 
 if __name__ == "__main__":

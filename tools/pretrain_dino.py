@@ -26,12 +26,12 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from _common import (ROOT, SyntheticNormalDataset, data_paths, load_model,
-                     resolve)
+from _common import (ROOT, SyntheticNormalDataset, data_paths, format_eta,
+                     load_model, log, resolve)
 from jingwei.data import NormalImageDataset, collate
 from jingwei.dino import (DINODistillLoss, DINOStudentAdaptor, load_teacher,
                           make_views)
-from jingwei.image_io import console_safe
+from jingwei.utils import count_parameters
 
 
 def valid_crop(crop: int, patch: int, size: int) -> bool:
@@ -58,6 +58,8 @@ def main():
     ap.add_argument("--num-workers", type=int, default=0)
     ap.add_argument("--smoke", type=int, default=0,
                     help="synthetic images + synthetic teacher; no data / no download")
+    ap.add_argument("--log-interval", type=int, default=100,
+                    help="print a progress line every N iterations (0 disables iter logs)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -90,11 +92,11 @@ def main():
         if not candidates:
             raise SystemExit(f"no valid crop for patch={patch}, size={size}")
         crop = candidates[min(1, len(candidates) - 1)]
-        print(f"[!] adjusted crop -> {crop} (multiple of {patch} and 32)")
+        log(f"[!] adjusted crop -> {crop} (multiple of {patch} and 32)")
 
-    print(f"stage 0: teacher={teacher.spec.name} ({teacher.spec.family}, "
-          f"patch={patch}, dim={teacher.spec.embed_dim})  crop={crop}  "
-          f"iters={iters}  batch={batch}  lr={lr}")
+    log(f"stage 0: teacher={teacher.spec.name} ({teacher.spec.family}, "
+        f"patch={patch}, dim={teacher.spec.embed_dim})  crop={crop}  "
+        f"iters={iters}  batch={batch}  lr={lr}")
 
     paths = data_paths(cfg, args.data)
     if args.smoke:
@@ -126,7 +128,25 @@ def main():
     out = Path(args.out) if Path(args.out).is_absolute() else ROOT / args.out
     out.mkdir(parents=True, exist_ok=True)
 
-    it, t0, acc = 0, time.time(), 0.0
+    trainable = sum(p.numel() for p in params) / 1e6
+    log("=" * 72)
+    log("JingWei stage 0 - offline DINO/DINOv2 teacher distillation")
+    log(f"cfg={args.cfg}  data={args.data or cfg.data.dataset_yaml}  device={args.device}")
+    log(f"ckpt={args.ckpt or 'none'}  repo={repo or 'torch.hub'}  "
+        f"weights={weights or 'default/pretrained'}  out={out}")
+    if args.device.startswith("cuda") and torch.cuda.is_available():
+        log(f"gpu={torch.cuda.get_device_name(0)}")
+    log(f"model={count_parameters(model) / 1e6:.2f} M params  "
+        f"trainable={trainable:.2f} M  img_size={size}  crop={crop}")
+    log(f"normal images={len(ds)}  batches/loader={len(loader)}  iters={iters}  "
+        f"batch={batch}  lr={lr:g}  workers={0 if args.smoke else args.num_workers}")
+    log(f"log_interval={args.log_interval}  "
+        "(use --log-interval 0 to disable iter logs; python -u disables buffering)")
+    log("=" * 72)
+
+    it = 0
+    global_t0 = time.time()
+    interval_t0, interval_loss, interval_n = global_t0, 0.0, 0
     while it < iters:
         for data in loader:
             if it >= iters:
@@ -148,12 +168,24 @@ def main():
             torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
             opt.step()
 
-            acc += float(loss.detach())
+            loss_val = float(loss.detach())
+            interval_loss += loss_val
+            interval_n += 1
             it += 1
-            if it == 1 or it % 100 == 0 or it == iters:
-                print(f"iter {it:6d}/{iters}  distill_cosine={acc / min(100, it):.5f} "
-                      f"({time.time() - t0:.1f}s)")
-                acc, t0 = 0.0, time.time()
+
+            if args.log_interval and (it == 1 or
+                                      it % args.log_interval == 0 or
+                                      it == iters):
+                elapsed = max(time.time() - interval_t0, 1e-6)
+                ips = interval_n / elapsed
+                eta = (iters - it) / max(ips, 1e-6)
+                avg = interval_loss / max(interval_n, 1)
+                lr_now = float(opt.param_groups[0]["lr"])
+                log(f"iter {it:6d}/{iters}  distill_cosine={avg:.5f}  "
+                    f"lr={lr_now:.2e}  {ips:.2f} it/s  "
+                    f"elapsed={format_eta(time.time() - global_t0)}  "
+                    f"eta={format_eta(eta)}")
+                interval_t0, interval_loss, interval_n = time.time(), 0.0, 0
 
     # Dinomaly stage B expects a FROZEN foundation projection — re-freeze it.
     model.normality.recon.target_proj.requires_grad_(False)
@@ -167,9 +199,9 @@ def main():
         "iters": it,
         "cfg": args.cfg,
     }, out / "dino_init.pt")
-    print(console_safe(f"saved -> {out / 'dino_init.pt'}"))
-    print("next: python tools/train_detector.py --cfg "
-          f"{args.cfg} --resume {out / 'dino_init.pt'}")
+    log(f"saved -> {out / 'dino_init.pt'}")
+    log("next: python tools/train_detector.py --cfg "
+        f"{args.cfg} --resume {out / 'dino_init.pt'}")
 
 
 if __name__ == "__main__":
