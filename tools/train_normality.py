@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 from _common import ROOT, SyntheticNormalDataset, data_paths, load_model, resolve
 from jingwei.data import NormalImageDataset, collate
 from jingwei.losses import HardMiningCosineLoss
+from jingwei.image_io import console_safe
 
 
 def main():
@@ -87,7 +88,7 @@ def main():
                 t0 = time.time()
     torch.save({"model": model.state_dict(), "iters": it, "cfg": args.cfg},
                out / "normality.pt")
-    print(f"saved -> {out / 'normality.pt'}")
+    print(console_safe(f"saved -> {out / 'normality.pt'}"))
 
 
 if __name__ == "__main__":

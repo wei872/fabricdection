@@ -3,10 +3,12 @@
 * ``train`` / ``val``      — YOLO-format defect data (images + ``.txt`` labels)
 * ``normaltrain`` / ``normalval`` — normal images ONLY (no labels), used by
   the unsupervised normality branch and for false-positive calibration.
+
+All file reads go through :mod:`jingwei.image_io`, so Chinese / Unicode image
+and folder names work on Windows as well as Linux.
 """
 from __future__ import annotations
 
-import glob
 import os
 from pathlib import Path
 
@@ -16,22 +18,26 @@ import torch
 from torch.utils.data import Dataset
 
 from .fabric import fabric_descriptor
+from .image_io import console_safe, imread_unicode
 
-IMG_EXTS = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff")
+IMG_EXTS = (
+    "*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff", "*.webp",
+    "*.JPG", "*.JPEG", "*.PNG", "*.BMP", "*.TIF", "*.TIFF", "*.WEBP",
+)
 
 
 def list_images(root: str | Path):
     root = Path(root)
-    files = []
+    files = set()
     for ext in IMG_EXTS:
-        files.extend(root.rglob(ext))
+        files.update(root.rglob(ext))
     return sorted(str(f) for f in files)
 
 
 def read_image(path: str | Path) -> np.ndarray:
-    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    img = imread_unicode(path, cv2.IMREAD_COLOR)
     if img is None:
-        raise FileNotFoundError(f"cannot read image: {path}")
+        raise FileNotFoundError(f"cannot read image: {console_safe(path)}")
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 

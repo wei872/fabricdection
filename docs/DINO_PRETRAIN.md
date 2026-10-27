@@ -126,7 +126,7 @@ python tools/pretrain_dino.py --smoke 4 --iters 2 --cfg configs/jingwei_p.yaml
 ```
 
 单元测试 `tests/test_model.py::test_20/21`（另见 `test_22/23` 前景/折入）覆盖同一路径：
-`python -m unittest discover -s tests -v` 应输出 `OK (23 tests)`。
+`python -m unittest discover -s tests -v` 应输出 `OK (24 tests)`（含中文路径回归）。
 
 ## 6. teacher 选择
 

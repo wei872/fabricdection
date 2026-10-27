@@ -25,6 +25,7 @@ import numpy as np
 import torch
 
 from _common import ROOT, load_model
+from jingwei.image_io import console_safe
 from jingwei.utils import count_parameters, profile_macs
 
 TARGET_MS = 25.0
@@ -132,15 +133,17 @@ def main():
 
     info = gpu_info()
     print("=" * 72)
-    print("GPU:", json.dumps(info, ensure_ascii=False))
+    print("GPU:", console_safe(json.dumps(info, ensure_ascii=False)))
     if not info["cuda"]:
-        print("\n[!] 没有检测到 CUDA GPU。下面只是 CPU 上的功能自检，不能当作 1660S 的延迟。")
-        print("    请在装有 1660 SUPER 的机器上运行本脚本。")
-        print("    自动把 warmup/iters 降到 1/2 以免在 CPU 上跑几分钟。\n")
+        print(console_safe(
+            "\n[!] 没有检测到 CUDA GPU。下面只是 CPU 上的功能自检，不能当作 1660S 的延迟。"))
+        print(console_safe("    请在装有 1660 SUPER 的机器上运行本脚本。"))
+        print(console_safe("    自动把 warmup/iters 降到 1/2 以免在 CPU 上跑几分钟。\n"))
         args.warmup, args.iters = 1, 2
     elif not info["tensor_cores"]:
-        print("[!] 该卡疑似无 Tensor Core（GTX 16 系列）。FP16/INT8 可能不加速甚至变慢，")
-        print("    请务必用 --precision both 做 A/B 测试。\n")
+        print(console_safe(
+            "[!] 该卡疑似无 Tensor Core（GTX 16 系列）。FP16/INT8 可能不加速甚至变慢，"))
+        print(console_safe("    请务必用 --precision both 做 A/B 测试。\n"))
 
     cfgs = [args.cfg]
     if args.compare:
@@ -156,33 +159,35 @@ def main():
         model.eval()
         macs = profile_macs(model, [torch.zeros(1, 3, int(cfg.input_size[0]),
                                                 int(cfg.input_size[1]))])
-        print(f"\n=== {cfg.name} ({cfg_path})  params={count_parameters(model)/1e6:.2f} M  "
-              f"MACs={macs['total']/1e9:.2f} G ===")
+        print(console_safe(
+            f"\n=== {cfg.name} ({cfg_path})  params={count_parameters(model)/1e6:.2f} M  "
+            f"MACs={macs['total']/1e9:.2f} G ==="))
         all_results["configs"][cfg.name] = {"params_M": count_parameters(model) / 1e6,
                                             "macs_G": macs["total"] / 1e9, "runs": {}}
         for prec in precisions:
             if prec == "fp16" and device.type == "cpu":
-                print("  fp16 在 CPU 上跳过")
+                print(console_safe("  fp16 在 CPU 上跳过"))
                 continue
             try:
                 r = measure(model, cfg, device, prec, args.warmup, args.iters)
             except RuntimeError as e:
-                print(f"  {prec}: FAILED -> {e}")
+                print(console_safe(f"  {prec}: FAILED -> {e}"))
                 continue
             all_results["configs"][cfg.name]["runs"][prec] = r
             verdict = "PASS ✅" if r["total_ms_p99"] <= TARGET_MS else "FAIL ❌"
-            print(f"  {prec:5s} net={fmt(r['net_ms_p50'])} ms  post={fmt(r['post_ms_p50'])} ms  "
-                  f"P50={fmt(r['total_ms_p50'])} ms  P95={fmt(r['total_ms_p95'])} ms  "
-                  f"P99={fmt(r['total_ms_p99'])} ms  -> {r['fps_p50']:.1f} FPS  "
-                  f"P99<={TARGET_MS:.0f}ms: {verdict}")
+            print(console_safe(
+                f"  {prec:5s} net={fmt(r['net_ms_p50'])} ms  post={fmt(r['post_ms_p50'])} ms  "
+                f"P50={fmt(r['total_ms_p50'])} ms  P95={fmt(r['total_ms_p95'])} ms  "
+                f"P99={fmt(r['total_ms_p99'])} ms  -> {r['fps_p50']:.1f} FPS  "
+                f"P99<={TARGET_MS:.0f}ms: {verdict}"))
 
     out = Path(args.out) if Path(args.out).is_absolute() else ROOT / args.out
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8") as fh:
         json.dump(all_results, fh, ensure_ascii=False, indent=2)
-    print(f"\n结果已保存 -> {out}")
-    print("注意：这是 PyTorch 图的上界；TensorRT engine 通常快 1.5–3x。")
-    print("      导出后用 `trtexec --loadEngine=... --duration=60` 复测 P99。")
+    print(console_safe(f"\n结果已保存 -> {out}"))
+    print(console_safe("注意：这是 PyTorch 图的上界；TensorRT engine 通常快 1.5–3x。"))
+    print(console_safe("      导出后用 `trtexec --loadEngine=... --duration=60` 复测 P99。"))
 
 
 def fmt(v):

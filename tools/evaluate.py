@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 
 from _common import ROOT, SyntheticNormalDataset, data_paths, load_model, resolve
 from jingwei.data import NormalImageDataset, YOLODefectDataset, collate
+from jingwei.image_io import ascii_safe, console_safe
 from jingwei.utils import box_iou, count_parameters, profile_macs
 
 
@@ -167,7 +168,8 @@ def main():
     print(f"large-defect recall: {rec:.4f}   <-- primary acceptance metric")
     print(f"normal image FPR  : {fpr:.4f}  ({fp}/{n})")
     for i, a in enumerate(aps):
-        print(f"  AP50[{i:2d}] {names[i] if i < len(names) else i:<8s}: {a:.4f}")
+        label = ascii_safe(names[i], f"cls{i}") if i < len(names) else str(i)
+        print(console_safe(f"  AP50[{i:2d}] {label:<8.8s}: {a:.4f}"))
     if not args.smoke:
         ms = benchmark(model, args.device, size)
         print(f"latency (full pipeline, {args.device}): {ms:.2f} ms -> {1000 / ms:.1f} FPS")

@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 
 from _common import ROOT, data_paths, load_model, resolve
 from jingwei.data import YOLODefectDataset, collate
+from jingwei.image_io import console_safe
 
 
 def main():
@@ -101,7 +102,7 @@ def main():
               f"({time.time() - t0:.1f}s)")
         torch.save({"model": model.state_dict(), "epoch": ep, "cfg": args.cfg},
                    out / "last.pt")
-    print(f"saved -> {out / 'last.pt'}")
+    print(console_safe(f"saved -> {out / 'last.pt'}"))
 
 
 if __name__ == "__main__":

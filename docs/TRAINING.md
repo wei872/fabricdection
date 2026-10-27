@@ -15,7 +15,7 @@ pip install onnx tensorrt ultralytics
 
 最低验证环境（本仓库实测）：Python 3.11 + torch 2.2.2 (CPU 即可) +
 numpy 1.26 + opencv-python-headless + PyYAML + scipy + tqdm。
-跑 `python -m unittest discover -s tests -v` 应输出 `OK`（23 项）。
+跑 `python -m unittest discover -s tests -v` 应输出 `OK`（24 项）。
 阶段 0 的 `--smoke` 模式用 synthetic teacher，不需要下载 DINOv2 权重。
 
 ## 2. 数据准备
@@ -73,6 +73,11 @@ PY
 若 `area ratio` 的中位数远小于 `0.001`，说明大缺陷很少，
 需要在 `configs/fabric19.yaml` 里调 `large_area_ratio`（同步改两个
 `jingwei_*.yaml` 的 `fusion.large_area_ratio`）。
+
+图片、标签、目录、视频文件名可以包含中文 / 空格 / Unicode，扩展名大小写
+（`.JPG/.PNG/.WEBP`）也能识别；`jingwei/data.py::list_images` 与
+`jingwei/image_io.py` 已统一处理，Windows 下**不需要重命名数据**，也不要把
+工具里的 `imread_unicode` / `imwrite_unicode` 改回 `cv2.imread` / `cv2.imwrite`。
 
 ### 2.3 normaltrain 的关键要求
 
@@ -183,7 +188,7 @@ subject to FPR ≤ max(3·target_fpr, 0.02)
 ## 4. 快速自检（无真实数据）
 
 ```bash
-python -m unittest discover -s tests -v                 # 23 项，约 41 s
+python -m unittest discover -s tests -v                 # 24 项，约 55 s（含中文路径回归）
 python tools/benchmark.py --all                         # p/n/s 参数量 / MACs / 延迟估算
 python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both  # 在你的 GPU 上实测
 python tools/train_detector.py   --smoke 2 --epochs 1 --batch 1 --device cpu
@@ -201,8 +206,9 @@ python tools/export.py --check --out runs/export/jingwei_n.onnx
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| `no images under ...` | 路径没改 / 图片扩展名不在列表 | 检查 `configs/fabric19.yaml`；支持 jpg/jpeg/png/bmp/tif |
-| 标签全空 | `labels` 目录推断失败 | 显式传 `--labels`（工具会自动把 `/images/` 换成 `/labels/`） |
+| `no images under ...` | 路径没改 / 图片扩展名不在列表 | 检查 `configs/fabric19.yaml`；支持 jpg/jpeg/png/bmp/tif/tiff/webp（含大写） |
+| 中文图片名报错 / 读图返回 `None` / 无法保存中文结果 | Windows 下 `cv2.imread` / `cv2.imwrite` / `cv2.VideoCapture` 直接吃非 ASCII 路径失败 | 已统一改用 `jingwei/image_io.py` 的 `imread_unicode` / `imwrite_unicode` / `VideoCaptureUnicode`；升级代码后若仍报错，贴完整 traceback，不要回退到直接 `cv2.imread`；详见 [DESIGN.md §12.5](DESIGN.md) |
+| 标签全空 | `labels` 目录推断失败 | 显式传 `--labels`（工具会自动把 `/images/` 换成 `/labels/`）；中文标签文件名同样支持 |
 | `rec_loss` → 0 | 主干没冻结，出现塌缩解 | 检查阶段 B 只把 `normality_parameters()` 加入优化器 |
 | 全图误报 | 记忆库没标定 / 用了未训练权重 | 必须先跑阶段 C；`tau` 由 `normalval` 标定 |
 | 大缺陷仍漏 | `anomaly_thresh` 太高 / `large_area_ratio` 太大 | 跑阶段 D；降低 `large_area_ratio` |

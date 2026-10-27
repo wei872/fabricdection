@@ -2,6 +2,9 @@
 
     python tools/predict.py --cfg configs/jingwei_n.yaml --ckpt runs/bank/memory_bank.pt \
         --source path/to/image.jpg --out runs/predict
+
+Chinese / Unicode image, folder and video names are supported on Windows and
+Linux; see :mod:`jingwei.image_io`.
 """
 from __future__ import annotations
 
@@ -16,6 +19,8 @@ import torch
 from _common import ROOT, data_paths, load_model
 from jingwei.data import list_images
 from jingwei.fabric import FabricPrototypes, fabric_descriptor
+from jingwei.image_io import (VideoCaptureUnicode, ascii_safe, console_safe,
+                              imread_unicode, imwrite_unicode)
 
 COLORS = [(int(255 * (0.11 * i % 1)), int(255 * (0.37 * i % 1)),
            int(255 * (0.71 * i % 1))) for i in range(64)]
@@ -52,26 +57,28 @@ def main():
     if src.is_dir():
         files = list_images(src)
     elif src.suffix.lower() in (".mp4", ".avi", ".mov", ".mkv"):
-        cap = cv2.VideoCapture(str(src))
         files = []
-        i = 0
-        while True:
-            ok, fr = cap.read()
-            if not ok:
-                break
-            f = out / f"_frames/{i:06d}.jpg"
-            f.parent.mkdir(exist_ok=True)
-            cv2.imwrite(str(f), fr)
-            files.append(str(f))
-            i += 1
-        cap.release()
+        with VideoCaptureUnicode(src) as cap:
+            if not cap.isOpened():
+                raise FileNotFoundError(f"cannot open video: {console_safe(src)}")
+            i = 0
+            while True:
+                ok, fr = cap.read()
+                if not ok:
+                    break
+                f = out / f"_frames/{i:06d}.jpg"
+                f.parent.mkdir(parents=True, exist_ok=True)
+                imwrite_unicode(f, fr)
+                files.append(str(f))
+                i += 1
     else:
         files = [str(src)]
 
     all_results = {}
     for f in files:
-        bgr = cv2.imread(f, cv2.IMREAD_COLOR)
+        bgr = imread_unicode(f, cv2.IMREAD_COLOR)
         if bgr is None:
+            print(f"[warn] cannot read image: {console_safe(f)}")
             continue
         rgb = cv2.cvtColor(cv2.resize(bgr, (size, size)), cv2.COLOR_BGR2RGB)
         x = torch.from_numpy(rgb.transpose(2, 0, 1)).float()[None] / 255.0
@@ -93,15 +100,19 @@ def main():
                 c = COLORS[int(l) % len(COLORS)]
                 x0, y0, x1, y1 = [int(v) for v in bb]
                 cv2.rectangle(bgr, (x0, y0), (x1, y1), c, 2)
-                txt = f"{names[int(l)] if int(l) < len(names) else '?'} {s:.2f}"
+                # cv2.putText's Hershey fonts are ASCII-only: Chinese class
+                # names are kept in results.json, but drawn as cls<id> here.
+                label = ascii_safe(names[int(l)], f"cls{int(l)}") \
+                    if int(l) < len(names) else f"cls{int(l)}"
+                txt = f"{label} {s:.2f}"
                 cv2.putText(bgr, txt, (x0, max(16, y0 - 4)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1, cv2.LINE_AA)
-            cv2.imwrite(str(out / Path(f).name), bgr)
-        print(f"{Path(f).name}: {len(items)} detections (prototype {k})")
+            imwrite_unicode(out / Path(f).name, bgr)
+        print(f"{console_safe(Path(f).name)}: {len(items)} detections (prototype {k})")
 
     with (out / "results.json").open("w", encoding="utf-8") as fh:
         json.dump(all_results, fh, ensure_ascii=False, indent=2)
-    print(f"results -> {out}")
+    print(f"results -> {console_safe(out)}")
 
 
 if __name__ == "__main__":

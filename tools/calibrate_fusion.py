@@ -25,6 +25,7 @@ from _common import ROOT, data_paths, load_model, resolve
 from jingwei.data import NormalImageDataset, YOLODefectDataset, collate
 from jingwei.fusion import fuse_detections
 from jingwei.utils import box_iou
+from jingwei.image_io import console_safe
 
 
 @torch.no_grad()
@@ -164,7 +165,7 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8") as fh:
         yaml.safe_dump(payload, fh, allow_unicode=True)
-    print(f"best -> {out}: {payload}")
+    print(console_safe(f"best -> {out}: {payload}"))
 
 
 if __name__ == "__main__":

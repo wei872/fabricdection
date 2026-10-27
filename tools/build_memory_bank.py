@@ -25,6 +25,7 @@ from _common import (ROOT, SyntheticNormalDataset, data_paths,
 from jingwei.data import list_images
 from jingwei.fabric import (fabric_descriptor, fit_fabric_prototypes,
                             greedy_coreset, spherical_kmeans)
+from jingwei.image_io import console_safe, imread_unicode
 
 
 def main():
@@ -73,8 +74,15 @@ def main():
         feats_by_k = extract_patch_features(model, files, labels, args.device, cfg,
                                             batch_size=args.batch_size, limit=limit)
         val_files = list_images(resolve(paths["normalval"]))
-        val_ds = [(f, proto.assign(fabric_descriptor(cv2.imread(f, 0))))
-                  for f in val_files]
+        val_ds = []
+        for f in val_files:
+            gray = imread_unicode(f, cv2.IMREAD_GRAYSCALE)
+            if gray is None:
+                continue
+            val_ds.append((f, proto.assign(fabric_descriptor(gray))))
+        if not val_ds:
+            raise FileNotFoundError(
+                f"no readable normalval images in {console_safe(resolve(paths['normalval']))}")
 
     for k, x in feats_by_k.items():
         x = np.asarray(x, np.float32)
@@ -112,7 +120,10 @@ def main():
             collect(val_ds[i]["image"][None].to(args.device), int(val_labels[i]))
     else:
         for f, k in val_ds:
-            im = cv2.cvtColor(cv2.resize(cv2.imread(f), (size, size)), cv2.COLOR_BGR2RGB)
+            im = imread_unicode(f, cv2.IMREAD_COLOR)
+            if im is None:
+                continue
+            im = cv2.cvtColor(cv2.resize(im, (size, size)), cv2.COLOR_BGR2RGB)
             x = torch.from_numpy(im.transpose(2, 0, 1)).float()[None] / 255.0
             collect(x.to(args.device), k)
 
@@ -155,7 +166,7 @@ def main():
                 "recon_calib": {"tau": r_tau, "slope": 8.0 / spread},
                 "model": model.state_dict(),
                 "n_prototypes": K, "n_centroids": C}, out / "memory_bank.pt")
-    print(f"saved -> {out}")
+    print(console_safe(f"saved -> {out}"))
 
 
 if __name__ == "__main__":

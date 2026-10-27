@@ -29,6 +29,7 @@ import torch
 
 from _common import load_model
 from jingwei.utils import count_parameters, profile_macs
+from jingwei.image_io import console_safe
 
 # ---------------------------------------------------------------- (A) Tensor Core
 REF_MACS = 7.2e9          # YOLO27n @640, RTX PRO 6000, TRT11 FP16
@@ -68,7 +69,7 @@ def measure_cpu(model, size, iters=2):
 def report(cfg_path, sizes=(640, 1280), measure=False):
     model, cfg = load_model(cfg_path, device="cpu")
     model.eval()
-    print(f"\n=== {cfg.name} ({cfg_path}) ===")
+    print(console_safe(f"\n=== {cfg.name} ({cfg_path}) ==="))
     print(f"parameters: {count_parameters(model) / 1e6:.2f} M")
     rows = []
     for s in sizes:

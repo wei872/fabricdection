@@ -31,6 +31,7 @@ from _common import (ROOT, SyntheticNormalDataset, data_paths, load_model,
 from jingwei.data import NormalImageDataset, collate
 from jingwei.dino import (DINODistillLoss, DINOStudentAdaptor, load_teacher,
                           make_views)
+from jingwei.image_io import console_safe
 
 
 def valid_crop(crop: int, patch: int, size: int) -> bool:
@@ -166,7 +167,7 @@ def main():
         "iters": it,
         "cfg": args.cfg,
     }, out / "dino_init.pt")
-    print(f"saved -> {out / 'dino_init.pt'}")
+    print(console_safe(f"saved -> {out / 'dino_init.pt'}"))
     print("next: python tools/train_detector.py --cfg "
           f"{args.cfg} --resume {out / 'dino_init.pt'}")
 

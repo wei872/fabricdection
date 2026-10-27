@@ -1,4 +1,8 @@
-"""Shared helpers for the CLI tools."""
+"""Shared helpers for the CLI tools.
+
+Image / video reads go through :mod:`jingwei.image_io`, so Chinese / Unicode
+dataset paths work on Windows as well as Linux.
+"""
 from __future__ import annotations
 
 import sys
@@ -9,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import cv2
 import numpy as np
 import torch
 import yaml
@@ -17,6 +22,7 @@ from torch.utils.data import DataLoader, Dataset
 from jingwei import build_model, load_config
 from jingwei.data import NormalImageDataset, YOLODefectDataset, collate, list_images
 from jingwei.fabric import fabric_descriptor, fit_fabric_prototypes
+from jingwei.image_io import console_safe, imread_unicode
 
 
 def data_paths(cfg, override: str | None = None) -> dict:
@@ -52,7 +58,6 @@ class SyntheticNormalDataset(Dataset):
         return self.n
 
     def __getitem__(self, idx):
-        import cv2
         rng = np.random.default_rng(self.seed + idx)
         s = 320                       # generate at low res then upscale -> fast
         yy, xx = np.mgrid[0:s, 0:s]
@@ -69,25 +74,26 @@ class SyntheticNormalDataset(Dataset):
 
 @torch.no_grad()
 def descriptors_for_folder(folder, k_prototypes, limit=None):
-    files = list_images(folder)[:limit] if limit else list_images(folder)
-    import cv2
-    descs = []
+    files = list_images(folder)
+    if limit:
+        files = files[:limit]
+    readable, descs = [], []
     for f in files:
-        img = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
+        img = imread_unicode(f, cv2.IMREAD_GRAYSCALE)
         if img is None:
             continue
+        readable.append(f)
         descs.append(fabric_descriptor(img))
     if not descs:
-        raise FileNotFoundError(f"no readable images in {folder}")
+        raise FileNotFoundError(f"no readable images in {console_safe(folder)}")
     d = np.stack(descs)
     proto, labels = fit_fabric_prototypes(d, k=k_prototypes)
-    return files, d, proto, labels
+    return readable, d, proto, labels
 
 
 @torch.no_grad()
 def extract_patch_features(model, files, proto_labels, device, cfg, batch_size=1, limit=None):
     """Return {prototype_id: (N, D) L2-normalised patch features}."""
-    import cv2
     model.eval()
     g = int(cfg.normality.grid)
     size = int(cfg.input_size[0])
@@ -97,7 +103,9 @@ def extract_patch_features(model, files, proto_labels, device, cfg, batch_size=1
         chunk = files[i:i + batch_size]
         imgs = []
         for f in chunk:
-            im = cv2.imread(f, cv2.IMREAD_COLOR)
+            im = imread_unicode(f, cv2.IMREAD_COLOR)
+            if im is None:
+                raise FileNotFoundError(f"cannot read image: {console_safe(f)}")
             im = cv2.cvtColor(cv2.resize(im, (size, size)), cv2.COLOR_BGR2RGB)
             imgs.append(torch.from_numpy(im.transpose(2, 0, 1)).float() / 255.0)
         x = torch.stack(imgs).to(device)

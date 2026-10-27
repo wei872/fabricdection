@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 
 from _common import ROOT, load_model
+from jingwei.image_io import console_safe
 
 try:
     import onnx as _onnx_pkg  # torch.onnx.export needs it to materialise the file
@@ -79,7 +80,7 @@ def main():
         wrapper, dummy, str(out), opset_version=opset,
         input_names=["images"], output_names=names,
         dynamic_axes=None, do_constant_folding=True)
-    print(f"exported -> {out}")
+    print(console_safe(f"exported -> {out}"))
     print("outputs:", names)
     print("shapes at 1280:", ", ".join(shape_note))
 
@@ -93,12 +94,14 @@ def main():
     shapes = (f"--minShapes=images:1x3x{size}x{size} "
               f"--optShapes=images:1x3x{size}x{size} "
               f"--maxShapes=images:1x3x{size}x{size}")
-    print("  # FP32 first — recommended on TU116/TU117 (no Tensor Cores)")
-    print(f"  trtexec --onnx={out} --saveEngine={out.with_suffix('.engine')} "
-          f"--workspace=4096 {shapes}")
-    print("  # FP16 A/B — NOT guaranteed faster on GTX 16-series; measure P99")
-    print(f"  trtexec --onnx={out} --saveEngine={out.with_suffix('.fp16.engine')} "
-          f"--fp16 --workspace=4096 {shapes}")
+    print("  # FP32 first - recommended on TU116/TU117 (no Tensor Cores)")
+    print(console_safe(
+        f"  trtexec --onnx={out} --saveEngine={out.with_suffix('.engine')} "
+        f"--workspace=4096 {shapes}"))
+    print("  # FP16 A/B - NOT guaranteed faster on GTX 16-series; measure P99")
+    print(console_safe(
+        f"  trtexec --onnx={out} --saveEngine={out.with_suffix('.fp16.engine')} "
+        f"--fp16 --workspace=4096 {shapes}"))
     print("  # INT8: not recommended on GTX 16-series (no INT8 Tensor Cores); "
           "if used, provide a calibration cache from ~500 normal images "
           "(one per fabric prototype).")

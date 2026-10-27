@@ -25,7 +25,7 @@
 
 **已验证**（见 §13）：参考实现在 1280×1280 下 n 变体 **6.32 M 参数 / 17.12 G MACs**，
 无 Tensor Core 卡专用的 pico 变体 **2.87 M / 8.42 G MACs**，
-23 项单元测试全过，ONNX 导出成功且输出全为静态形状。
+24 项单元测试全过（含中文 / Unicode 路径回归），ONNX 导出成功且输出全为静态形状。
 
 > ⚠️ **诚实声明**：仓库里目前只有 `dataset/dataset.yaml`（路径指向你本机的
 > `D:/tyhn/yolo/...`），**没有真实图片**。因此本文所有的精度数字都是**设计目标 / 验收指标**，
@@ -727,11 +727,12 @@ jingwei/
   fabric.py      布种描述符 / 原型聚类 / 记忆库压缩 → §9
   data.py        YOLO 数据集 / 纯正常图集 / 布种 / 折入增广 → §6
   foreground.py 布幅掩膜 / 边缘折入带 / 缺陷前景头 → §5.8
+  image_io.py   中文/Unicode 安全的图像与视频 I/O → §12.5
   dino.py       阶段 0 DINOv2 离线 teacher 工具
   model.py       JingWei 顶层（训练 / 推理 / 导出）
 tools/           阶段 0 + A–E 的 CLI（pretrain_dino / train / build / calibrate /
                  evaluate / predict / export / benchmark / bench_device）
-tests/test_model.py  23 项单元测试
+tests/test_model.py  24 项单元测试（含中文路径回归）
 docs/DESIGN.md   本文
 docs/TRAINING.md 训练与数据准备手册
 docs/DEPLOYMENT.md 实时部署手册
@@ -772,6 +773,27 @@ YOLO27 "models are not yet available, and no launch date is set"，权重/配置
 
 也就是说，YOLO27 是本设计的**可插拔升级件**，不是前置依赖。
 
+### 12.5 中文 / Unicode 文件名（Windows 必读）
+
+真实数据常放在 `D:/布匹数据/.../图片 001.jpg` 这类路径下。Windows 上某些
+OpenCV 构建的 `cv2.imread` / `cv2.imwrite` / `cv2.VideoCapture` 接收窄字符串，
+遇到非 ASCII 路径会返回 `None` / `False` 或抛异常；`cv2.putText` 的 Hershey
+字体也不能可靠绘制中文类名。本实现把全部 I/O 收敛到 `jingwei/image_io.py`：
+
+| 操作 | 实现 | 原因 |
+|---|---|---|
+| 读图 | `np.fromfile(path, uint8)` + `cv2.imdecode` | Python 文件 API 支持 Unicode 路径，绕过 OpenCV 路径编码 |
+| 写图 | `cv2.imencode(ext, img)` + `ndarray.tofile(path)` | 同上；扩展名取自 `pathlib` 后缀，支持大写 `.JPG/.PNG/.WEBP` |
+| 视频 | `VideoCaptureUnicode`（非 ASCII 本地路径复制到临时 ASCII 文件再打开） | `cv2.VideoCapture` 无法可靠处理中文路径；退出时删除临时副本 |
+| 图上文字 / 评估表 | `ascii_safe()`：中文类名在图上 / 控制台表格里退化为 `cls<id>` | Hershey 字体只有 ASCII；中文类名仍完整写入 `results.json` |
+| 其它控制台输出 | `console_safe()` 把非 ASCII 转成 `\uXXXX` | 避免 Windows 控制台 `UnicodeEncodeError` |
+
+因此 `dataset.yaml` 的 `D:/中文目录/...`、`predict.py --source 中文图.jpg --out 中文目录`、
+中文 `.npz` 原型、中文视频名、中文类别名都**不需要改名**。回归测试
+`test_24_unicode_paths` 覆盖 `read_image` / `descriptors_for_folder` /
+`VideoCaptureUnicode` / `predict.py` 图片与视频端到端；`test_14` 另覆盖
+中文 YOLO 标签文件名。所有工具都不再直接调用 `cv2.imread` / `cv2.imwrite`。
+
 ---
 
 ## 13. 已验证结果（实测，非目标值）
@@ -779,10 +801,11 @@ YOLO27 "models are not yet available, and no launch date is set"，权重/配置
 执行 `python -m unittest discover -s tests -v`（CPU 即可，无需数据/GPU）：
 
 ```
-Ran 23 tests in ~41 s — OK
+Ran 24 tests in ~55 s — OK
 
   params = 6.32 M        MACs @1280 = 17.12 G   (jingwei_n)
   pico   = 2.87 M        MACs @1280 =  8.42 G   (jingwei_p)
+  Chinese/Unicode image, folder, video and .npz paths = OK
 ```
 
 覆盖内容：
@@ -812,6 +835,7 @@ Ran 23 tests in ~41 s — OK
 | 21 | `tools/pretrain_dino.py --smoke` 端到端跑通并保存可用 checkpoint |
 | 22 | 前景上下文：逐帧布幅掩膜 + 边缘折入带估计 |
 | 23 | 安全网拒绝正常折入，但保留中央大缺陷与高前景边缘缺陷 |
+| 24 | **中文 / Unicode 图片、目录、视频、`.npz` 原型路径 + `predict.py` 端到端** |
 
 **布种描述符实测**（合成织纹，周期 5/9/13/19 px、亮度 100/170、反光 0/0.9）：
 
@@ -821,7 +845,8 @@ Ran 23 tests in ~41 s — OK
 
 **工具链端到端**（smoke 模式，随机权重 + 合成图，仅验证可运行）：
 `pretrain_dino` / `train_detector` / `train_normality` / `build_memory_bank` /
-`calibrate_fusion` / `evaluate` / `predict` / `export` 全部跑通。
+`calibrate_fusion` / `evaluate` / `predict` / `export` 全部跑通；`predict` 另在
+中文图片名、中文输出目录、中文 `.npz` 原型、中文视频名下跑通（见 §12.5 / 测试 24）。
 
 **ONNX 导出**：`tools/export.py` 成功导出 1280² 静态图，
 `onnx.checker` 通过；`roi_head=false`（pico）为 8 个输出（+context），

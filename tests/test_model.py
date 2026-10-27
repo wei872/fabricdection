@@ -6,17 +6,21 @@ Run from the repo root::
 
 No pytest / no GPU / no real data needed. It checks shapes at the required
 1280x1280 input, trainability, the deterministic safety net, fabric-type
-invariance, memory-bank algebra, and the dataset readers.
+invariance, memory-bank algebra, the dataset readers, and Chinese / Unicode
+file paths (24 tests).
 """
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 
@@ -27,11 +31,15 @@ from jingwei import build_model, load_config                       # noqa: E402
 from jingwei.fabric import (fabric_descriptor, fit_fabric_prototypes,  # noqa: E402
                             greedy_coreset, spherical_kmeans)
 from jingwei.fusion import safety_net_numpy                       # noqa: E402
+from jingwei.image_io import (VideoCaptureUnicode, ascii_safe,     # noqa: E402
+                              console_safe, imread_unicode,
+                              imwrite_unicode)
 from jingwei.layers import LocalContrastNorm                     # noqa: E402
 from jingwei.losses import hungarian_match                       # noqa: E402
 from jingwei.utils import count_parameters, profile_macs          # noqa: E402
 
 CFG_N = str(ROOT / "configs/jingwei_n.yaml")
+CFG_P = str(ROOT / "configs/jingwei_p.yaml")
 
 
 def weave(period, bright=128, refl=0.0, size=512):
@@ -208,7 +216,6 @@ class TestModel(unittest.TestCase):
         self.assertEqual(sum(len(x) for x in matches), 2)
 
     def test_14_dataset_readers(self):
-        import cv2
         from jingwei.data import NormalImageDataset, YOLODefectDataset, collate
         with tempfile.TemporaryDirectory() as tmp:
             imgs = Path(tmp) / "images" / "train"
@@ -216,17 +223,23 @@ class TestModel(unittest.TestCase):
             normal = Path(tmp) / "normal" / "images" / "train"
             for d in (imgs, labs, normal):
                 d.mkdir(parents=True, exist_ok=True)
-            for i in range(3):
-                cv2.imwrite(str(imgs / f"{i}.jpg"), weave(9 + i, 128, 0.2, 128))
-                (labs / f"{i}.txt").write_text("1 0.25 0.30 0.10 0.08\n17 0.7 0.6 0.2 0.1\n")
-                cv2.imwrite(str(normal / f"n{i}.jpg"), weave(7, 140, 0.4, 128))
+            # ASCII, uppercase extension, and Chinese filenames / label stems.
+            names = ["0.jpg", "1.JPG", "中文_布边折入.png"]
+            for i, name in enumerate(names):
+                imwrite_unicode(imgs / name, weave(9 + i, 128, 0.2, 128))
+                (labs / f"{Path(name).stem}.txt").write_text(
+                    "1 0.25 0.30 0.10 0.08\n17 0.7 0.6 0.2 0.1\n", encoding="utf-8")
+                imwrite_unicode(normal / f"n{i}.jpg", weave(7, 140, 0.4, 128))
+            imwrite_unicode(normal / "正常图.WEBP", weave(7, 140, 0.4, 128))
             ds = YOLODefectDataset(imgs, labs, img_size=128, augment=False)
+            self.assertEqual(len(ds), 3)
             item = ds[0]
             self.assertEqual(tuple(item["image"].shape), (3, 128, 128))
             self.assertEqual(tuple(item["boxes"].shape), (2, 4))
             self.assertEqual(tuple(item["labels"].shape), (2,))
             nd = NormalImageDataset(normal, img_size=128, augment=False,
                                     with_descriptor=True)
+            self.assertEqual(len(nd), 4)
             self.assertEqual(tuple(nd[0]["descriptor"].shape), (8,))
             batch = collate([ds[0], ds[1]])
             self.assertEqual(tuple(batch["image"].shape), (2, 3, 128, 128))
@@ -423,6 +436,112 @@ class TestModel(unittest.TestCase):
                                     (1280, 1280), cfg, 19, context=ctx2)
         self.assertEqual(out_edge["n_safety_boxes"], 1,
                          "high defect_fg in edge band must NOT be suppressed")
+
+    # ------------------------------------------------------- Chinese / Unicode paths
+    def test_24_unicode_paths(self):
+        """Chinese image / folder / video / prototype names must not error."""
+        from jingwei.data import list_images, read_image
+
+        # ASCII-only helpers -------------------------------------------------
+        self.assertEqual(ascii_safe("油点线", "cls3"), "cls3")
+        self.assertEqual(ascii_safe("ABC 123", "cls3"), "ABC 123")
+        escaped = console_safe("中文_路径")
+        self.assertNotIn("中", escaped)
+        self.assertIn("\\u", escaped)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "布匹数据_中文目录"
+            root.mkdir(parents=True, exist_ok=True)
+            img_cn = root / "中文_测试图.jpg"
+            img_up = root / "大写扩展.PNG"
+            self.assertTrue(imwrite_unicode(img_cn, weave(9, 128, 0.2, 128)))
+            self.assertTrue(imwrite_unicode(img_up, weave(11, 128, 0.2, 128)))
+            self.assertIsNone(imread_unicode(root / "不存在.jpg"))
+
+            gray = imread_unicode(img_cn, cv2.IMREAD_GRAYSCALE)
+            self.assertIsNotNone(gray)
+            self.assertEqual(gray.ndim, 2)
+            self.assertEqual(fabric_descriptor(gray).shape, (8,))
+            rgb = read_image(img_cn)
+            self.assertEqual(rgb.shape[:2], (128, 128))
+            self.assertEqual(rgb.shape[2], 3)
+
+            found = list_images(root)
+            self.assertEqual(len(found), 2)
+            self.assertTrue(any("中文_测试图.jpg" in f for f in found))
+            self.assertTrue(any("大写扩展.PNG" in f for f in found))
+
+            # tools/_common.descriptors_for_folder reads Unicode paths -------
+            tools_dir = str(ROOT / "tools")
+            sys.path.insert(0, tools_dir)
+            try:
+                import _common
+                files, descs, proto, labels = _common.descriptors_for_folder(root, 2)
+            finally:
+                sys.path.remove(tools_dir)
+            self.assertEqual(len(files), 2)
+            self.assertEqual(descs.shape, (2, 8))
+            self.assertEqual(labels.shape, (2,))
+
+            # Chinese-named .npz prototype file -----------------------------
+            proto_path = root / "布种原型.npz"
+            np.savez(proto_path,
+                     centers=np.zeros((2, 8), np.float32),
+                     mean=np.zeros(8, np.float32),
+                     std=np.ones(8, np.float32))
+            self.assertTrue(proto_path.exists())
+
+            # Chinese-named video + VideoCaptureUnicode ----------------------
+            ascii_video = root / "_tmp_ascii.avi"
+            writer = cv2.VideoWriter(str(ascii_video),
+                                     cv2.VideoWriter_fourcc(*"MJPG"), 5, (64, 64))
+            self.assertTrue(writer.isOpened())
+            writer.write(np.full((64, 64, 3), 110, np.uint8))
+            writer.release()
+            video_cn = root / "布匹视频_测试.avi"
+            shutil.copyfile(ascii_video, video_cn)
+            with VideoCaptureUnicode(video_cn) as cap:
+                self.assertTrue(cap.isOpened())
+                ok, frame = cap.read()
+                self.assertTrue(ok)
+                self.assertEqual(frame.shape[:2], (64, 64))
+                tmp_copy = cap.temp_path
+            self.assertIsNotNone(tmp_copy)
+            self.assertFalse(os.path.exists(tmp_copy))
+
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "ascii:backslashreplace"
+
+            # predict.py on a Chinese image, writing a Chinese output name ---
+            out_img = root / "中文输出目录"
+            cmd_img = [sys.executable, "tools/predict.py",
+                       "--cfg", CFG_P, "--source", str(img_cn),
+                       "--out", str(out_img), "--device", "cpu",
+                       "--prototypes", str(proto_path)]
+            proc = subprocess.run(cmd_img, cwd=str(ROOT), env=env,
+                                  capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=180)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertTrue((out_img / img_cn.name).exists())
+            res = json.loads((out_img / "results.json").read_text(encoding="utf-8"))
+            self.assertIn(img_cn.name, res)
+            self.assertIn("\\u", proc.stdout)       # console_safe escaped it
+            self.assertNotIn("中文", proc.stdout)
+
+            # predict.py on a Chinese video path -----------------------------
+            out_vid = root / "视频输出"
+            cmd_vid = [sys.executable, "tools/predict.py",
+                       "--cfg", CFG_P, "--source", str(video_cn),
+                       "--out", str(out_vid), "--device", "cpu",
+                       "--prototypes", str(proto_path), "--no-draw"]
+            proc_v = subprocess.run(cmd_vid, cwd=str(ROOT), env=env,
+                                    capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=180)
+            self.assertEqual(proc_v.returncode, 0, proc_v.stdout + proc_v.stderr)
+            self.assertTrue((out_vid / "_frames" / "000000.jpg").exists())
+            res_v = json.loads((out_vid / "results.json").read_text(encoding="utf-8"))
+            self.assertIn("000000.jpg", res_v)
+            self.assertNotIn("布匹视频", proc_v.stdout)
 
 
 if __name__ == "__main__":
