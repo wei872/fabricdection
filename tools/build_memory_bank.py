@@ -21,7 +21,7 @@ import torch
 
 from _common import (ROOT, SyntheticNormalDataset, data_paths,
                      descriptors_for_folder, extract_patch_features,
-                     load_model, resolve)
+                     load_model, resolve, save_checkpoint)
 from jingwei.data import list_images
 from jingwei.fabric import (fabric_descriptor, fit_fabric_prototypes,
                             greedy_coreset, spherical_kmeans)
@@ -162,10 +162,11 @@ def main():
     np.savez(out / "fabric_prototypes.npz",
              centers=proto.centers, mean=proto.mean, std=proto.std,
              descriptors=descs)
-    torch.save({"bank": bank.state_dict(),
-                "recon_calib": {"tau": r_tau, "slope": 8.0 / spread},
-                "model": model.state_dict(),
-                "n_prototypes": K, "n_centroids": C}, out / "memory_bank.pt")
+    save_checkpoint({"bank": bank.state_dict(),
+                     "recon_calib": {"tau": r_tau, "slope": 8.0 / spread},
+                     "model": model.state_dict(),
+                     "n_prototypes": K, "n_centroids": C},
+                    out / "memory_bank.pt")
     print(console_safe(f"saved -> {out}"))
 
 

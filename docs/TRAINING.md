@@ -15,7 +15,7 @@ pip install onnx tensorrt ultralytics
 
 最低验证环境（本仓库实测）：Python 3.11 + torch 2.2.2 (CPU 即可) +
 numpy 1.26 + opencv-python-headless + PyYAML + scipy + tqdm。
-跑 `python -m unittest discover -s tests -v` 应输出 `OK`（26 项）。
+跑 `python -m unittest discover -s tests -v` 应输出 `OK`（27 项）。
 阶段 0 的 `--smoke` 模式用 synthetic teacher，不需要下载 DINOv2 权重。
 
 ## 2. 数据准备
@@ -189,10 +189,47 @@ subject to FPR ≤ max(3·target_fpr, 0.02)
 若没有一组满足约束，说明 `target_fpr` 设得太严，或 `normaltrain` 污染 /
 布种覆盖不足（回到 §2.3）。
 
+### 3.5 断点续训
+
+阶段 0 / A / B 都支持完整 checkpoint 恢复。训练过程中会写：
+
+- `runs/dino/last.pt`、`runs/detector/last.pt`、`runs/normality/last.pt`；
+- 可选编号快照：`--save-interval N` 生成 `iter_XXXXXX.pt` / `epoch_XXXX.pt`；
+- 阶段 0 最终仍写 `dino_init.pt`，阶段 B 最终仍写 `normality.pt`，供下一阶段加载。
+
+完整 checkpoint 包含模型、优化器、scheduler、torch/CUDA/Python/NumPy RNG、
+当前 epoch/iter 和训练配置。中断后用同一条命令把 `--resume` 指向 `last.pt`：
+
+```bash
+# 阶段 0：不传 --iters 时沿用 checkpoint 里的总 iters
+python tools/pretrain_dino.py --cfg configs/jingwei_n.yaml \
+    --resume runs/dino/last.pt --log-interval 100
+
+# 阶段 A：从上次完成的 epoch 继续；可调大 --epochs 延长训练
+python tools/train_detector.py --cfg configs/jingwei_n.yaml \
+    --data configs/fabric19.yaml --resume runs/detector/last.pt \
+    --epochs 200 --batch 8 --log-interval 20
+
+# 阶段 B：从上次完成的 iteration 继续；可调大 --iters
+python tools/train_normality.py --cfg configs/jingwei_n.yaml \
+    --data configs/fabric19.yaml --resume runs/normality/last.pt \
+    --iters 12000 --log-interval 100
+```
+
+`--resume` 会自动区分两种文件：
+
+- 完整 checkpoint → 日志显示 `mode=full`，恢复全部状态并继续；
+- 仅权重的 checkpoint（如 `dino_init.pt`）→ 日志显示 `mode=weights-only`，
+  只热启动模型，从第 1 个 epoch/iter 开始。
+
+恢复阶段 0 时，teacher / crop / batch / lr / loss weights 会优先使用 checkpoint
+里的配置；若 CLI 传入冲突参数会给出警告。阶段 A/B 若 cfg、data、seed、batch、lr
+与 checkpoint 不同也会警告。详见 [DESIGN.md §12.8](DESIGN.md)。
+
 ## 4. 快速自检（无真实数据）
 
 ```bash
-python -m unittest discover -s tests -v                 # 26 项，约 67 s（含中文路径 / 非方形图 / 训练日志回归）
+python -m unittest discover -s tests -v                 # 27 项，约 105 s（含中文路径 / 非方形图 / 训练日志 / 断点续训回归）
 python tools/benchmark.py --all                         # p/n/s 参数量 / MACs / 延迟估算
 python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both  # 在你的 GPU 上实测
 python tools/train_detector.py   --smoke 2 --epochs 1 --batch 1 --device cpu --log-interval 1
@@ -215,6 +252,8 @@ python tools/export.py --check --out runs/export/jingwei_n.onnx
 | `ValueError: operands could not be broadcast together with shapes (H,W,3) (H,W)` | 旧版 `fabric_photometric` 反光场经 OpenCV 后变成 2D，未补通道维 | 已修复：`field[:, :, None]` 后再与 RGB 相乘；`test_25` 覆盖 1040×2448 类长条图，见 [DESIGN.md §12.6](DESIGN.md) |
 | `FutureWarning: You are using torch.load with weights_only=False` | PyTorch 2.6+ 提示未来默认值改为 `True` | 已统一走 `jingwei.utils.torch_load`（默认 `weights_only=True`）；含自定义对象的第三方权重会自动回退并给出 `RuntimeWarning`，仅加载可信文件 |
 | 训练时长时间没有任何日志 | 旧版只在 epoch 结束打印；Windows 控制台 / 重定向 stdout 还会缓冲 | 已加入启动日志 + `--log-interval` batch 日志 + `flush=True`；用 `--log-interval 20`（默认）观察进度，`--log-interval 0` 关闭 iter 日志；仍不显示时用 `python -u tools/train_detector.py ...` 或设置 `PYTHONUNBUFFERED=1`，见 [DESIGN.md §12.7](DESIGN.md) |
+| 训练中断后要从头开始 | 旧版 `last.pt` 只有模型权重 | 现在 `last.pt` 含优化器 / scheduler / RNG / epoch/iter；用 `--resume .../last.pt` 继续，日志出现 `mode=full` 才表示完整恢复；见 [DESIGN.md §12.8](DESIGN.md) |
+| `--resume dino_init.pt` 显示 `weights-only` | `dino_init.pt` 是阶段 0 交给阶段 A 的权重文件，不含训练状态 | 这是正常的 weight-only 热启动；若要继续阶段 0 训练，应 `--resume runs/dino/last.pt` |
 | 标签全空 | `labels` 目录推断失败 | 显式传 `--labels`（工具会自动把 `/images/` 换成 `/labels/`）；中文标签文件名同样支持 |
 | `rec_loss` → 0 | 主干没冻结，出现塌缩解 | 检查阶段 B 只把 `normality_parameters()` 加入优化器 |
 | 全图误报 | 记忆库没标定 / 用了未训练权重 | 必须先跑阶段 C；`tau` 由 `normalval` 标定 |

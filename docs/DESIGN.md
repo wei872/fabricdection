@@ -25,7 +25,7 @@
 
 **已验证**（见 §13）：参考实现在 1280×1280 下 n 变体 **6.32 M 参数 / 17.12 G MACs**，
 无 Tensor Core 卡专用的 pico 变体 **2.87 M / 8.42 G MACs**，
-26 项单元测试全过（含中文 / Unicode 路径 / 非方形图 / 训练日志回归），ONNX 导出成功且输出全为静态形状。
+27 项单元测试全过（含中文 / Unicode 路径 / 非方形图 / 训练日志 / 断点续训回归），ONNX 导出成功且输出全为静态形状。
 
 > ⚠️ **诚实声明**：仓库里目前只有 `dataset/dataset.yaml`（路径指向你本机的
 > `D:/tyhn/yolo/...`），**没有真实图片**。因此本文所有的精度数字都是**设计目标 / 验收指标**，
@@ -733,8 +733,9 @@ jingwei/
   model.py       JingWei 顶层（训练 / 推理 / 导出）
 tools/           阶段 0 + A–E 的 CLI（pretrain_dino / train / build / calibrate /
                  evaluate / predict / export / benchmark / bench_device）
-tools/_common.py 共享数据/模型加载 + log()/format_eta() 进度日志（flush=True）
-tests/test_model.py  26 项单元测试（含中文路径 / 非方形图 / 训练日志回归）
+tools/_common.py 共享数据/模型加载 + log()/format_eta() 进度日志 +
+                 save_checkpoint()/resume_checkpoint()/RNG 断点续训工具
+tests/test_model.py  27 项单元测试（含中文路径 / 非方形图 / 训练日志 / 断点续训回归）
 docs/DESIGN.md   本文
 docs/TRAINING.md 训练与数据准备手册
 docs/DEPLOYMENT.md 实时部署手册
@@ -831,6 +832,58 @@ Windows 控制台 / 重定向日志还会缓冲 `print`，于是用户会以为�
    `PYTHONUNBUFFERED=1`。`test_26_training_progress_logs` 覆盖三个脚本的
    启动日志、iteration 日志与 ETA。
 
+### 12.8 断点续训（checkpoint 设计）
+
+阶段 0 / A / B 现在都写**完整训练 checkpoint**，而不再只保存模型权重：
+
+| 字段 | 内容 |
+|---|---|
+| `model` | 模型 `state_dict` |
+| `optimizer` | AdamW 的 momentum / variance / step 等状态 |
+| `scheduler` | 阶段 A 的 `CosineAnnealingLR` 状态（阶段 0 / B 无 scheduler） |
+| `rng` | torch CPU/CUDA、Python `random`、数据集 `np.random.Generator` 状态 |
+| `train` | `stage` / `format_version` / `epoch` / `iter` / `iters` / `epochs` / `batch` / `lr` / `cfg` / `data` / `seed` / 原始 CLI 参数 |
+| `dino_adaptor` / `teacher_model` | 阶段 0 专用；真实 DINOv2 teacher 不落盘，只保存 synthetic teacher |
+
+设计要点：
+
+1. **写入原子化**：`tools/_common.py::save_checkpoint` 先写 `*.tmp` 再 `os.replace`，
+   进程被强杀时不会留下半个损坏的 `.pt`。
+2. **自动识别两种 `--resume`**：
+   - 完整 checkpoint（含 `optimizer` 且 `train.stage` 匹配）→ 恢复模型、优化器、
+     scheduler、RNG、epoch/iter，继续训练；
+   - 只有权重的 checkpoint（如 `dino_init.pt`、`normality.pt`、旧版 `last.pt`）→
+     仅热启动权重，日志明确提示 `mode=weights-only`，从第 1 个 epoch / iter 开始。
+3. **恢复点**：
+   - 阶段 A 每个 epoch 结束覆盖 `runs/detector/last.pt`，`train.epoch` 表示
+     **下一个要跑的 epoch**；`--save-interval N` 额外保留 `epoch_XXXX.pt`。
+   - 阶段 0 / B 每 `--save-interval` iters 覆盖 `last.pt` 并保留
+     `iter_XXXXXX.pt`，`train.iter` 表示已完成的 iteration；最终仍分别写
+     `dino_init.pt` / `normality.pt` 供下一阶段使用。
+4. **配置一致性**：阶段 0 完整 checkpoint 会恢复 teacher / crop / batch / lr /
+   loss weights；阶段 A/B 会检查 cfg / data / seed / batch / lr 是否变化并给出警告。
+   若想延长训练，只需把 `--epochs` 或 `--iters` 调大。
+5. **RNG 精确恢复**：不仅恢复 torch / CUDA / Python RNG，也恢复数据集增广用的
+   `np.random.Generator` 状态；并以 `weights_only=True` 友好的纯容器保存，不触发
+   PyTorch 2.6+ 的 `FutureWarning`。
+6. `test_27_resume_training` 覆盖三个阶段的“训练 1 步 → 中断 → 完整恢复 → 继续”，
+   以及 `dino_init.pt` 的 weight-only 热启动。
+
+典型用法：
+
+```bash
+# 阶段 0 中断后继续（不传 --iters 即沿用 checkpoint 里的总 iters）
+python tools/pretrain_dino.py --cfg configs/jingwei_p.yaml --resume runs/dino/last.pt
+
+# 阶段 A 从上次 epoch 继续，并把总 epoch 从 150 延长到 200
+python tools/train_detector.py --cfg configs/jingwei_p.yaml \
+    --resume runs/detector/last.pt --epochs 200 --log-interval 20
+
+# 阶段 B 从上次 iteration 继续
+python tools/train_normality.py --cfg configs/jingwei_p.yaml \
+    --resume runs/normality/last.pt --iters 10000
+```
+
 ---
 
 ## 13. 已验证结果（实测，非目标值）
@@ -838,13 +891,14 @@ Windows 控制台 / 重定向日志还会缓冲 `print`，于是用户会以为�
 执行 `python -m unittest discover -s tests -v`（CPU 即可，无需数据/GPU）：
 
 ```
-Ran 26 tests in ~67 s — OK
+Ran 27 tests in ~105 s — OK
 
   params = 6.32 M        MACs @1280 = 17.12 G   (jingwei_n)
   pico   = 2.87 M        MACs @1280 =  8.42 G   (jingwei_p)
   Chinese/Unicode image, folder, video and .npz paths = OK
   non-square 1040x2448-like fabric frame augmentation = OK
   stage 0 / A / B startup + per-iteration progress logs = OK
+  stage 0 / A / B full checkpoint resume + weight-only warm start = OK
 ```
 
 覆盖内容：
@@ -877,6 +931,7 @@ Ran 26 tests in ~67 s — OK
 | 24 | **中文 / Unicode 图片、目录、视频、`.npz` 原型路径 + `predict.py` 端到端** |
 | 25 | **非方形 / 长条布幅图（如 1040×2448）在反光增广下的广播正确性** |
 | 26 | 阶段 0 / A / B 训练脚本的启动日志与按 iteration 的进度 / ETA 日志 |
+| 27 | 阶段 0 / A / B 完整 checkpoint 断点续训（optimizer / scheduler / RNG / epoch / iter）与 weight-only 热启动 |
 
 **布种描述符实测**（合成织纹，周期 5/9/13/19 px、亮度 100/170、反光 0/0.9）：
 
@@ -889,7 +944,8 @@ Ran 26 tests in ~67 s — OK
 `calibrate_fusion` / `evaluate` / `predict` / `export` 全部跑通；`predict` 另在
 中文图片名、中文输出目录、中文 `.npz` 原型、中文视频名下跑通（见 §12.5 / 测试 24）。
 `pretrain_dino` / `train_detector` / `train_normality` 另验证启动日志、
-`--log-interval` batch 进度与 ETA（见 §12.7 / 测试 26）。
+`--log-interval` batch 进度与 ETA（见 §12.7 / 测试 26），以及完整 checkpoint
+断点续训与 weight-only 热启动（见 §12.8 / 测试 27）。
 
 **ONNX 导出**：`tools/export.py` 成功导出 1280² 静态图，
 `onnx.checker` 通过；`roi_head=false`（pico）为 8 个输出（+context），

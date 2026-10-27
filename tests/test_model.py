@@ -7,8 +7,8 @@ Run from the repo root::
 No pytest / no GPU / no real data needed. It checks shapes at the required
 1280x1280 input, trainability, the deterministic safety net, fabric-type
 invariance, memory-bank algebra, the dataset readers, Chinese / Unicode
-file paths, non-square fabric augmentation, and training progress logs
-(26 tests).
+file paths, non-square fabric augmentation, training progress logs, and
+full checkpoint resume (27 tests).
 """
 from __future__ import annotations
 
@@ -636,6 +636,116 @@ class TestModel(unittest.TestCase):
                         "--out", str(out / "dino")])
             for token in ("JingWei stage 0", "iter      1/1", "eta=", "next:"):
                 self.assertIn(token, dino)
+
+    # ------------------------------------------------------------- resume training
+    def test_27_resume_training(self):
+        """Full checkpoints restore optimizer / scheduler / RNG in stages 0/A/B."""
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "ascii:backslashreplace"
+
+        def run(cmd):
+            proc = subprocess.run(cmd, cwd=str(ROOT), env=env,
+                                  capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=180)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return proc.stdout
+
+        def common(*extra):
+            return [sys.executable, *extra, "--cfg", CFG_P, "--device", "cpu",
+                    "--seed", "7", "--log-interval", "0"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+
+            # ---- stage A: 1 epoch -> full checkpoint -> resume to 2 epochs ----
+            run(common("tools/train_detector.py", "--smoke", "1", "--epochs", "1",
+                       "--batch", "1", "--num-workers", "0", "--save-interval", "1",
+                       "--out", str(out / "det_a")))
+            det_ckpt = out / "det_a" / "last.pt"
+            self.assertTrue(det_ckpt.is_file())
+            self.assertTrue((out / "det_a" / "epoch_0001.pt").is_file())
+            s = torch_load(det_ckpt, map_location="cpu")
+            self.assertIn("optimizer", s)
+            self.assertIn("scheduler", s)
+            self.assertIn("rng", s)
+            self.assertEqual(s["train"]["stage"], "detector")
+            self.assertEqual(s["train"]["epoch"], 1)
+
+            det2 = run(common("tools/train_detector.py", "--smoke", "1",
+                              "--epochs", "2", "--batch", "1", "--num-workers", "0",
+                              "--resume", str(det_ckpt),
+                              "--out", str(out / "det_b")))
+            self.assertIn("mode=full", det2)
+            self.assertIn("resumed full checkpoint", det2)
+            self.assertIn("start_epoch=2/2", det2)
+            self.assertIn("epoch   2/2", det2)
+            self.assertNotIn("epoch   1/2", det2)
+            s2 = torch_load(out / "det_b" / "last.pt", map_location="cpu")
+            self.assertEqual(s2["train"]["epoch"], 2)
+
+            # ---- stage B: 1 iter -> full checkpoint -> resume to 2 iters ----
+            run(common("tools/train_normality.py", "--smoke", "1", "--iters", "1",
+                       "--batch", "1", "--save-interval", "1",
+                       "--out", str(out / "norm_a")))
+            norm_ckpt = out / "norm_a" / "last.pt"
+            self.assertTrue(norm_ckpt.is_file())
+            self.assertTrue((out / "norm_a" / "normality.pt").is_file())
+            s = torch_load(norm_ckpt, map_location="cpu")
+            self.assertIn("optimizer", s)
+            self.assertEqual(s["train"]["stage"], "normality")
+            self.assertEqual(s["train"]["iter"], 1)
+
+            norm2 = run(common("tools/train_normality.py", "--smoke", "1",
+                               "--iters", "2", "--batch", "1",
+                               "--resume", str(norm_ckpt),
+                               "--out", str(out / "norm_b")))
+            self.assertIn("mode=full", norm2)
+            self.assertIn("start_iter=1/2", norm2)
+            self.assertIn("resumed full checkpoint", norm2)
+            s2 = torch_load(out / "norm_b" / "last.pt", map_location="cpu")
+            self.assertEqual(s2["train"]["iter"], 2)
+
+            # ---- stage 0: 1 iter -> full checkpoint -> resume to 2 iters ----
+            run(common("tools/pretrain_dino.py", "--smoke", "1", "--iters", "1",
+                       "--batch", "1", "--save-interval", "1",
+                       "--out", str(out / "dino_a")))
+            dino_ckpt = out / "dino_a" / "last.pt"
+            self.assertTrue(dino_ckpt.is_file())
+            self.assertTrue((out / "dino_a" / "dino_init.pt").is_file())
+            s = torch_load(dino_ckpt, map_location="cpu")
+            self.assertIn("optimizer", s)
+            self.assertIn("dino_adaptor", s)
+            self.assertIn("teacher_model", s)
+            self.assertEqual(s["train"]["stage"], "dino")
+            self.assertEqual(s["train"]["iter"], 1)
+
+            dino2 = run(common("tools/pretrain_dino.py", "--smoke", "1",
+                               "--iters", "2", "--batch", "1",
+                               "--resume", str(dino_ckpt),
+                               "--out", str(out / "dino_b")))
+            self.assertIn("mode=full", dino2)
+            self.assertIn("start_iter=1/2", dino2)
+            self.assertIn("resumed full checkpoint", dino2)
+            s2 = torch_load(out / "dino_b" / "last.pt", map_location="cpu")
+            self.assertEqual(s2["train"]["iter"], 2)
+            self.assertTrue((out / "dino_b" / "dino_init.pt").is_file())
+
+            # Stored iters are reused when --iters is omitted; already done.
+            done = run(common("tools/pretrain_dino.py", "--smoke", "1",
+                              "--batch", "1", "--resume",
+                              str(out / "dino_b" / "last.pt"),
+                              "--out", str(out / "dino_done")))
+            self.assertIn("nothing to do", done)
+            self.assertTrue((out / "dino_done" / "dino_init.pt").is_file())
+
+            # Weight-only warm start (dino_init.pt) must still work.
+            warm = run(common("tools/train_detector.py", "--smoke", "1",
+                              "--epochs", "1", "--batch", "1",
+                              "--num-workers", "0", "--resume",
+                              str(out / "dino_b" / "dino_init.pt"),
+                              "--out", str(out / "warm")))
+            self.assertIn("mode=weights-only", warm)
+            self.assertIn("starting from epoch 1", warm)
 
 
 if __name__ == "__main__":

@@ -234,6 +234,7 @@ python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both
 - [ ] 生产图片/视频路径含中文/空格时用 `jingwei/image_io.py` 读写（已默认接入）；回归测试 `test_24_unicode_paths` 通过
 - [ ] 非方形长条布幅帧（如 1040×2448）在 `augment=True` 下能正常训练；回归测试 `test_25_non_square_photometric_augment` 通过
 - [ ] 阶段 0 / A / B 训练日志可见（启动信息 + batch 进度 / ETA）；回归测试 `test_26_training_progress_logs` 通过
+- [ ] 阶段 0 / A / B 可用 `last.pt` 断点续训；回归测试 `test_27_resume_training` 通过
 - [ ] ONNX 8 个输出（含 context）形状静态；TRT engine 在目标设备构建成功
 - [ ] INT8 情况下阈值已重新标定
 - [ ] 1000 帧 P50/P99 延迟达标，P99/P50 ≤ 1.3

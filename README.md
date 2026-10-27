@@ -31,8 +31,8 @@
 | **[docs/FOREGROUND.md](docs/FOREGROUND.md)** | **前景/背景分离、布幅变化跟随、边缘正常折入误报抑制** |
 | `jingwei/` | 参考实现：主干 / 双尺度头 / 记忆库 / 线性注意力重建 / 安全网 / 损失 / 数据集 / **Unicode 安全图像 I/O** / **安全 checkpoint 加载** / DINO teacher 工具 |
 | `configs/` | `jingwei_n.yaml`（实时优先）、`jingwei_s.yaml`（精度优先）、**`jingwei_p.yaml`（GTX 1660 SUPER 等无 Tensor Core 卡专用）**、`fabric19.yaml`（数据）；均含 `dino:` 阶段 0 配置 |
-| `tools/` | **DINOv2 蒸馏预训练**、训练（带启动 / batch 级进度日志）、建库、标定、评估、推理、导出、算力剖析、**真实设备延迟实测** CLI |
-| `tests/test_model.py` | 26 项单元测试（含中文路径 / 非方形图 / 训练日志回归） |
+| `tools/` | **DINOv2 蒸馏预训练**、训练（启动 / batch 级日志 + **完整断点续训**）、建库、标定、评估、推理、导出、算力剖析、**真实设备延迟实测** CLI |
+| `tests/test_model.py` | 27 项单元测试（含中文路径 / 非方形图 / 训练日志 / 断点续训回归） |
 
 > `dataset/dataset.yaml` 保持原样，作为 19 个类别名的真源。
 
@@ -43,7 +43,7 @@
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m unittest discover -s tests -v     # 应输出 OK (26 tests，含中文路径 / 非方形图 / 训练日志回归)
+python -m unittest discover -s tests -v     # 应输出 OK (27 tests，含中文路径 / 非方形图 / 训练日志 / 断点续训回归)
 python tools/benchmark.py --both            # 参数量 / MACs / 延迟估算
 ```
 
@@ -66,11 +66,20 @@ python tools/export.py            --cfg configs/jingwei_n.yaml --ckpt runs/bank/
 训练命令现在会立即打印启动信息，并按 `--log-interval` 打印 batch 级进度 / ETA；
 若控制台仍被缓冲，用 `python -u tools/train_detector.py ...` 或设置 `PYTHONUNBUFFERED=1`。
 
+中断后直接把 `--resume` 指向对应阶段的 `last.pt` 即可继续：
+
+```bash
+python tools/pretrain_dino.py    --cfg configs/jingwei_n.yaml --resume runs/dino/last.pt
+python tools/train_detector.py   --cfg configs/jingwei_n.yaml --resume runs/detector/last.pt
+python tools/train_normality.py  --cfg configs/jingwei_n.yaml --resume runs/normality/last.pt
+```
+
 图片 / 目录 / 视频文件名支持中文、空格及大写扩展名（`.JPG/.PNG/.WEBP`）；
 `jingwei/image_io.py` 统一用 `np.fromfile+imdecode` / `imencode+tofile` 读写，
 `VideoCaptureUnicode` 处理中文视频路径，Windows 下无需重命名数据。
-非方形长条布幅图（如 1040×2448）也可直接训练；详见
-[docs/DESIGN.md §12.5–12.7](docs/DESIGN.md)。
+非方形长条布幅图（如 1040×2448）也可直接训练；阶段 0 / A / B 支持
+完整 checkpoint 断点续训；详见
+[docs/DESIGN.md §12.5–12.8](docs/DESIGN.md)。
 
 阶段 A 会同时训练 `defect_fg` 前景头；`data.py` 还会合成布幅边缘正常折入增广，
 避免产线把折入误判成疵点，详见 [docs/FOREGROUND.md](docs/FOREGROUND.md)。
@@ -84,13 +93,14 @@ python tools/export.py            --cfg configs/jingwei_n.yaml --ckpt runs/bank/
 
 ```
 python -m unittest discover -s tests -v
-Ran 26 tests in ~67 s — OK
+Ran 27 tests in ~105 s — OK
   jingwei_n = 6.32 M / 17.12 G MACs @1280
   jingwei_p = 2.87 M /  8.42 G MACs @1280
   stage 0 DINOv2 distillation + foreground/fold context = smoke OK
   Chinese/Unicode image, folder, video and .npz paths = OK
   non-square 1040x2448-like fabric frame augmentation = OK
   stage 0 / A / B startup + per-iteration progress logs = OK
+  stage 0 / A / B full checkpoint resume + weight-only warm start = OK
 ```
 
 | 变体 | 参数 | 1280² MACs | 640² MACs | RTX 4090 估算 | Jetson AGX Orin 估算 | **GTX 1660 SUPER 估算** |
@@ -130,6 +140,10 @@ JingWei-n 在 1280² 仍只用了约六成的计算量。
 - **训练日志**：阶段 0 / A / B 启动即打印配置、数据、设备、参数量与输出路径；
   训练中默认每 20 个 batch（阶段 0 / B 默认 100 iters）打印 loss、lr、it/s、ETA。
   全部日志 `flush=True`，可用 `--log-interval N` 调整或 `python -u` 关闭缓冲。
+- **断点续训**：`last.pt` 现在保存模型 + 优化器 + scheduler + RNG + epoch/iter
+  完整状态；`--resume` 自动识别完整 checkpoint 与 weight-only 热启动。
+  `--save-interval` 保留编号快照，写入使用临时文件 + `os.replace` 原子替换。
+  详见 [docs/DESIGN.md §12.8](docs/DESIGN.md)。
 
 ---
 

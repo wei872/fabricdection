@@ -126,11 +126,28 @@ python tools/pretrain_dino.py --smoke 4 --iters 2 --cfg configs/jingwei_p.yaml
 ```
 
 单元测试 `tests/test_model.py::test_20/21`（另见 `test_22/23` 前景/折入）覆盖同一路径：
-`python -m unittest discover -s tests -v` 应输出 `OK (26 tests)`（含中文路径 / 非方形图 / 训练日志回归）。
+`python -m unittest discover -s tests -v` 应输出 `OK (27 tests)`（含中文路径 / 非方形图 / 训练日志 / 断点续训回归）。
 本地 teacher 权重与 checkpoint 统一通过 `jingwei.utils.torch_load` 读取，默认
 `weights_only=True`，不再触发 PyTorch 2.6+ 的 `FutureWarning`。
 阶段 0 启动即打印 teacher / 数据 / device / 参数量，并按
 `--log-interval` 打印 `distill_cosine`、lr、it/s 与 ETA；默认 100 iters。
+
+### 5.4 断点续训
+
+阶段 0 每 `--save-interval` iters（默认 500）写 `runs/dino/last.pt` 与
+`iter_XXXXXX.pt` 快照，最终仍写 `dino_init.pt`。中断后：
+
+```bash
+python tools/pretrain_dino.py --cfg configs/jingwei_p.yaml \
+    --resume runs/dino/last.pt --log-interval 100
+```
+
+完整 checkpoint 会恢复 student、dino adaptor、optimizer、RNG、已完成的
+iteration 以及 teacher / crop / batch / lr / loss weights 配置；不传 `--iters`
+时沿用 checkpoint 里的总 iters，想延长训练则显式传更大的 `--iters`。
+真实 DINOv2 teacher 不写入 checkpoint（从 hub / 本地权重重新加载），synthetic
+teacher 会连同随机权重一起保存，保证 smoke 复现。详见
+[DESIGN.md §12.8](DESIGN.md)。
 
 ## 6. teacher 选择
 

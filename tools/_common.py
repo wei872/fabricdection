@@ -2,11 +2,14 @@
 
 Image / video reads go through :mod:`jingwei.image_io`, so Chinese / Unicode
 dataset paths work on Windows as well as Linux.  Training scripts use
-:func:`log` so progress appears immediately even when stdout is buffered.
+:func:`log` so progress appears immediately even when stdout is buffered, and
+:func:`save_checkpoint` / :func:`resume_checkpoint` for full-state resume.
 """
 from __future__ import annotations
 
 import math
+import os
+import random
 import sys
 from pathlib import Path
 
@@ -65,11 +68,160 @@ def resolve(p: str) -> Path:
     return p if p.is_absolute() else ROOT / p
 
 
+def set_global_seed(seed: int) -> None:
+    """Seed Python / NumPy / CPU+CUDA torch RNGs for reproducible resumes."""
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
+
+def save_checkpoint(state: dict, path) -> Path:
+    """Atomically write a checkpoint (safe if the process is killed mid-save)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        torch.save(state, tmp)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    return path
+
+
+def load_checkpoint(path) -> dict:
+    """Load a checkpoint relative to the repo root when given a relative path."""
+    return torch_load(resolve(path), map_location="cpu")
+
+
+def checkpoint_meta(state: dict) -> dict:
+    return dict(state.get("train", {}) or {})
+
+
+def is_resumable(state: dict, stage: str) -> bool:
+    meta = checkpoint_meta(state)
+    return "optimizer" in state and meta.get("stage") == stage
+
+
+# --------------------------------------------------------------------------------------
+# RNG state (kept weights_only=True friendly: no raw numpy arrays / custom objects)
+# --------------------------------------------------------------------------------------
+def _generator_state(rng) -> dict:
+    st = rng.bit_generator.state
+    return {
+        "bit_generator": str(st["bit_generator"]),
+        "state": st["state"].tolist(),
+        "has_uint32": int(st["has_uint32"]),
+        "uinteger": int(st["uinteger"]),
+    }
+
+
+def _restore_generator_state(rng, st: dict) -> None:
+    state = dict(st)
+    state["state"] = np.asarray(state["state"], dtype=np.uint32)
+    state["has_uint32"] = int(state["has_uint32"])
+    state["uinteger"] = int(state["uinteger"])
+    rng.bit_generator.state = state
+
+
+def collect_rng_state(dataset=None) -> dict:
+    out = {
+        "torch": torch.get_rng_state(),
+        "python": random.getstate(),
+        "cuda": (torch.cuda.get_rng_state_all()
+                 if torch.cuda.is_available() else []),
+    }
+    rng = getattr(dataset, "rng", None)
+    if rng is not None and hasattr(rng, "bit_generator"):
+        out["numpy"] = _generator_state(rng)
+    return out
+
+
+def restore_rng_state(state: dict, dataset=None) -> None:
+    if not state:
+        return
+    if "torch" in state:
+        torch.set_rng_state(state["torch"])
+    if "python" in state:
+        try:
+            random.setstate(tuple(state["python"]))
+        except (TypeError, ValueError):
+            pass
+    if state.get("cuda") and torch.cuda.is_available():
+        try:
+            torch.cuda.set_rng_state_all(state["cuda"])
+        except (RuntimeError, TypeError):
+            pass
+    if "numpy" in state:
+        rng = getattr(dataset, "rng", None)
+        if rng is not None and hasattr(rng, "bit_generator"):
+            try:
+                _restore_generator_state(rng, state["numpy"])
+            except (KeyError, TypeError, ValueError):
+                pass
+
+
+def resume_checkpoint(state_or_path, stage: str, model, optimizer=None,
+                      scheduler=None, dataset=None, extra_modules=None,
+                      device="cpu") -> dict:
+    """Load weights; additionally restore full training state when available.
+
+    ``state_or_path`` may be a path or an already-loaded state dict.  A full
+    checkpoint contains ``optimizer`` and ``train.stage == stage``; otherwise
+    the file is treated as a weight-only warm start (e.g. ``dino_init.pt``).
+    """
+    state = (state_or_path if isinstance(state_or_path, dict)
+             else load_checkpoint(state_or_path))
+    meta = checkpoint_meta(state)
+    full = bool(optimizer is not None and "optimizer" in state and
+                meta.get("stage") == stage)
+
+    sd = state.get("model", state)
+    model.load_state_dict(sd, strict=False)
+    if extra_modules:
+        for key, module in extra_modules.items():
+            if key in state:
+                module.load_state_dict(state[key], strict=False)
+
+    if full:
+        optimizer.load_state_dict(state["optimizer"])
+        for st in optimizer.state.values():
+            if isinstance(st, dict):
+                for k, v in st.items():
+                    if torch.is_tensor(v):
+                        st[k] = v.to(device)
+        if scheduler is not None and "scheduler" in state:
+            scheduler.load_state_dict(state["scheduler"])
+        restore_rng_state(state.get("rng", {}), dataset)
+
+    if full:
+        reason = "ok"
+    elif meta.get("stage") and meta.get("stage") != stage:
+        reason = f"stage mismatch: checkpoint is {meta.get('stage')!r}, expected {stage!r}"
+    elif "optimizer" not in state:
+        reason = "weight-only checkpoint (no optimizer / scheduler state)"
+    else:
+        reason = "missing optimizer"
+    return {
+        "full": full,
+        "reason": reason,
+        "meta": meta,
+        "epoch": int(meta.get("epoch", 0)) if full else 0,
+        "iter": int(meta.get("iter", 0)) if full else 0,
+        "state": state,
+    }
+
+
 def load_model(cfg_path: str, ckpt: str | None = None, device="cpu"):
     cfg = load_config(cfg_path)
     model = build_model(cfg)
     if ckpt:
-        state = torch_load(ckpt, map_location="cpu")
+        state = load_checkpoint(ckpt)
         sd = state.get("model", state)
         model.load_state_dict(sd, strict=False)
     return model.to(device), cfg
