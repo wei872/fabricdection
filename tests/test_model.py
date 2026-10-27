@@ -8,8 +8,9 @@ No pytest / no GPU / no real data needed. It checks shapes at the required
 1280x1280 input, trainability, the deterministic safety net, fabric-type
 invariance, memory-bank algebra, the dataset readers, Chinese / Unicode
 file paths, non-square fabric augmentation, training progress logs,
-full checkpoint resume, numpy RNG state checkpointing, and dynamic
-local+global attention foreground context (29 tests).
+full checkpoint resume, numpy RNG state checkpointing, dynamic
+local+global attention foreground context, validation metrics, YOLO-style
+image cache, and unknown-defect boxes (32 tests).
 """
 from __future__ import annotations
 
@@ -907,6 +908,154 @@ class TestModel(unittest.TestCase):
                     "attention.fg_head.weight"):
             self.assertIsNotNone(named[key].grad, key)
             self.assertTrue(torch.isfinite(named[key].grad).all(), key)
+
+    # ------------------------------------------------- validation metrics in training
+    def test_30_validation_metrics_and_best_checkpoint(self):
+        """Stage A must print val precision/recall/mAP/large recall and save best.pt."""
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "ascii:backslashreplace"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "det"
+            cmd = [sys.executable, "tools/train_detector.py",
+                   "--cfg", CFG_P, "--smoke", "2", "--epochs", "1",
+                   "--batch", "1", "--num-workers", "0", "--device", "cpu",
+                   "--log-interval", "0", "--val-interval", "1",
+                   "--val-max", "2", "--normal-max", "2", "--cache", "none",
+                   "--out", str(out)]
+            proc = subprocess.run(cmd, cwd=str(ROOT), env=env,
+                                  capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=240)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            text = proc.stdout
+            for token in ("val   epoch", "mAP50=", "precision=", "recall=",
+                          "f1=", "large_recall=", "normal_fpr=",
+                          "unknown_boxes=", "best   ->"):
+                self.assertIn(token, text)
+            self.assertTrue((out / "last.pt").is_file())
+            self.assertTrue((out / "best.pt").is_file())
+
+    # ------------------------------------------------------- YOLO-style image cache
+    def test_31_yolo_style_image_cache(self):
+        """disk/ram/bytes caches reproduce the original dataset + Unicode paths."""
+        from jingwei.cache import (build_dataset_cache, cache_paths,
+                                   cache_prefix, load_cached_dataset)
+        from jingwei.data import YOLODefectDataset, infer_labels_dir
+
+        size = 64
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img_dir = root / "布幅图片" / "images"
+            lab_dir = root / "布幅图片" / "labels"
+            img_dir.mkdir(parents=True)
+            lab_dir.mkdir(parents=True)
+            for i in range(3):
+                img = np.full((80, 120, 3), 40 + i * 40, np.uint8)
+                cv2.putText(img, str(i), (10, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                            1, (200, 200, 200), 2)
+                self.assertTrue(imwrite_unicode(img_dir / f"布匹_{i}.jpg", img))
+                (lab_dir / f"布匹_{i}.txt").write_text(
+                    f"{i % 2} 0.5 0.5 0.4 0.3\n", encoding="utf-8")
+
+            inferred = infer_labels_dir(img_dir)
+            self.assertTrue(inferred.endswith("labels"), inferred)
+            orig = YOLODefectDataset(img_dir, inferred, img_size=size,
+                                     augment=False, seed=0)
+            self.assertEqual(len(orig[0]["labels"]), 1)
+
+            for mode in ("disk", "ram", "bytes"):
+                prefix = cache_prefix(root / "cache", "tag", "train",
+                                      size, mode)
+                meta = build_dataset_cache(
+                    img_dir, inferred, size, prefix, mode, True,
+                    log_fn=lambda m: None)
+                self.assertEqual(meta["n"], 3)
+                ds = load_cached_dataset(prefix, mode, False, 0)
+                o, c = orig[1], ds[1]
+                self.assertEqual(tuple(c["image"].shape),
+                                 tuple(o["image"].shape))
+                self.assertLess(float((c["image"] - o["image"]).abs().max()),
+                                1e-6, mode)
+                self.assertTrue(torch.allclose(c["boxes"], o["boxes"]), mode)
+                self.assertTrue(torch.equal(c["labels"], o["labels"]), mode)
+                self.assertIn("布匹_1", c["path"])
+                meta2 = build_dataset_cache(
+                    img_dir, inferred, size, prefix, mode, True,
+                    log_fn=lambda m: None)
+                self.assertEqual(meta["signature"], meta2["signature"])
+                mp, dp = cache_paths(prefix, mode)
+                self.assertTrue(mp.is_file() and dp.is_file())
+
+            # CLI pre-build like YOLO's train.cache, with a Unicode dataset path
+            import yaml
+            data_yaml = root / "data.yaml"
+            data_yaml.write_text(yaml.safe_dump({
+                "train": str(root / "train" / "images"),
+                "val": str(root / "val" / "images"),
+                "normaltrain": str(root / "normaltrain" / "images"),
+                "normalval": str(root / "normalval" / "images"),
+            }, allow_unicode=True), encoding="utf-8")
+            for split in ("train", "val", "normaltrain", "normalval"):
+                d = root / split / "images"
+                d.mkdir(parents=True)
+                (root / split / "labels").mkdir(parents=True, exist_ok=True)
+                imwrite_unicode(d / "图_0.jpg",
+                                np.full((48, 64, 3), 90, np.uint8))
+                if split in ("train", "val"):
+                    (root / split / "labels" / "图_0.txt").write_text(
+                        "1 0.5 0.5 0.3 0.3\n", encoding="utf-8")
+            cfg_yaml = root / "tiny.yaml"
+            cfg_yaml.write_text("name: tiny\ninput_size: [64, 64]\n"
+                                "data:\n  dataset_yaml: " +
+                                str(data_yaml).replace("\\", "/") +
+                                "\n  nc: 19\n  names: [a, b]\n",
+                                encoding="utf-8")
+            cache_dir = root / "cli_cache"
+            cmd = [sys.executable, "tools/cache_dataset.py",
+                   "--cfg", str(cfg_yaml), "--data", str(data_yaml),
+                   "--splits", "train,val,normaltrain,normalval",
+                   "--mode", "bytes", "--cache-dir", str(cache_dir),
+                   "--img-size", "64"]
+            proc = subprocess.run(cmd, cwd=str(ROOT), capture_output=True,
+                                  text=True, encoding="utf-8",
+                                  errors="replace", timeout=120)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("cache ready", proc.stdout)
+            self.assertTrue(any(cache_dir.glob("train_64_bytes_*.bin")))
+            self.assertTrue(any(cache_dir.glob("val_64_bytes_*.json")))
+
+    # --------------------------------------------------- unknown defect type boxes
+    def test_32_unknown_defect_boxes(self):
+        """Small anomalous components also emit 未知异常 boxes, large ones stay."""
+        G = 160
+        cfg = load_config(CFG_N)
+        self.assertTrue(bool(cfg.fusion.emit_unknown_boxes))
+        ctx = np.zeros((3, G, G), np.float32)
+        ctx[1] = 1.0                       # all fabric, no fold band
+        empty_b = np.zeros((0, 4), np.float32)
+        empty_s = np.zeros(0, np.float32)
+        empty_l = np.zeros(0, np.int64)
+
+        small = np.zeros((G, G), np.float32)
+        small[80:83, 80:82] = 0.90        # 6 cells < large_min, >= unknown_min
+        out = safety_net_numpy(small, empty_b, empty_s, empty_l,
+                               (1280, 1280), cfg, 19, context=ctx)
+        self.assertEqual(out["n_safety_boxes"], 1)
+        self.assertEqual(out["n_unknown_boxes"], 1)
+        self.assertIn(19, out["labels"].tolist())
+
+        cfg.fusion.emit_unknown_boxes = False
+        off = safety_net_numpy(small, empty_b, empty_s, empty_l,
+                               (1280, 1280), cfg, 19, context=ctx)
+        self.assertEqual(off["n_safety_boxes"], 0)
+
+        cfg.fusion.emit_unknown_boxes = True
+        large = np.zeros((G, G), np.float32)
+        large[50:100, 60:110] = 0.95
+        big = safety_net_numpy(large, empty_b, empty_s, empty_l,
+                               (1280, 1280), cfg, 19, context=ctx)
+        self.assertEqual(big["n_safety_boxes"], 1)
+        self.assertEqual(big["n_unknown_boxes"], 0)
+        self.assertIn(19, big["labels"].tolist())
 
 
 if __name__ == "__main__":

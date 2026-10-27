@@ -17,6 +17,12 @@ skipped here (``set_stage('detector')``) and trained in stage B.
 ``--resume`` auto-detects a full training checkpoint (``last.pt``) versus a
 weight-only warm start (``dino_init.pt``). Full checkpoints are written at
 every epoch; ``--save-interval N`` additionally keeps numbered snapshots.
+``best.pt`` is saved when validation mAP50 + large-defect recall improves.
+
+Add ``--cache disk`` (or ``ram`` / ``bytes``) to use a YOLO-style image cache;
+every epoch still prints val precision / recall / F1 / mAP50 / large recall.
+Use ``--val-interval 0`` to disable validation and ``--val-max 200`` to
+validate on a subset for speed.
 """
 from __future__ import annotations
 
@@ -25,12 +31,14 @@ import time
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
-from _common import (ROOT, collect_rng_state, data_paths, format_eta,
-                     load_checkpoint, load_model, log, resolve,
+from _common import (ROOT, SyntheticNormalDataset, add_cache_args,
+                     collect_rng_state, data_paths, format_eta, iter_speed,
+                     load_checkpoint, load_model, log, make_dataset, resolve,
                      resume_checkpoint, save_checkpoint, set_global_seed)
-from jingwei.data import YOLODefectDataset, collate
+from evaluate import validate_detector
+from jingwei.data import collate
 from jingwei.utils import count_parameters
 
 
@@ -52,6 +60,18 @@ def main():
                     help="also keep epoch_XXXX.pt every N epochs (0 disables snapshots)")
     ap.add_argument("--log-interval", type=int, default=20,
                     help="print a progress line every N batches (0 disables iter logs)")
+    add_cache_args(ap)
+    ap.add_argument("--val-interval", type=int, default=1,
+                    help="run val precision/recall/mAP every N epochs (0 disables)")
+    ap.add_argument("--val-max", type=int, default=0,
+                    help="limit val images for fast periodic validation (0 = all)")
+    ap.add_argument("--normal-max", type=int, default=0,
+                    help="limit normalval images for FPR (0 = all)")
+    ap.add_argument("--val-conf", type=float, default=None,
+                    help="score threshold for val precision/recall "
+                         "(default: fusion.final_score_thresh)")
+    ap.add_argument("--val-iou", type=float, default=0.5,
+                    help="IoU threshold for val TP matching")
     args = ap.parse_args()
 
     set_global_seed(args.seed)
@@ -65,7 +85,6 @@ def main():
     size = int(cfg.input_size[0])
 
     if args.smoke:
-        from _common import SyntheticNormalDataset
         ds = SyntheticNormalDataset(n=args.smoke, size=size)
         # fake YOLO targets so the whole loss graph is exercised
         class Wrapped(torch.utils.data.Dataset):
@@ -78,14 +97,50 @@ def main():
                 return d
         train_ds = Wrapped()
     else:
-        train_dir = resolve(paths["train"])
-        lab = str(train_dir).replace("/images/", "/labels/")
-        train_ds = YOLODefectDataset(train_dir, lab, img_size=size,
-                                     augment=True, seed=args.seed)
+        train_ds = make_dataset("train", resolve(paths["train"]), None,
+                                size, args, has_labels=True, augment=True,
+                                seed=args.seed)
 
     loader = DataLoader(train_ds, batch_size=batch, shuffle=True,
                         num_workers=0 if args.smoke else args.num_workers,
                         collate_fn=collate, drop_last=False, pin_memory=True)
+
+    # ---- validation loaders (precision / recall / mAP / FPR) -----------------
+    def build_val_loaders():
+        if args.smoke:
+            base = SyntheticNormalDataset(n=max(2, min(args.smoke, 4)), size=size,
+                                          seed=args.seed + 1)
+
+            class Wrap(torch.utils.data.Dataset):
+                def __len__(self): return len(base)
+
+                def __getitem__(self, i):
+                    d = base[i]
+                    d["boxes"] = torch.tensor([[100., 100., 400., 300.]])
+                    d["labels"] = torch.tensor([3])
+                    return d
+            vl = DataLoader(Wrap(), batch_size=1, shuffle=False,
+                            collate_fn=collate)
+            nl = DataLoader(SyntheticNormalDataset(n=4, size=size,
+                                                   seed=args.seed + 2),
+                            batch_size=1, shuffle=False, collate_fn=collate)
+            return vl, nl
+        vds = make_dataset("val", resolve(paths["val"]), None, size, args,
+                           has_labels=True, augment=False, seed=args.seed)
+        n_key = "normalval" if "normalval" in paths else "normaltrain"
+        nds = make_dataset(n_key, resolve(paths[n_key]), None, size, args,
+                           has_labels=False, augment=False, seed=args.seed)
+        if args.val_max:
+            vds = Subset(vds, range(min(args.val_max, len(vds))))
+        if args.normal_max:
+            nds = Subset(nds, range(min(args.normal_max, len(nds))))
+        vl = DataLoader(vds, batch_size=1, shuffle=False, collate_fn=collate)
+        nl = DataLoader(nds, batch_size=1, shuffle=False, collate_fn=collate)
+        return vl, nl
+
+    val_loader = norm_loader = None
+    if args.val_interval:
+        val_loader, norm_loader = build_val_loaders()
 
     model.set_stage("detector")
     model.train()
@@ -104,6 +159,7 @@ def main():
     start_epoch = min(info["epoch"], epochs) if info and info["full"] else 0
     it = info["iter"] if info and info["full"] else 0
     meta = info["meta"] if info else {}
+    best_score = float(meta.get("best_score", -1.0)) if info and info["full"] else -1.0
     resume_mode = ("full" if info and info["full"] else
                    "weights-only" if info else "none")
 
@@ -121,7 +177,11 @@ def main():
         f"seed={args.seed}")
     log(f"start_epoch={start_epoch + 1}/{epochs}  global_iter={it}  "
         f"save_interval={args.save_interval}  log_interval={args.log_interval}")
-    log("(use --log-interval 0 to disable iter logs; python -u disables buffering)")
+    log(f"cache={args.cache}  cache_dir={args.cache_dir}  "
+        f"val_interval={args.val_interval}  val_max={args.val_max}  "
+        f"normal_max={args.normal_max}")
+    log("(use --log-interval 0 to disable iter logs; --val-interval 0 disables val; "
+        "python -u disables buffering)")
     log("=" * 72)
 
     if info and info["full"]:
@@ -142,6 +202,7 @@ def main():
         return
 
     global_t0 = time.time()
+    global_it0 = it
     for ep in range(start_epoch, epochs):
         t0 = time.time()
         interval_t0 = t0
@@ -171,13 +232,16 @@ def main():
                                       (bi + 1) % args.log_interval == 0 or
                                       (bi + 1) == n_batches):
                 elapsed = max(time.time() - interval_t0, 1e-6)
-                ips = interval_n / elapsed
+                ips = iter_speed(it - global_it0, time.time() - global_t0,
+                                 interval_n, elapsed)
                 remain = (n_batches - (bi + 1)) + (epochs - ep - 1) * n_batches
                 eta = remain / max(ips, 1e-6)
                 avg = interval_loss / max(interval_n, 1)
+                epoch_avg = running.get("total", 0.0) / max(bi + 1, 1)
                 lr_now = float(opt.param_groups[0]["lr"])
                 log(f"epoch {ep + 1:3d}/{epochs}  iter {bi + 1:5d}/{n_batches}  "
-                    f"loss={avg:.4f}  lr={lr_now:.2e}  {ips:.2f} it/s  "
+                    f"loss={avg:.4f}  epoch_avg={epoch_avg:.4f}  "
+                    f"lr={lr_now:.2e}  {ips:.2f} it/s  "
                     f"elapsed={format_eta(time.time() - t0)}  eta={format_eta(eta)}")
                 interval_t0, interval_loss, interval_n = time.time(), 0.0, 0
 
@@ -185,14 +249,50 @@ def main():
         msg = " | ".join(f"{k}={v / n:.3f}" for k, v in running.items() if k != "total")
         log(f"epoch {ep + 1:3d}/{epochs}  {msg}  total={running.get('total', 0) / n:.3f} "
             f"({time.time() - t0:.1f}s)  elapsed_total={format_eta(time.time() - global_t0)}")
+
+        # ---- validation: precision / recall / F1 / mAP50 / large recall -----
+        val_metrics = None
+        if (args.val_interval and val_loader is not None and
+                ((ep + 1) % args.val_interval == 0 or ep + 1 == epochs)):
+            tv = time.time()
+            model.eval()
+            try:
+                val_metrics = validate_detector(
+                    model, val_loader, norm_loader, args.device, cfg,
+                    conf_thresh=args.val_conf, iou_thr=args.val_iou)
+            finally:
+                model.train()
+                model.set_stage("detector")
+            val_metrics["seconds"] = round(time.time() - tv, 2)
+            log(f"val   epoch {ep + 1:3d}/{epochs}  "
+                f"mAP50={val_metrics['mAP50']:.4f}  "
+                f"precision={val_metrics['precision']:.4f}  "
+                f"recall={val_metrics['recall']:.4f}  "
+                f"f1={val_metrics['f1']:.4f}  "
+                f"large_recall={val_metrics['large_recall']:.4f}  "
+                f"normal_fpr={val_metrics['normal_fpr']:.4f}  "
+                f"unknown_boxes={val_metrics['unknown_boxes']}  "
+                f"({val_metrics['seconds']:.1f}s)")
+            score = 0.5 * val_metrics["mAP50"] + 0.5 * val_metrics["large_recall"]
+            if score > best_score:
+                best_score = score
+                save_checkpoint({"model": model.state_dict(),
+                                 "metrics": val_metrics,
+                                 "train": {"stage": "detector",
+                                           "epoch": ep + 1,
+                                           "best_score": best_score}},
+                                out / "best.pt")
+                log(f"best   -> {out / 'best.pt'}  (score={score:.4f})")
+
         state = {
             "model": model.state_dict(),
             "optimizer": opt.state_dict(),
             "scheduler": sched.state_dict(),
             "rng": collect_rng_state(train_ds),
+            "metrics": val_metrics,
             "train": {
                 "stage": "detector",
-                "format_version": 2,
+                "format_version": 3,
                 "epoch": ep + 1,          # next epoch to run on resume
                 "iter": it,
                 "epochs": epochs,
@@ -202,6 +302,7 @@ def main():
                 "cfg": args.cfg,
                 "data": args.data or cfg.data.dataset_yaml,
                 "seed": args.seed,
+                "best_score": best_score,
                 "args": vars(args),
             },
         }

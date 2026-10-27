@@ -176,6 +176,10 @@ python tools/benchmark.py --cfg configs/jingwei_p.yaml
 # 2) 在 1660S 上实测 PyTorch 图（上界），A/B 测 FP32 / FP16
 python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both
 python tools/bench_device.py --cfg configs/jingwei_p.yaml --compare   # 同时测 p/n/s
+# 预测 CLI 可自动检测 1660/1650/TU116/TU117，强制 pico + FP32 并打印 P99
+python tools/predict.py --cfg configs/jingwei_p.yaml --realtime-1660 \
+    --ckpt runs/detector/best.pt --source D:/产线图片/ --out runs/predict
+# 注意：best.pt 也必须由 jingwei_p.yaml 训练得到；n/s 权重切 pico 会警告且精度不可信
 
 # 3) 导出并构建 TRT engine（先试 FP32，再试 FP16，不要直接上 INT8）
 python tools/export.py --cfg configs/jingwei_p.yaml --ckpt runs/bank/memory_bank.pt \
@@ -238,6 +242,9 @@ python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both
 - [ ] 阶段 0 / A / B 训练日志可见（启动信息 + batch 进度 / ETA）；回归测试 `test_26_training_progress_logs` 通过
 - [ ] 阶段 0 / A / B 可用 `last.pt` 断点续训；回归测试 `test_27_resume_training` 通过
 - [ ] 真实 `NormalImageDataset` / `YOLODefectDataset` 的 numpy RNG state 可写入 `weights_only=True` checkpoint 并恢复；回归测试 `test_28_numpy_rng_state_checkpoint` 通过
+- [ ] 阶段 A 每 epoch 输出 val 精确率 / 召回率 / F1 / mAP50 / 大缺陷召回，并用 `best.pt` 部署；回归测试 `test_30_validation_metrics_and_best_checkpoint` 通过
+- [ ] 训练集已生成 YOLO 式 `train.cache` 并用 `--cache disk` 训练；中文路径回归测试 `test_31_yolo_style_image_cache` 通过
+- [ ] 未知疵点类型也生成预测框，`emit_unknown_boxes / unknown_min_area_ratio / max_unknown_boxes` 按产线 FPR A/B 调好；回归测试 `test_32_unknown_defect_boxes` 通过
 - [ ] ONNX 8 个输出（含 context）形状静态；TRT engine 在目标设备构建成功
 - [ ] INT8 情况下阈值已重新标定
 - [ ] 1000 帧 P50/P99 延迟达标，P99/P50 ≤ 1.3
@@ -266,4 +273,7 @@ def infer(bgr):
     return d['boxes'].cpu(), d['scores'].cpu(), d['labels'].cpu(), k
 ```
 
-`tools/predict.py` 提供等价的 CLI（含画框与 JSON 输出）。
+`tools/predict.py` 提供等价的 CLI（含画框与 JSON 输出）。加 `--realtime-1660`
+会在 1660/1650/TU116/TU117 上自动切 pico + FP32、实测 P99，并在结果 JSON 中
+记录 `realtime_1660 / emit_unknown / unknown_boxes`。未知疵点类型默认生成
+`label=19 / 未知异常` 预测框；`--no-unknown` 可关闭。

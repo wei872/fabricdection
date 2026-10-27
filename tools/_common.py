@@ -2,11 +2,14 @@
 
 Image / video reads go through :mod:`jingwei.image_io`, so Chinese / Unicode
 dataset paths work on Windows as well as Linux.  Training scripts use
-:func:`log` so progress appears immediately even when stdout is buffered, and
-:func:`save_checkpoint` / :func:`resume_checkpoint` for full-state resume.
+:func:`log` so progress appears immediately even when stdout is buffered,
+:func:`iter_speed` for stable ETA, :func:`make_dataset` for YOLO-style
+``train.cache``, and :func:`save_checkpoint` / :func:`resume_checkpoint` for
+full-state resume.
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import random
@@ -25,7 +28,10 @@ import yaml
 from torch.utils.data import DataLoader, Dataset
 
 from jingwei import build_model, load_config
-from jingwei.data import NormalImageDataset, YOLODefectDataset, collate, list_images
+from jingwei.cache import (build_dataset_cache, cache_prefix,
+                           load_cached_dataset)
+from jingwei.data import (NormalImageDataset, YOLODefectDataset, collate,
+                          infer_labels_dir, list_images)
 from jingwei.fabric import fabric_descriptor, fit_fabric_prototypes
 from jingwei.image_io import console_safe, imread_unicode
 from jingwei.utils import torch_load
@@ -53,6 +59,70 @@ def format_eta(seconds: float) -> str:
     if m:
         return f"{m}m{s:02d}s"
     return f"{s}s"
+
+
+def iter_speed(done: int, elapsed: float, interval_n: int,
+               interval_elapsed: float) -> float:
+    """Stable it/s for ETA: mostly epoch-average, slightly instantaneous.
+
+    A single slow batch (checkpoint, GC, OS page fault) used to make the ETA
+    jump from 1h to 700h.  Blending the running average with the short interval
+    keeps the estimate useful without hiding real slowdowns.
+    """
+    avg = float(done) / max(float(elapsed), 1e-6)
+    inst = float(interval_n) / max(float(interval_elapsed), 1e-6)
+    return 0.85 * avg + 0.15 * inst
+
+
+def add_cache_args(ap) -> None:
+    """Add the shared ``--cache*`` options to a training / eval CLI."""
+    ap.add_argument("--cache", choices=["none", "ram", "disk", "bytes"],
+                    default="none",
+                    help="YOLO-style image cache: none / ram / disk / bytes "
+                         "(disk = mmap decoded RGB; bytes = mmap JPEG bytes)")
+    ap.add_argument("--cache-dir", default="runs/cache",
+                    help="directory holding generated *.json + *.npy/*.bin caches")
+    ap.add_argument("--rebuild-cache", action="store_true",
+                    help="force cache regeneration even if signature matches")
+
+
+def make_dataset(split, images_dir, labels_dir, img_size, args, *,
+                 has_labels: bool, augment: bool, seed: int,
+                 with_descriptor: bool = False, log_fn=log):
+    """Return original or cached dataset depending on ``args.cache``.
+
+    ``split`` is only used to name the cache file.  ``labels_dir`` may be None
+    for normal-only splits; for YOLO splits it is inferred when omitted.
+    """
+    images_dir = Path(images_dir)
+    if has_labels:
+        labels_dir = str(labels_dir) if labels_dir else infer_labels_dir(images_dir)
+    if getattr(args, "cache", "none") == "none":
+        if has_labels:
+            return YOLODefectDataset(images_dir, labels_dir, img_size=img_size,
+                                     augment=augment, seed=seed)
+        return NormalImageDataset(images_dir, img_size=img_size,
+                                  augment=augment, seed=seed,
+                                  with_descriptor=with_descriptor)
+
+    mode = args.cache
+    cache_dir = Path(getattr(args, "cache_dir", "runs/cache"))
+    if not cache_dir.is_absolute():
+        cache_dir = ROOT / cache_dir
+    tag = hashlib.sha1(str(images_dir).encode("utf-8", "replace")).hexdigest()[:8]
+    prefix = cache_prefix(cache_dir, tag, split, img_size, mode)
+    build_dataset_cache(images_dir, labels_dir if has_labels else None,
+                        img_size, prefix, mode, has_labels,
+                        rebuild=bool(getattr(args, "rebuild_cache", False)),
+                        log_fn=log_fn)
+    return load_cached_dataset(prefix, mode, augment, seed,
+                               with_descriptor=with_descriptor)
+
+
+def cache_dir_for(cfg, args) -> Path:
+    """Resolve --cache-dir against the repo root (Unicode-safe)."""
+    p = Path(getattr(args, "cache_dir", "runs/cache"))
+    return p if p.is_absolute() else ROOT / p
 
 
 def data_paths(cfg, override: str | None = None) -> dict:

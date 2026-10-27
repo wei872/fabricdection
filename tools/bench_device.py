@@ -13,6 +13,9 @@ SLOWER than FP32 — see docs/DEPLOYMENT.md §4.1.
 NOTE: this measures the PyTorch graph, which is an UPPER bound. A TensorRT
 engine is typically 1.5–3x faster. After measuring here, build the engine with
 tools/export.py + trtexec and re-measure with `trtexec --duration=60`.
+
+``tools/predict.py --realtime-1660`` reuses ``gpu_info()`` / ``measure()`` to
+auto-select the pico FP32 path on GTX 16-series and print P99 before inference.
 """
 from __future__ import annotations
 

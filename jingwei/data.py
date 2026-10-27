@@ -34,6 +34,20 @@ def list_images(root: str | Path):
     return sorted(str(f) for f in files)
 
 
+def infer_labels_dir(images_dir) -> str:
+    """YOLO convention: .../images/... -> .../labels/... (Windows-safe).
+
+    Also handles paths that END in ``/images`` with no trailing slash, which is
+    what ``dataset.yaml`` usually contains.
+    """
+    p = str(images_dir).replace("\\", "/")
+    if "/images/" in p:
+        return p.replace("/images/", "/labels/")
+    if p.endswith("/images"):
+        return p[:-len("images")] + "labels"
+    return p
+
+
 def read_image(path: str | Path) -> np.ndarray:
     img = imread_unicode(path, cv2.IMREAD_COLOR)
     if img is None:
@@ -157,8 +171,7 @@ class YOLODefectDataset(Dataset):
         self.img_size, self.augment = img_size, augment
         self.files = list_images(images_dir)
         if labels_dir is None:
-            p = str(images_dir).replace("\\", "/")
-            labels_dir = p.replace("/images/", "/labels/")
+            labels_dir = infer_labels_dir(images_dir)
         self.labels_dir = str(labels_dir)
         self.rng = np.random.default_rng(seed)
         if not self.files:

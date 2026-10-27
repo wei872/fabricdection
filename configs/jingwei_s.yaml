@@ -67,6 +67,10 @@ fusion:
   box_margin: 1.15
   min_box_px: 24
   unknown_score_scale: 0.9
+  emit_unknown_boxes: true        # 未知疵点类型也生成预测框（不止大缺陷兜底）
+  unknown_min_area_ratio: 0.0002  # 比 large_area_ratio 更小，约 5 个 anomaly cell @160²
+  unknown_peak_thresh: 0.55       # 小未知区域需要更高异常峰值，抑制噪声
+  max_unknown_boxes: 20           # 每帧最多额外未知框（大缺陷框不受此限制）
   final_score_thresh: 0.15
   roi_head: true
   roi_hidden: 256

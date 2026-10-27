@@ -160,6 +160,12 @@ if fold_like and peak < fold_peak_override:
 `use_aspect_cue` 默认 **false**——长宽比只是可选辅助，主判据是学习到的
 `fold_band + defect_fg`。`fold_aspect_ratio` 保留为兼容/调试项，不再是核心。
 
+`fusion.emit_unknown_boxes: true` 还会让**较小的未知异常连通域**也输出
+`label=19 / 未知异常` 框；大缺陷连通域永远保留，不受
+`max_unknown_boxes` 限制。未知框仍要经过上述 `fabric_mask / fold_band /
+defect_fg` 检查，因此不会把背景或正常折入当成缺陷。详见
+[CACHE_AND_VALIDATION.md](CACHE_AND_VALIDATION.md)。
+
 ---
 
 ## 6. 配置（三个变体统一）
@@ -247,7 +253,8 @@ onnx.checker 与 pico/N 导出均通过。
 - `test_29`：验证 `LocalGlobalForegroundAttention` 的局部+全局双分支、
   动态 FiLM、context 形状、损失与梯度；
 - `test_23`：端到端大缺陷 / 正常折入 / 边缘真缺陷 / 大兜底回归；
-- 全套 **29 项单元测试通过**，compileall / ONNX checker / pico+N 导出通过。
+- `test_32`：未知疵点类型（含小面积异常连通域）也生成 `未知异常` 框，大缺陷兜底不被 `max_unknown_boxes` 丢弃；
+- 全套 **32 项单元测试通过**（含验证指标 / 图像缓存 / 未知缺陷框回归），compileall / ONNX checker / pico+N 导出通过。
 
 ---
 

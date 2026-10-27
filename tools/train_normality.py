@@ -1,8 +1,8 @@
 """Stage B — normality branch training on NORMAL images ONLY (no labels).
 
-    python tools/train_normality.py --cfg configs/jingwei_n.yaml --ckpt runs/detector/last.pt
+    python tools/train_normality.py --cfg configs/jingwei_n.yaml --ckpt runs/detector/best.pt --cache disk
     # full resume after an interrupted run
-    python tools/train_normality.py --cfg configs/jingwei_n.yaml --resume runs/normality/last.pt
+    python tools/train_normality.py --cfg configs/jingwei_n.yaml --resume runs/normality/last.pt --cache disk
     python tools/train_normality.py --cfg configs/jingwei_n.yaml --smoke 32 --iters 20
 
 The backbone / neck / detection head are FROZEN (Dinomaly's "frozen foundation
@@ -22,11 +22,11 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from _common import (ROOT, SyntheticNormalDataset, collect_rng_state,
-                     data_paths, format_eta, load_checkpoint, load_model, log,
-                     resolve, resume_checkpoint, save_checkpoint,
-                     set_global_seed)
-from jingwei.data import NormalImageDataset, collate
+from _common import (ROOT, SyntheticNormalDataset, add_cache_args,
+                     collect_rng_state, data_paths, format_eta, iter_speed,
+                     load_checkpoint, load_model, log, make_dataset, resolve,
+                     resume_checkpoint, save_checkpoint, set_global_seed)
+from jingwei.data import collate
 from jingwei.losses import HardMiningCosineLoss
 from jingwei.utils import count_parameters
 
@@ -49,6 +49,7 @@ def main():
                     help="write last.pt / iter snapshots every N iterations (0 only final)")
     ap.add_argument("--log-interval", type=int, default=200,
                     help="print a progress line every N iterations (0 disables iter logs)")
+    add_cache_args(ap)
     args = ap.parse_args()
 
     set_global_seed(args.seed)
@@ -63,9 +64,9 @@ def main():
     size = int(cfg.input_size[0])
 
     ds = (SyntheticNormalDataset(n=args.smoke, size=size) if args.smoke else
-          NormalImageDataset(resolve(paths["normaltrain"]), img_size=size,
-                             augment=True, with_descriptor=False,
-                             seed=args.seed))
+          make_dataset("normaltrain", resolve(paths["normaltrain"]), None,
+                       size, args, has_labels=False, augment=True,
+                       seed=args.seed, with_descriptor=False))
     loader = DataLoader(ds, batch_size=batch, shuffle=True, num_workers=0,
                         collate_fn=collate, drop_last=True)
 
@@ -110,6 +111,7 @@ def main():
         f"batch={batch}  lr={lr:g}  seed={args.seed}")
     log(f"start_iter={start_it}/{iters}  save_interval={args.save_interval}  "
         f"log_interval={args.log_interval}")
+    log(f"cache={args.cache}  cache_dir={args.cache_dir}")
     log("(use --log-interval 0 to disable iter logs; python -u disables buffering)")
     log("=" * 72)
 
@@ -152,6 +154,8 @@ def main():
         }
 
     global_t0 = time.time()
+    global_it0 = start_it
+    running_loss, running_n = 0.0, 0
     interval_t0, interval_loss, interval_n = global_t0, 0.0, 0
     while it < iters:
         for data in loader:
@@ -168,17 +172,22 @@ def main():
             loss_val = float(loss.detach())
             interval_loss += loss_val
             interval_n += 1
+            running_loss += loss_val
+            running_n += 1
             it += 1
 
             if args.log_interval and (it == 1 or
                                       it % args.log_interval == 0 or
                                       it == iters):
                 elapsed = max(time.time() - interval_t0, 1e-6)
-                ips = interval_n / elapsed
+                ips = iter_speed(it - global_it0, time.time() - global_t0,
+                                 interval_n, elapsed)
                 eta = (iters - it) / max(ips, 1e-6)
                 avg = interval_loss / max(interval_n, 1)
+                run_avg = running_loss / max(running_n, 1)
                 lr_now = float(opt.param_groups[0]["lr"])
-                log(f"iter {it:6d}/{iters}  rec_loss={avg:.5f}  lr={lr_now:.2e}  "
+                log(f"iter {it:6d}/{iters}  rec_loss={avg:.5f}  "
+                    f"run_avg={run_avg:.5f}  lr={lr_now:.2e}  "
                     f"{ips:.2f} it/s  elapsed={format_eta(time.time() - global_t0)}  "
                     f"eta={format_eta(eta)}")
                 interval_t0, interval_loss, interval_n = time.time(), 0.0, 0

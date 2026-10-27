@@ -15,7 +15,7 @@ pip install onnx tensorrt ultralytics
 
 最低验证环境（本仓库实测）：Python 3.11 + torch 2.2.2 (CPU 即可) +
 numpy 1.26 + opencv-python-headless + PyYAML + scipy + tqdm。
-跑 `python -m unittest discover -s tests -v` 应输出 `OK`（29 项）。
+跑 `python -m unittest discover -s tests -v` 应输出 `OK`（32 项）。
 阶段 0 的 `--smoke` 模式用 synthetic teacher，不需要下载 DINOv2 权重。
 
 ## 2. 数据准备
@@ -103,23 +103,32 @@ PY
 # 阶段 0：DINOv2 离线蒸馏（只用 normaltrain，无标签）
 python tools/pretrain_dino.py \
     --cfg configs/jingwei_n.yaml --data configs/fabric19.yaml \
-    --teacher dinov2_vits14 --iters 5000 --log-interval 100 --out runs/dino
+    --teacher dinov2_vits14 --iters 5000 --log-interval 100 \
+    --cache disk --out runs/dino
 # 无数据 / 无网络自检：python tools/pretrain_dino.py --smoke 4 --iters 2
 
+# 目标卡若是 GTX 1660 SUPER / 1650 / 无 Tensor Core 老卡，
+# 下面所有 --cfg 都改为 configs/jingwei_p.yaml（训练和预测保持一致）。
+# 先生成 YOLO 式 train.cache（只需一次；中文路径可用）
+python tools/cache_dataset.py --cfg configs/jingwei_n.yaml --mode disk
+
 # 阶段 A：有监督检测（train + labels），从阶段 0 权重热启动
+# --cache disk 加速图片读取；--val-interval 1 每 epoch 输出精确率/召回率/mAP
 python tools/train_detector.py \
     --cfg configs/jingwei_n.yaml --data configs/fabric19.yaml \
-    --resume runs/dino/dino_init.pt \
-    --epochs 150 --batch 8 --log-interval 20 --out runs/detector
+    --resume runs/dino/dino_init.pt --cache disk \
+    --epochs 150 --batch 8 --log-interval 20 --val-interval 1 \
+    --val-max 300 --normal-max 300 --out runs/detector
 
 # 阶段 A 同时训练局部+全局注意力的 defect_fg / fabric_mask / fold_band
 # （YOLO 框级弱监督 + 逐帧动态布幅伪目标）；data.py 也会以 25% 概率合成
 # 布幅边缘正常折入增广，让 normaltrain / detector 都把它见成背景。
-# 详见 docs/FOREGROUND.md。
+# 详见 docs/FOREGROUND.md 与 docs/CACHE_AND_VALIDATION.md。
 # 阶段 B：无监督正常性（normaltrain，主干冻结）
 python tools/train_normality.py \
     --cfg configs/jingwei_n.yaml --data configs/fabric19.yaml \
-    --ckpt runs/detector/last.pt --iters 10000 --log-interval 100 --out runs/normality
+    --ckpt runs/detector/best.pt --iters 10000 --log-interval 100 \
+    --cache disk --out runs/normality
 
 # 阶段 C：构建布种条件记忆库 + 阈值标定（normaltrain + normalval）
 python tools/build_memory_bank.py \
@@ -235,7 +244,7 @@ python tools/train_normality.py --cfg configs/jingwei_n.yaml \
 ## 4. 快速自检（无真实数据）
 
 ```bash
-python -m unittest discover -s tests -v                 # 29 项，约 67 s（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态注意力前景）
+python -m unittest discover -s tests -v                 # 32 项，约 140 s（含验证指标 / 图像缓存 / 未知缺陷框）
 python tools/benchmark.py --all                         # p/n/s 参数量 / MACs / 延迟估算
 python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both  # 在你的 GPU 上实测
 python tools/train_detector.py   --smoke 2 --epochs 1 --batch 1 --device cpu --log-interval 1
@@ -258,6 +267,11 @@ python tools/export.py --check --out runs/export/jingwei_n.onnx
 | `ValueError: operands could not be broadcast together with shapes (H,W,3) (H,W)` | 旧版 `fabric_photometric` 反光场经 OpenCV 后变成 2D，未补通道维 | 已修复：`field[:, :, None]` 后再与 RGB 相乘；`test_25` 覆盖 1040×2448 类长条图，见 [DESIGN.md §12.6](DESIGN.md) |
 | `FutureWarning: You are using torch.load with weights_only=False` | PyTorch 2.6+ 提示未来默认值改为 `True` | 已统一走 `jingwei.utils.torch_load`（默认 `weights_only=True`）；含自定义对象的第三方权重会自动回退并给出 `RuntimeWarning`，仅加载可信文件 |
 | 训练时长时间没有任何日志 | 旧版只在 epoch 结束打印；Windows 控制台 / 重定向 stdout 还会缓冲 | 已加入启动日志 + `--log-interval` batch 日志 + `flush=True`；用 `--log-interval 20`（默认）观察进度，`--log-interval 0` 关闭 iter 日志；仍不显示时用 `python -u tools/train_detector.py ...` 或设置 `PYTHONUNBUFFERED=1`，见 [DESIGN.md §12.7](DESIGN.md) |
+| 日志只有 loss，没有验证集精确率 / 召回率 | 旧版 `train_detector.py` 不带 val；或运行的是旧提交 | 拉取最新代码后默认 `--val-interval 1` 每 epoch 打印 `mAP50 / precision / recall / f1 / large_recall / normal_fpr` 并保存 `best.pt`；`--val-interval 0` 可关闭，`--val-max` 可抽样加速 |
+| iter 日志 `loss=0.0000` 但 epoch 汇总非零 | `loss=` 是短日志区间平均，末尾若连续几张无标注图就会是 0 | 看同一行新增的 `epoch_avg=`（整轮平均）与 epoch 汇总；ETA 也改为长平均+短区间的混合速度，避免单个慢 batch 让 ETA 跳到几百小时 |
+| 图片读取太慢 / 每个 epoch 都要重新解码 | 每 epoch 重复 `imread` + JPEG 解码 + 中文路径文件打开 | 先跑 `tools/cache_dataset.py --mode disk` 生成 YOLO 式 `train.cache`，训练加 `--cache disk`；内存多用 `ram`，磁盘紧张用 `bytes`，详见 [CACHE_AND_VALIDATION.md](CACHE_AND_VALIDATION.md) |
+| 未知疵点类型没有预测框 | 旧安全网只兜底 `large_area_ratio` 以上的大异常 | 配置 `fusion.emit_unknown_boxes: true`（默认已开）、按需调小 `unknown_min_area_ratio`；`predict.py --no-unknown` 可临时关闭 |
+| 1660 SUPER 上预测不够实时 | 用了 `n/s` 配置或假设 FP16 一定更快 | 训练和预测都用 `configs/jingwei_p.yaml`，预测加 `--realtime-1660`；用 `bench_device.py --precision both` 实测，详见 [CACHE_AND_VALIDATION.md](CACHE_AND_VALIDATION.md) |
 | 训练中断后要从头开始 | 旧版 `last.pt` 只有模型权重 | 现在 `last.pt` 含优化器 / scheduler / RNG / epoch/iter；用 `--resume .../last.pt` 继续，日志出现 `mode=full` 才表示完整恢复；见 [DESIGN.md §12.8](DESIGN.md) |
 | `--resume dino_init.pt` 显示 `weights-only` | `dino_init.pt` 是阶段 0 交给阶段 A 的权重文件，不含训练状态 | 这是正常的 weight-only 热启动；若要继续阶段 0 训练，应 `--resume runs/dino/last.pt` |
 | `AttributeError: 'dict' object has no attribute 'tolist'`（在 `_generator_state` / `collect_rng_state` 保存 checkpoint 时） | `np.random.Generator.bit_generator.state` 的 `state` 字段在不同 numpy / BitGenerator 下可能是 dict 或 ndarray；旧代码假设 ndarray 并调用 `.tolist()` | 已修复为递归 `_to_plain` / `_from_plain` 转换，纯 Python 容器保存且 `weights_only=True` 友好；`test_28` 覆盖 PCG64/PCG64DXSM/Philox/SFC64/MT19937 与真实 `NormalImageDataset`。若崩溃发生在写 `last.pt` 之前，则没有生成新 checkpoint，拉最新代码后重新运行即可；建议加 `--save-interval 100` 缩短中断损失。见 [DESIGN.md §12.8](DESIGN.md) |

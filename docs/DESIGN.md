@@ -25,7 +25,7 @@
 
 **已验证**（见 §13）：参考实现在 1280×1280 下 n 变体 **6.36 M 参数 / 16.62 G MACs**，
 无 Tensor Core 卡专用的 pico 变体 **2.93 M / 8.09 G MACs**，
-29 项单元测试全过（含中文 / Unicode 路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态局部+全局注意力前景回归），ONNX 导出成功且输出全为静态形状。
+32 项单元测试全过（含中文 / Unicode 路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态局部+全局注意力前景 / 每 epoch 验证指标 / YOLO 式图像缓存 / 未知缺陷框回归），ONNX 导出成功且输出全为静态形状。
 
 > ⚠️ **诚实声明**：仓库里目前只有 `dataset/dataset.yaml`（路径指向你本机的
 > `D:/tyhn/yolo/...`），**没有真实图片**。因此本文所有的精度数字都是**设计目标 / 验收指标**，
@@ -395,6 +395,8 @@ for cc in connectedComponents8(mask):
     if peak(A[cc]) < anomaly_thresh: continue
     if valid_frac(cc) < min_fabric_frac: continue     # 背景
     if fold_like(cc) and peak < fold_peak_override: continue  # 正常折入
+    # 小未知疵点由 fusion.emit_unknown_boxes / unknown_min_area_ratio 控制，
+    # 大异常连通域永远保留，不受 max_unknown_boxes 限制。
     box = bbox(cc) * 8 * margin                  # 映射回 1280 像素坐标
     if max IoU(box, 已有检测框) > 0.1:
         boost(那些框的分数)                       # 已检出 → 不重复出框
@@ -445,6 +447,9 @@ A_eff = A * fabric_mask * (1 - fold_attenuation * fold_band * (1 - defect_fg))
 `data.py` 还以 25% 概率合成边缘折入增广（只改亮度、不移动框），让
 normaltrain / 记忆库与 detector 都把折入见成正常背景。注意力头在
 stride-32 token 上计算，1280² 下只增加约 0.12~0.26 G MACs。
+`fusion.emit_unknown_boxes` 默认开启，使未知疵点类型也生成 `未知异常` 框；
+缓存、验证指标与 1660S 实时命令见
+[CACHE_AND_VALIDATION.md](CACHE_AND_VALIDATION.md)。
 
 ### 5.9 "大缺陷一定不漏"的形式化说明
 
@@ -469,6 +474,8 @@ Recall_large ≥ R_A + (1 - R_A) · R_det
   `fabric_mask / fold_band / defect_fg` 只跳过「背景 + 低前景动态折入状」
   连通域；真实大缺陷要么 `defect_fg` 高、要么峰值超过 `fold_peak_override`、
   要么不在预测折入带，仍进入上述确定性兜底。固定图像边缘像素不再参与判定。
+  `emit_unknown_boxes` 还会把较小的未知异常连通域也标成 `未知异常` 框，
+  大缺陷兜底不受 `max_unknown_boxes` 限制。
 
 > 严格地说，"100% 不漏"是工程保证而非数学定理：本设计把问题从
 > "检测器必须召回" 转化为 "异常图必须召回"，后者由双无监督信号 +
@@ -741,20 +748,23 @@ jingwei/
   losses.py      检测损失 + 匈牙利 + 宽松重建损失   → §7
   fabric.py      布种描述符 / 原型聚类 / 记忆库压缩 → §9
   data.py        YOLO 数据集 / 纯正常图集 / 布种 / 折入增广 → §6
+  cache.py       YOLO 式 train.cache（disk/ram/bytes）→ CACHE_AND_VALIDATION.md
   foreground.py 局部+全局注意力 / 动态布幅掩膜 / 折入带 / 缺陷前景头 → §5.8
   image_io.py   中文/Unicode 安全的图像与视频 I/O → §12.5
   utils.py      框工具 / MACs profiler / 安全 torch_load（weights_only=True）
   dino.py       阶段 0 DINOv2 离线 teacher 工具
   model.py       JingWei 顶层（训练 / 推理 / 导出）
-tools/           阶段 0 + A–E 的 CLI（pretrain_dino / train / build / calibrate /
-                 evaluate / predict / export / benchmark / bench_device）
+tools/           阶段 0 + A–E 的 CLI（pretrain_dino / train / cache_dataset /
+                 build / calibrate / evaluate / predict / export / benchmark /
+                 bench_device）
 tools/_common.py 共享数据/模型加载 + log()/format_eta() 进度日志 +
                  save_checkpoint()/resume_checkpoint()/RNG 断点续训工具
-tests/test_model.py  29 项单元测试（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态注意力前景）
+tests/test_model.py  32 项单元测试（含验证指标 / 图像缓存 / 未知缺陷框）
 docs/DESIGN.md   本文
 docs/TRAINING.md 训练与数据准备手册
 docs/DEPLOYMENT.md 实时部署手册
 docs/FOREGROUND.md 局部+全局注意力前景/背景与动态折入抑制
+docs/CACHE_AND_VALIDATION.md 训练缓存 / 验证指标 / 未知框 / 1660S 实时
 docs/DINO_PRETRAIN.md 阶段 0 DINOv2 蒸馏
 ```
 
@@ -766,8 +776,11 @@ docs/DINO_PRETRAIN.md 阶段 0 DINOv2 蒸馏
   （GTX 1660 SUPER / 1660 Ti / 1650）在 1280² 下实时而裁剪：
   通道 ×0.75、重建块 4→2、网格 80→64、记忆库中心 256→128、关闭 ROI 二级分类。
   **LocalContrastNorm、布种原型、双无监督信号、局部+全局注意力动态前景/折入上下文、确定性安全网全部保留**，
-  即"大缺陷不漏"与"边缘折入不误报"的机制都没有被削弱。详见
-  [DEPLOYMENT.md §4.1](DEPLOYMENT.md) 与 [FOREGROUND.md](FOREGROUND.md)。
+  即"大缺陷不漏"与"边缘折入不误报"的机制都没有被削弱。预测时
+  `python tools/predict.py --cfg configs/jingwei_p.yaml --realtime-1660` 会自动
+  检测 1660/1650/TU116/TU117 并强制 pico + FP32 + 实测 P99。详见
+  [DEPLOYMENT.md §4.1](DEPLOYMENT.md)、[FOREGROUND.md](FOREGROUND.md) 与
+  [CACHE_AND_VALIDATION.md](CACHE_AND_VALIDATION.md)。
 - 若需要更高精度，可把 `attn_heads` / `recon_dim` / `n_centroids` 调大，
   或把 `top_k` 从 300 提到 500（对延迟影响很小）。
 
@@ -837,15 +850,20 @@ Windows 控制台 / 重定向日志还会缓冲 `print`，于是用户会以为�
 `train_normality.py`：
 
 1. **启动日志**：配置、数据 yaml、device/GPU、resume/ckpt、输出目录、模型参数量、
-   可训练参数量、图片数、batch、lr、workers、log_interval；
-2. **batch / iteration 日志**：当前 epoch/iter、区间平均 loss、当前 lr、it/s、
-   已耗时、剩余 ETA；
-3. **每 epoch 汇总 + checkpoint 保存路径**；
+   可训练参数量、图片数、batch、lr、workers、log_interval、cache / val 配置；
+2. **batch / iteration 日志**：当前 epoch/iter、短区间平均 loss、整轮 `epoch_avg`
+   （或 `run_avg`）、当前 lr、it/s、已耗时、剩余 ETA。ETA 用
+   `iter_speed()` 混合长平均与短区间速度，避免单个慢 batch 把剩余时间从 1h
+   跳到几百小时；
+3. **每 epoch 汇总 + validation 行 + checkpoint 保存路径**：阶段 A 默认打印
+   `mAP50 / precision / recall / f1 / large_recall / normal_fpr / unknown_boxes`
+   并保存 `best.pt`；
 4. `--log-interval N` 可调，默认 detector 20 batches、阶段 0 / B 100 iters；
-   `--log-interval 0` 只保留启动/epoch/保存日志；
+   `--log-interval 0` 只保留启动/epoch/保存日志；`--val-interval 0` 关闭验证；
 5. 所有日志立即 flush；若 IDE / 管道仍缓冲，可加 `python -u` 或
    `PYTHONUNBUFFERED=1`。`test_26_training_progress_logs` 覆盖三个脚本的
-   启动日志、iteration 日志与 ETA。
+   启动日志、iteration 日志与 ETA，`test_30_validation_metrics_and_best_checkpoint`
+   覆盖验证指标与 `best.pt`。
 
 ### 12.8 断点续训（checkpoint 设计）
 
@@ -917,7 +935,7 @@ python tools/train_normality.py --cfg configs/jingwei_p.yaml \
 执行 `python -m unittest discover -s tests -v`（CPU 即可，无需数据/GPU）：
 
 ```
-Ran 29 tests in ~67 s — OK
+Ran 32 tests in ~140 s — OK
 
   params = 6.36 M        MACs @1280 = 16.62 G   (jingwei_n)
   pico   = 2.93 M        MACs @1280 =  8.09 G   (jingwei_p)
@@ -927,6 +945,9 @@ Ran 29 tests in ~67 s — OK
   stage 0 / A / B full checkpoint resume + weight-only warm start = OK
   numpy BitGenerator RNG state (PCG64/Philox/SFC64/MT19937) = OK
   local+global attention dynamic fold_band (no fixed edge pixels) = OK
+  per-epoch val precision/recall/F1/mAP50/large recall = OK
+  YOLO-style train.cache (disk/ram/bytes, Unicode paths) = OK
+  unknown defect type boxes (label 19) = OK
 ```
 
 覆盖内容：
@@ -962,6 +983,9 @@ Ran 29 tests in ~67 s — OK
 | 27 | 阶段 0 / A / B 完整 checkpoint 断点续训（optimizer / scheduler / RNG / epoch / iter）与 weight-only 热启动 |
 | 28 | numpy `BitGenerator.state` 的 dict / ndarray 形态在 `weights_only=True` checkpoint 中递归保存与恢复（Windows / numpy 2.x `.tolist()` 崩溃回归） |
 | 29 | **局部+全局注意力前景头**：`LinearAttention2` 全局 token、动态 FiLM、三个上下文头、损失与梯度；布幅位置变化时 context 由特征决定而非固定图像边缘 |
+| 30 | 阶段 A 每 epoch 输出 val 精确率 / 召回率 / F1 / mAP50 / 大缺陷召回 / FPR，并保存 `best.pt` |
+| 31 | YOLO 式 `train.cache`：`disk/ram/bytes` 三种缓存与中文路径 CLI 预生成，缓存数据与原数据集一致 |
+| 32 | 未知疵点类型（含小于 `large_area_ratio` 的异常连通域）也生成 `未知异常` 预测框，大缺陷兜底不被 `max_unknown_boxes` 丢弃 |
 
 **布种描述符实测**（合成织纹，周期 5/9/13/19 px、亮度 100/170、反光 0/0.9）：
 
@@ -977,7 +1001,9 @@ Ran 29 tests in ~67 s — OK
 `--log-interval` batch 进度与 ETA（见 §12.7 / 测试 26），完整 checkpoint
 断点续训与 weight-only 热启动（见 §12.8 / 测试 27），以及用真实
 `NormalImageDataset` / `YOLODefectDataset` 写 / 恢复 numpy RNG state
-（见 §12.8 / 测试 28）。
+（见 §12.8 / 测试 28）。`train_detector` 另验证每 epoch val 指标 /
+`best.pt`（测试 30），`cache_dataset` / `jingwei/cache.py` 验证三种
+`train.cache` 模式与中文路径（测试 31），`fusion` 验证未知缺陷框（测试 32）。
 
 **ONNX 导出**：`tools/export.py` 成功导出 1280² 静态图，
 `onnx.checker` 通过；`roi_head=false`（pico）为 8 个输出（+context），

@@ -4,7 +4,9 @@ This module is the reason the design can *guarantee* that a large defect is
 never silently dropped: the rule
 
     every connected anomalous region above an area threshold that is not
-    covered by a detection box is emitted as a box (label = 未知异常)
+    covered by a detection box is emitted as a box (label = 未知异常).
+    With ``fusion.emit_unknown_boxes`` this also covers SMALLER unknown defect
+    types, not just huge anomalies; large components are never dropped.
 
 is deterministic, not learned. Recall for large defects is therefore bounded
 below by the anomaly map's recall, not by the detector's top-k or confidence.
@@ -128,6 +130,14 @@ def safety_net_numpy(anomaly: np.ndarray, boxes: np.ndarray, scores: np.ndarray,
     use_aspect_cue = bool(fcfg.get("use_aspect_cue", False))
     fold_peak_override = float(fcfg.get("fold_peak_override",
                                         fcfg.get("edge_peak_override", 0.80)))
+    # Unknown defect types: emit a box for ANY anomalous component that is not
+    # already covered by a supervised detection, not just for huge ones.
+    emit_unknown = bool(f.get("emit_unknown_boxes", True))
+    unknown_ratio = float(f.get("unknown_min_area_ratio",
+                                f.get("large_area_ratio", 0.001)))
+    unknown_peak_thresh = float(f.get("unknown_peak_thresh",
+                                      f.get("anomaly_thresh", 0.5)))
+    max_unknown = int(f.get("max_unknown_boxes", 20))
     mask = (anomaly >= float(f.anomaly_thresh)).astype(np.uint8)
 
     # dilate slightly to connect fragmented elongated defects (断纬 / 稀缝)
@@ -135,21 +145,32 @@ def safety_net_numpy(anomaly: np.ndarray, boxes: np.ndarray, scores: np.ndarray,
     mask = cv2.dilate(mask, kernel, iterations=1)
 
     n_cc, lab, stats, cents = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    min_area_cells = max(1, int(float(f.large_area_ratio) * G * G))
+    large_min = max(1, int(float(f.large_area_ratio) * G * G))
+    unknown_min = max(1, int(float(unknown_ratio) * G * G))
+    min_area_cells = min(large_min, unknown_min) if emit_unknown else large_min
     margin = float(f.box_margin)
 
-    extra_boxes, extra_scores, extra_labels = [], [], []
+    # Large components are NEVER dropped (recall guarantee).  Smaller unknown
+    # candidates are kept up to ``max_unknown_boxes`` by peak anomaly score.
+    large_extra, unknown_extra = [], []
     boost = np.zeros(len(scores), np.float32)
 
     for i in range(1, n_cc):
         x, y, w, h, area = stats[i]
         if area < min_area_cells:
             continue
+        is_large = area >= large_min
+        is_unknown = (emit_unknown and (not is_large) and
+                      area >= unknown_min)
+        if not (is_large or is_unknown):
+            continue
         region_mask = lab == i
         region = anomaly[region_mask]
         peak = float(region.max())
         if peak < float(f.anomaly_thresh):
             continue
+        if is_unknown and peak < unknown_peak_thresh:
+            continue                              # weak noise, not a defect
 
         # ---- foreground context: reject background / normal edge fold-in ----
         valid_frac = float((fabric_mask[region_mask] >= fabric_thresh).mean())
@@ -185,6 +206,7 @@ def safety_net_numpy(anomaly: np.ndarray, boxes: np.ndarray, scores: np.ndarray,
             iou = np.zeros(0, np.float32)
             hit = np.zeros(0, bool)
 
+        score = min(0.999, float(f.unknown_score_scale) * peak)
         if hit.any():
             # supervised head already found it -> reinforce its confidence.
             # A fold-like low-foreground component gets only a weak boost.
@@ -193,9 +215,17 @@ def safety_net_numpy(anomaly: np.ndarray, boxes: np.ndarray, scores: np.ndarray,
                                     float(f.score_boost) * peak * boost_gain)
         else:
             # *** the guarantee: emit a box anyway, labelled 未知异常 ***
-            extra_boxes.append(cb)
-            extra_scores.append(min(0.999, float(f.unknown_score_scale) * peak))
-            extra_labels.append(unknown_label)
+            (large_extra if is_large else unknown_extra).append(
+                (float(peak), cb, score, unknown_label))
+
+    if max_unknown > 0 and len(unknown_extra) > max_unknown:
+        unknown_extra.sort(key=lambda t: -t[0])
+        unknown_extra = unknown_extra[:max_unknown]
+    all_extra = large_extra + unknown_extra
+    extra_boxes = [t[1] for t in all_extra]
+    extra_scores = [t[2] for t in all_extra]
+    extra_labels = [t[3] for t in all_extra]
+    n_unknown_boxes = len(unknown_extra)
 
     if extra_boxes:
         boxes = np.concatenate([boxes, np.stack(extra_boxes, 0)], 0)
@@ -205,7 +235,8 @@ def safety_net_numpy(anomaly: np.ndarray, boxes: np.ndarray, scores: np.ndarray,
 
     scores = np.clip(scores + boost * (1.0 - scores), 0.0, 1.0)
     return dict(boxes=boxes, scores=scores, labels=labels,
-                n_safety_boxes=len(extra_boxes))
+                n_safety_boxes=len(extra_boxes),
+                n_unknown_boxes=n_unknown_boxes)
 
 
 def fuse_detections(det: dict, anomaly: torch.Tensor, img_size, cfg,
@@ -236,5 +267,6 @@ def fuse_detections(det: dict, anomaly: torch.Tensor, img_size, cfg,
 
     keep = scores >= float(cfg.fusion.final_score_thresh)
     result = dict(boxes=boxes[keep], scores=scores[keep], labels=labels[keep],
-                  n_safety_boxes=out["n_safety_boxes"])
+                  n_safety_boxes=out["n_safety_boxes"],
+                  n_unknown_boxes=out.get("n_unknown_boxes", 0))
     return result

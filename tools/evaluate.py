@@ -1,7 +1,11 @@
-"""Evaluation: mAP50, per-class AP, large-defect recall, normal-image FPR, FPS.
+"""Evaluation: precision / recall / F1 / mAP50 / large recall / FPR / FPS.
 
     python tools/evaluate.py --cfg configs/jingwei_n.yaml --ckpt runs/bank/memory_bank.pt
     python tools/evaluate.py --cfg configs/jingwei_n.yaml --smoke
+    python tools/evaluate.py --cfg configs/jingwei_p.yaml --cache disk --max-val 200
+
+``validate_detector()`` is also called from ``tools/train_detector.py`` so every
+training epoch prints val metrics instead of only loss.
 """
 from __future__ import annotations
 
@@ -10,10 +14,11 @@ import time
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
-from _common import ROOT, SyntheticNormalDataset, data_paths, load_model, resolve
-from jingwei.data import NormalImageDataset, YOLODefectDataset, collate
+from _common import (ROOT, SyntheticNormalDataset, add_cache_args, data_paths,
+                     load_model, make_dataset, resolve)
+from jingwei.data import collate
 from jingwei.image_io import ascii_safe, console_safe
 from jingwei.utils import box_iou, count_parameters, profile_macs
 
@@ -28,9 +33,18 @@ def average_precision(recall, precision):
 
 
 @torch.no_grad()
-def evaluate_map(model, loader, device, nc, iou_thr=0.5):
+def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0):
+    """mAP50 + global precision/recall/F1 at ``conf_thresh``.
+
+    Unknown-class boxes (label >= nc) are counted separately: they are the
+    deterministic safety net / normality fallback and must NOT be scored as a
+    normal class, but they still count for large-defect recall.
+    """
     records = [[] for _ in range(nc)]
     n_gt = np.zeros(nc, np.int64)
+    tp = fp = 0
+    unknown_boxes = 0
+    n_det = 0
     for batch in loader:
         dets = model(batch["image"].to(device))
         for b, d in enumerate(dets):
@@ -41,8 +55,12 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5):
             used = torch.zeros(len(gt_boxes), dtype=torch.bool, device=device)
             order = torch.argsort(d["scores"], descending=True)
             for i in order.tolist():
+                score = float(d["scores"][i])
                 c = int(d["labels"][i])
                 if c >= nc:            # 未知异常 is not one of the 19 classes
+                    if score >= conf_thresh:
+                        unknown_boxes += 1
+                        n_det += 1
                     continue
                 box = d["boxes"][i:i + 1]
                 if len(gt_boxes):
@@ -54,7 +72,11 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5):
                         used[j] = True
                 else:
                     is_tp = False
-                records[c].append((float(d["scores"][i]), is_tp))
+                records[c].append((score, is_tp))
+                n_det += 1
+                if score >= conf_thresh:
+                    tp += int(is_tp)
+                    fp += int(not is_tp)
 
     aps = []
     for c in range(nc):
@@ -62,10 +84,22 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5):
             aps.append(float("nan"))
             continue
         rec = sorted(records[c], key=lambda x: -x[0])
-        tp = np.cumsum([r[1] for r in rec])
-        fp = np.cumsum([not r[1] for r in rec])
-        aps.append(average_precision(tp / n_gt[c], tp / np.maximum(tp + fp, 1)))
-    return float(np.nanmean(aps)), aps
+        cum_tp = np.cumsum([r[1] for r in rec])
+        cum_fp = np.cumsum([not r[1] for r in rec])
+        aps.append(average_precision(cum_tp / n_gt[c],
+                                     cum_tp / np.maximum(cum_tp + cum_fp, 1)))
+    total_gt = int(n_gt.sum())
+    fn = max(0, total_gt - tp)
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-9)
+    pr = {"precision": float(precision), "recall": float(recall),
+          "f1": float(f1), "tp": int(tp), "fp": int(fp), "fn": int(fn),
+          "n_gt": total_gt, "n_det": int(n_det),
+          "unknown_boxes": int(unknown_boxes)}
+    valid_aps = [a for a in aps if np.isfinite(a)]
+    map50 = float(np.mean(valid_aps)) if valid_aps else 0.0
+    return map50, aps, pr
 
 
 @torch.no_grad()
@@ -100,6 +134,35 @@ def normal_fpr(model, loader, device):
 
 
 @torch.no_grad()
+def validate_detector(model, val_loader, norm_loader, device, cfg,
+                      conf_thresh=None, iou_thr=0.5):
+    """One validation pass returning all acceptance metrics as a plain dict."""
+    conf = float(conf_thresh if conf_thresh is not None
+                 else cfg.fusion.final_score_thresh)
+    map50, aps, pr = evaluate_map(model, val_loader, device,
+                                  int(cfg.data.nc), iou_thr=iou_thr,
+                                  conf_thresh=conf)
+    rec = large_defect_recall(model, val_loader, device,
+                              float(cfg.fusion.large_area_ratio))
+    if norm_loader is not None:
+        fpr, nfp, nn = normal_fpr(model, norm_loader, device)
+    else:
+        fpr, nfp, nn = 0.0, 0, 0
+    out = {
+        "mAP50": float(map50),
+        "AP50": [float(a) for a in aps],
+        "large_recall": float(rec),
+        "normal_fpr": float(fpr),
+        "normal_fp": int(nfp),
+        "normal_n": int(nn),
+        "conf_thresh": conf,
+        "iou_thr": float(iou_thr),
+    }
+    out.update(pr)
+    return out
+
+
+@torch.no_grad()
 def benchmark(model, device, size, iters=5, warmup=2):
     x = torch.randn(1, 3, size, size, device=device)
     if device == "cuda":
@@ -123,11 +186,25 @@ def main():
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--max-val", type=int, default=0)
+    ap.add_argument("--normal-max", type=int, default=0)
+    ap.add_argument("--val-conf", type=float, default=None,
+                    help="score threshold for precision/recall "
+                         "(default: fusion.final_score_thresh)")
+    ap.add_argument("--val-iou", type=float, default=0.5)
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--names", default=None)
+    ap.add_argument("--emit-unknown", action="store_true",
+                    help="force unknown-defect boxes on")
+    ap.add_argument("--no-unknown", action="store_true",
+                    help="force unknown-defect boxes off")
+    add_cache_args(ap)
     args = ap.parse_args()
 
     model, cfg = load_model(args.cfg, args.ckpt, args.device)
+    if args.emit_unknown:
+        cfg.fusion.emit_unknown_boxes = True
+    if args.no_unknown:
+        cfg.fusion.emit_unknown_boxes = False
     paths = data_paths(cfg, args.data)
     model.eval()
     size = int(cfg.input_size[0])
@@ -146,17 +223,22 @@ def main():
         norm_loader = DataLoader(SyntheticNormalDataset(n=8, size=size, seed=42),
                                  batch_size=1, collate_fn=collate)
     else:
-        vdir, ndir = resolve(paths["val"]), resolve(paths["normalval"])
-        ldir = str(vdir).replace("/images/", "/labels/")
-        vds = YOLODefectDataset(vdir, ldir, img_size=size, augment=False)
-        idx = list(range(min(args.max_val, len(vds)))) if args.max_val else list(range(len(vds)))
-        val_loader = DataLoader(vds, batch_size=1, shuffle=False, collate_fn=collate, sampler=idx)
-        norm_loader = DataLoader(NormalImageDataset(ndir, img_size=size, augment=False),
-                                 batch_size=1, shuffle=False, collate_fn=collate)
+        vds = make_dataset("val", resolve(paths["val"]), None, size, args,
+                           has_labels=True, augment=False, seed=0)
+        n_key = "normalval" if "normalval" in paths else "normaltrain"
+        nds = make_dataset(n_key, resolve(paths[n_key]), None, size, args,
+                           has_labels=False, augment=False, seed=0)
+        if args.max_val:
+            vds = Subset(vds, range(min(args.max_val, len(vds))))
+        if args.normal_max:
+            nds = Subset(nds, range(min(args.normal_max, len(nds))))
+        val_loader = DataLoader(vds, batch_size=1, shuffle=False,
+                                collate_fn=collate)
+        norm_loader = DataLoader(nds, batch_size=1, shuffle=False,
+                                 collate_fn=collate)
 
-    map50, aps = evaluate_map(model, val_loader, args.device, int(cfg.data.nc))
-    rec = large_defect_recall(model, val_loader, args.device, float(cfg.fusion.large_area_ratio))
-    fpr, fp, n = normal_fpr(model, norm_loader, args.device)
+    m = validate_detector(model, val_loader, norm_loader, args.device, cfg,
+                          conf_thresh=args.val_conf, iou_thr=args.val_iou)
     macs = profile_macs(model, [torch.zeros(1, 3, size, size)])
 
     print("\n================ JingWei evaluation ================")
@@ -164,10 +246,17 @@ def main():
     print(f"MACs @ {size}     : {macs['total'] / 1e9:.2f} G "
           f"(conv {macs.get('conv', 0)/1e9:.2f} / linear {macs.get('linear', 0)/1e9:.2f} "
           f"/ attention {macs.get('attention', 0)/1e9:.2f})")
-    print(f"mAP50             : {map50:.4f}")
-    print(f"large-defect recall: {rec:.4f}   <-- primary acceptance metric")
-    print(f"normal image FPR  : {fpr:.4f}  ({fp}/{n})")
-    for i, a in enumerate(aps):
+    print(f"conf / IoU        : {m['conf_thresh']:.3f} / {m['iou_thr']:.2f}")
+    print(f"mAP50             : {m['mAP50']:.4f}")
+    print(f"precision         : {m['precision']:.4f}  (TP={m['tp']} FP={m['fp']})")
+    print(f"recall            : {m['recall']:.4f}  (FN={m['fn']} GT={m['n_gt']})")
+    print(f"F1                : {m['f1']:.4f}")
+    print(f"large-defect recall: {m['large_recall']:.4f}   <-- primary acceptance metric")
+    print(f"normal image FPR  : {m['normal_fpr']:.4f}  "
+          f"({m['normal_fp']}/{m['normal_n']})")
+    print(f"unknown boxes     : {m['unknown_boxes']}  "
+          f"(label={int(cfg.data.nc)} / 未知异常)")
+    for i, a in enumerate(m["AP50"]):
         label = ascii_safe(names[i], f"cls{i}") if i < len(names) else str(i)
         print(console_safe(f"  AP50[{i:2d}] {label:<8.8s}: {a:.4f}"))
     if not args.smoke:

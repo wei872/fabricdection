@@ -2,7 +2,7 @@
 
     # real teacher (needs torch.hub / local DINOv2 clone + weights)
     python tools/pretrain_dino.py --cfg configs/jingwei_n.yaml \
-        --teacher dinov2_vits14 --iters 5000 --out runs/dino
+        --teacher dinov2_vits14 --iters 5000 --cache disk --out runs/dino
 
     # then warm-start the supervised detector from the distilled student
     python tools/train_detector.py --cfg configs/jingwei_n.yaml \
@@ -16,7 +16,7 @@
     python tools/pretrain_dino.py --smoke 4 --iters 2
 
 The DINOv2 ViT is a FROZEN TEACHER at training time only.  The exported engine
-still contains only the lightweight CNN student (jingwei_p = 7.59 G MACs).
+still contains only the lightweight CNN student (jingwei_p = 8.09 G MACs).
 After distillation ``normality.recon.target_proj`` is re-frozen, exactly as
 Dinomaly's frozen foundation encoder requires (docs/DESIGN.md §6 stage 0).
 
@@ -32,11 +32,12 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from _common import (ROOT, SyntheticNormalDataset, checkpoint_meta,
-                     collect_rng_state, data_paths, format_eta, is_resumable,
-                     load_checkpoint, load_model, log, resolve,
-                     resume_checkpoint, save_checkpoint, set_global_seed)
-from jingwei.data import NormalImageDataset, collate
+from _common import (ROOT, SyntheticNormalDataset, add_cache_args,
+                     checkpoint_meta, collect_rng_state, data_paths,
+                     format_eta, is_resumable, iter_speed, load_checkpoint,
+                     load_model, log, make_dataset, resolve, resume_checkpoint,
+                     save_checkpoint, set_global_seed)
+from jingwei.data import collate
 from jingwei.dino import (DINODistillLoss, DINOStudentAdaptor, load_teacher,
                           make_views)
 from jingwei.utils import count_parameters
@@ -72,6 +73,7 @@ def main():
                     help="write last.pt / iter snapshots every N iterations (0 only final)")
     ap.add_argument("--log-interval", type=int, default=100,
                     help="print a progress line every N iterations (0 disables iter logs)")
+    add_cache_args(ap)
     args = ap.parse_args()
 
     set_global_seed(args.seed)
@@ -152,9 +154,9 @@ def main():
     if args.smoke:
         ds = SyntheticNormalDataset(n=args.smoke, size=size)
     else:
-        ds = NormalImageDataset(resolve(paths["normaltrain"]), img_size=size,
-                                augment=False, with_descriptor=False,
-                                seed=args.seed)
+        ds = make_dataset("normaltrain", resolve(paths["normaltrain"]), None,
+                          size, args, has_labels=False, augment=False,
+                          seed=args.seed, with_descriptor=False)
     loader = DataLoader(ds, batch_size=batch, shuffle=True,
                         num_workers=0 if args.smoke else args.num_workers,
                         collate_fn=collate, drop_last=not args.smoke,
@@ -207,6 +209,7 @@ def main():
         f"seed={args.seed}")
     log(f"start_iter={start_it}/{iters}  save_interval={args.save_interval}  "
         f"log_interval={args.log_interval}")
+    log(f"cache={args.cache}  cache_dir={args.cache_dir}")
     log("(use --log-interval 0 to disable iter logs; python -u disables buffering)")
     log("=" * 72)
 
@@ -282,6 +285,8 @@ def main():
         return
 
     global_t0 = time.time()
+    global_it0 = start_it
+    running_loss, running_n = 0.0, 0
     interval_t0, interval_loss, interval_n = global_t0, 0.0, 0
     while it < iters:
         for data in loader:
@@ -307,18 +312,22 @@ def main():
             loss_val = float(loss.detach())
             interval_loss += loss_val
             interval_n += 1
+            running_loss += loss_val
+            running_n += 1
             it += 1
 
             if args.log_interval and (it == 1 or
                                       it % args.log_interval == 0 or
                                       it == iters):
                 elapsed = max(time.time() - interval_t0, 1e-6)
-                ips = interval_n / elapsed
+                ips = iter_speed(it - global_it0, time.time() - global_t0,
+                                 interval_n, elapsed)
                 eta = (iters - it) / max(ips, 1e-6)
                 avg = interval_loss / max(interval_n, 1)
+                run_avg = running_loss / max(running_n, 1)
                 lr_now = float(opt.param_groups[0]["lr"])
                 log(f"iter {it:6d}/{iters}  distill_cosine={avg:.5f}  "
-                    f"lr={lr_now:.2e}  {ips:.2f} it/s  "
+                    f"run_avg={run_avg:.5f}  lr={lr_now:.2e}  {ips:.2f} it/s  "
                     f"elapsed={format_eta(time.time() - global_t0)}  "
                     f"eta={format_eta(eta)}")
                 interval_t0, interval_loss, interval_n = time.time(), 0.0, 0
