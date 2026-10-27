@@ -11,12 +11,12 @@
 [GPU] TRT engine  ──► 8 个张量（静态形状）[+n3/n5 if roi_head]
    │  cls3(1,19,160,160)  reg3(1,4,160,160)  obj3(1,1,160,160)
    │  cls5(1,19,40,40)    reg5(1,4,40,40)    obj5(1,1,40,40)
-   │  anomaly(1,1,160,160)   context(1,3,160,160)
+   │  anomaly(1,1,G,G)       context(1,3,G,G)
    ▼
 [CPU/GPU 后处理，固定上界]
    1. 布种描述符 → prototype id            O(1280²) FFT，可与上一帧流水
    2. decode: top-k(300) + 阈值            ~27k 候选，无 NMS
-   3. 连通域安全网（160² 上） + context 前景/折入抑制
+   3. 连通域安全网（160² 上） + 局部+全局注意力 context 动态前景/折入抑制
    4. ROI 二级分类（可选）
    ▼
 结果（19 类框 / 未知异常框）→ PLC / MES
@@ -38,7 +38,7 @@ python tools/export.py \
 
 导出前会自动：
 
-- `strip_train_only()`：删除 `obj`（o2m）、训练期 `fg` 对齐分支；**保留** `FabricContext` 前景头；
+- `strip_train_only()`：删除 `obj`（o2m）、训练期 `fg` 对齐分支；**保留** `FabricContext` 局部+全局注意力前景头；
 - `bank.set_active(proto)`：把该布种原型的 centroids 固化进 1×1 卷积权重；
 - 把高斯平滑核变成常量 buffer，使 `anomaly` 输出也是静态形状。
 
@@ -48,8 +48,10 @@ python tools/export.py \
 images  (1,3,1280,1280)
 cls3    (1,19,160,160)     reg3  (1,4,160,160)     obj3 (1,1,160,160)
 cls5    (1,19,40,40)       reg5  (1,4,40,40)       obj5 (1,1,40,40)
-anomaly (1,1,160,160)      context(1,3,160,160) = [defect_fg, fabric_mask, edge_band]
+anomaly (1,1,160,160)      context(1,3,160,160) = [defect_fg, fabric_mask, fold_band]
 ```
+`jingwei_p` 的 `anomaly / context` 为 `(1,1,128,128)` / `(1,3,128,128)`，
+其余输出形状与通道语义不变。
 
 ### 2.1 多布种怎么办
 
@@ -89,10 +91,10 @@ trtexec --onnx=runs/export/jingwei_n.onnx --saveEngine=.../jingwei_n_int8.engine
 
 | 设备 | jingwei_p | jingwei_n | jingwei_s |
 |---|---:|---:|---:|
-| RTX PRO 6000 | 2.02 ms / 494 FPS | 2.87 ms / 348 FPS | 4.70 ms / 213 FPS |
-| RTX 4090 | 2.43 ms / 411 FPS | 3.71 ms / 269 FPS | 6.45 ms / 155 FPS |
-| RTX 3060 | 4.49 ms / 223 FPS | 7.90 ms / 127 FPS | 15.20 ms / 66 FPS |
-| Jetson AGX Orin | 7.78 ms / 129 FPS | 14.59 ms / 69 FPS | 29.20 ms / 34 FPS |
+| RTX PRO 6000 | 1.99 ms / 502 FPS | 2.83 ms / 354 FPS | 4.54 ms / 221 FPS |
+| RTX 4090 | 2.39 ms / 419 FPS | 3.64 ms / 275 FPS | 6.20 ms / 161 FPS |
+| RTX 3060 | 4.36 ms / 229 FPS | 7.70 ms / 130 FPS | 14.54 ms / 69 FPS |
+| Jetson AGX Orin | 7.52 ms / 133 FPS | 14.20 ms / 70 FPS | 27.88 ms / 36 FPS |
 
 估算方法见 DESIGN.md §8.2（锚定 YOLO27n 官方 0.44 ms / 7.2 G MACs）。
 该估算**只含计算**，未含相机曝光/传输、PLC 通信与 GPU 频率波动。
@@ -144,11 +146,11 @@ GTX 1660 SUPER = Turing **TU116，1408 CUDA 核，1785 MHz，没有 Tensor Core�
 
 | 变体 | MACs | 1660S 估算延迟 | 估算 FPS | 能否实时（≤25 ms） |
 |---|---|---|---|---|
-| **jingwei_p** | **8.42 G** | **13.6 – 20.7 ms** | **48 – 74 FPS** | ✅ 稳 |
-| jingwei_n | 17.12 G | 23.5 – 38.0 ms | 26 – 43 FPS | ⚠️ 临界，看实测 |
-| jingwei_s | 35.80 G | 44.7 – 75.2 ms | 13 – 22 FPS | ❌ 基本不行 |
+| **jingwei_p** | **8.09 G** | **13.2 – 20.1 ms** | **50 – 76 FPS** | ✅ 稳 |
+| jingwei_n | 16.62 G | 22.9 – 37.0 ms | 27 – 44 FPS | ⚠️ 临界，看实测 |
+| jingwei_s | 34.11 G | 42.8 – 71.8 ms | 14 – 23 FPS | ❌ 基本不行 |
 
-（FP16 shader 若能达到 ~1.3×：p 11.4–16.9 ms / n 19.0–30.2 ms / s 35.3–58.7 ms。
+（FP16 shader 若能达到 ~1.3×：p 11.1–16.4 ms / n 18.5–29.4 ms / s 33.8–56.2 ms。
 但见下方风险，**不要假设 FP16 一定更快**。）
 
 ### 三个必须先验证的风险
@@ -195,15 +197,15 @@ python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both
 
 ### 显存
 
-6 GB 完全够：pico 参数 2.87 M（FP32 约 11 MB），1280² batch=1 的激活峰值
+6 GB 完全够：pico 参数 2.93 M（FP32 约 11 MB），1280² batch=1 的激活峰值
 估计 < 1 GB，TRT workspace 1–2 GB。无需担心 OOM；别把 batch 调大即可。
 
 ### 结论
 
-- **原版 jingwei_n 在 1660S 上处于临界**（约 26–43 FPS），有 risk，不建议直接上产线；
+- **原版 jingwei_n 在 1660S 上处于临界**（约 27–44 FPS），有 risk，不建议直接上产线；
 - **jingwei_s 达不到实时**；
-- **换成 `configs/jingwei_p.yaml` 后，1660S 上估算约 48–74 FPS**，
-  且保留 LocalContrastNorm、布种原型、双无监督信号、**前景/折入上下文**与确定性安全网，
+- **换成 `configs/jingwei_p.yaml` 后，1660S 上估算约 50–76 FPS**，
+  且保留 LocalContrastNorm、布种原型、双无监督信号、**局部+全局注意力动态前景/折入上下文**与确定性安全网，
   "大型缺陷不漏"的机制没有被削弱，只是砍掉了通道数、2 个重建块和 ROI 二级分类。
 - 最终以你自己机器上的 `bench_device.py` + `trtexec` 实测为准。
 
@@ -218,7 +220,7 @@ python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both
 ```
 
 - 布种描述符（2D FFT）只依赖当前帧，可与 GPU 推理重叠；
-- `context(1,3,G,G)` 与 `anomaly` 一起出图，安全网据此拒绝背景和正常折入；
+- `context(1,3,G,G)` 与 `anomaly` 一起出图；三通道来自局部+全局注意力，安全网据此动态拒绝背景和正常折入，不依赖固定边缘像素；
 - `LocalContrastNorm` 已包含在导出图内，无需 CPU 预处理；
 - 用 CUDA streams + pinned memory + 双缓冲，把 H2D/D2H 与计算重叠；
 - 后处理的连通域在 160² 上做，通常 < 0.3 ms（CPU）。
@@ -230,7 +232,7 @@ python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both
 - [ ] `configs/fusion_calibrated.yaml` 的阈值已回填到模型配置
 - [ ] `Recall@large ≥ 99.5%`、`FPR@normal ≤ 0.5%`、`FPR@fold ≤ 0.5%`（真实 val/normalval）
 - [ ] 每个布种都有 normaltrain 覆盖；未覆盖原型走 conservative fallback
-- [ ] 正常折入/布幅变化样本已覆盖；`foreground` 阈值按产线 A/B 调好
+- [ ] 正常折入/布幅变化样本已覆盖；局部+全局注意力 `foreground` 阈值按产线 A/B 调好（不再调 `edge_band_px`）
 - [ ] 生产图片/视频路径含中文/空格时用 `jingwei/image_io.py` 读写（已默认接入）；回归测试 `test_24_unicode_paths` 通过
 - [ ] 非方形长条布幅帧（如 1040×2448）在 `augment=True` 下能正常训练；回归测试 `test_25_non_square_photometric_augment` 通过
 - [ ] 阶段 0 / A / B 训练日志可见（启动信息 + batch 进度 / ETA）；回归测试 `test_26_training_progress_logs` 通过

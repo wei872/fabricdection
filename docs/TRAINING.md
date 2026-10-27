@@ -15,7 +15,7 @@ pip install onnx tensorrt ultralytics
 
 最低验证环境（本仓库实测）：Python 3.11 + torch 2.2.2 (CPU 即可) +
 numpy 1.26 + opencv-python-headless + PyYAML + scipy + tqdm。
-跑 `python -m unittest discover -s tests -v` 应输出 `OK`（28 项）。
+跑 `python -m unittest discover -s tests -v` 应输出 `OK`（29 项）。
 阶段 0 的 `--smoke` 模式用 synthetic teacher，不需要下载 DINOv2 权重。
 
 ## 2. 数据准备
@@ -112,8 +112,9 @@ python tools/train_detector.py \
     --resume runs/dino/dino_init.pt \
     --epochs 150 --batch 8 --log-interval 20 --out runs/detector
 
-# 阶段 A 同时训练 defect_fg 前景头（YOLO 框级弱监督）；data.py 也会以 25%
-# 概率合成布幅边缘正常折入增广，让 normaltrain / detector 都把它见成背景。
+# 阶段 A 同时训练局部+全局注意力的 defect_fg / fabric_mask / fold_band
+# （YOLO 框级弱监督 + 逐帧动态布幅伪目标）；data.py 也会以 25% 概率合成
+# 布幅边缘正常折入增广，让 normaltrain / detector 都把它见成背景。
 # 详见 docs/FOREGROUND.md。
 # 阶段 B：无监督正常性（normaltrain，主干冻结）
 python tools/train_normality.py \
@@ -143,7 +144,8 @@ python tools/export.py    --cfg configs/jingwei_n.yaml --ckpt runs/bank/memory_b
 ### 3.1 阶段 A 细节
 
 - `model.set_stage("detector")` 跳过正常性分支，训练更快；
-- 损失 = o2m 密集 + o2o 匈牙利 + 前景对齐（见 DESIGN.md §7）；
+- 损失 = o2m 密集 + o2o 匈牙利 + 前景对齐（YOLO27 训练辅助，见 DESIGN.md §7）
+  + 局部+全局注意力前景上下文损失（见 FOREGROUND.md）；
 - 优化器 AdamW + cosine，梯度裁剪 5.0；
 - 若某类 AP 特别低，在 `train.class_weights` 里填 19 个权重（如按 `1/sqrt(样本数)` 归一化）；
 - **建议**：先用 `normaltrain` 里的图做"纯负样本"加入训练（无框），可显著降低 FPR。
@@ -233,7 +235,7 @@ python tools/train_normality.py --cfg configs/jingwei_n.yaml \
 ## 4. 快速自检（无真实数据）
 
 ```bash
-python -m unittest discover -s tests -v                 # 28 项，约 106 s（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG 回归）
+python -m unittest discover -s tests -v                 # 29 项，约 67 s（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态注意力前景）
 python tools/benchmark.py --all                         # p/n/s 参数量 / MACs / 延迟估算
 python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both  # 在你的 GPU 上实测
 python tools/train_detector.py   --smoke 2 --epochs 1 --batch 1 --device cpu --log-interval 1
@@ -270,8 +272,8 @@ python tools/export.py --check --out runs/export/jingwei_n.onnx
 | 阶段 0 `torch.hub.load` 失败 | 内网无法访问 GitHub / 权重 URL | clone DINOv2 到本地，用 `--repo /path/to/dinov2 --weights /path/to/xxx.pth`；见 [DINO_PRETRAIN.md](DINO_PRETRAIN.md) |
 | 阶段 0 OOM | teacher 太大 / crop / batch 太大 | 换 `dinov2_vits14`、`--batch 2`、`--crop 224`；推理图不受影响 |
 | 阶段 0 loss 不降 | iters 太少 / normaltrain 布种单一 | 先跑 5000 iters；确认 normaltrain 覆盖全部布种与光照 |
-| 布边正常折入仍误报 | `edge_band` 太窄 / `defect_fg` 把折入当前景 | 增大 `edge_band_px` / `edge_attenuation`；补充 normaltrain 折入图；见 [FOREGROUND.md](FOREGROUND.md) |
-| 真实边缘缺陷被压掉 | 抑制过强 | 降低 `edge_attenuation`、提高 `edge_peak_override`，或增加带框边缘缺陷样本训练 `defect_fg` |
+| 布边正常折入仍误报 | 动态 `fold_band` 没学到 / `defect_fg` 把折入当前景 | 提高 `fold_loss_weight` / `pos_weight`；补充 normaltrain 折入图；见 [FOREGROUND.md](FOREGROUND.md) |
+| 真实边缘缺陷被压掉 | 抑制过强 | 降低 `fold_attenuation`、提高 `fold_peak_override`，或增加带框边缘缺陷样本训练 `defect_fg` |
 | 1660 SUPER 上 FP16 比 FP32 还慢 | TU116 能用 TensorRT，但没有 Tensor Core；TRT FP16 可能落到慢 kernel | 用 `--precision both` 实测，取快的；先构建 FP32 engine 再 A/B FP16，见 [DEPLOYMENT.md §4.1](DEPLOYMENT.md) |
-| 1660 SUPER 上不到 40 FPS | n/s 变体算力过大 | 换 `configs/jingwei_p.yaml`（8.42 G MACs） |
+| 1660 SUPER 上不到 40 FPS | n/s 变体算力过大 | 换 `configs/jingwei_p.yaml`（8.09 G MACs） |
 | 后处理占了 3–4 ms | decode + 连通域在 CPU 上 | 用 uint8 输入、`top_k` 降到 100、`out_grid` 降到 96 |

@@ -23,9 +23,9 @@
 | **Dinomaly** | 冻结基础特征 + 噪声瓶颈 + 线性注意力 + 宽松重建，结构异常敏感 | ViT 编码器推理慢，不适合实时 | 蒸馏成 P5 上的**轻量重建残差头**（无第二编码器） |
 | **DINOv2** | 自监督、密集 patch 特征、无需缺陷标签 | ViT 推理慢、不能进实时图 | **阶段 0 离线 teacher**：冻结蒸馏进 CNN 后丢弃，推理图不变（[DINO_PRETRAIN.md](DINO_PRETRAIN.md)） |
 
-**已验证**（见 §13）：参考实现在 1280×1280 下 n 变体 **6.32 M 参数 / 17.12 G MACs**，
-无 Tensor Core 卡专用的 pico 变体 **2.87 M / 8.42 G MACs**，
-28 项单元测试全过（含中文 / Unicode 路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG 回归），ONNX 导出成功且输出全为静态形状。
+**已验证**（见 §13）：参考实现在 1280×1280 下 n 变体 **6.36 M 参数 / 16.62 G MACs**，
+无 Tensor Core 卡专用的 pico 变体 **2.93 M / 8.09 G MACs**，
+29 项单元测试全过（含中文 / Unicode 路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态局部+全局注意力前景回归），ONNX 导出成功且输出全为静态形状。
 
 > ⚠️ **诚实声明**：仓库里目前只有 `dataset/dataset.yaml`（路径指向你本机的
 > `D:/tyhn/yolo/...`），**没有真实图片**。因此本文所有的精度数字都是**设计目标 / 验收指标**，
@@ -222,8 +222,8 @@ flowchart TB
 - `FabricPrototypeBank.scorer`：1 个 1×1 卷积 (128→256, 80²) ≈ 0.21 G MACs
 - `ReconstructionResidual`：40²=1600 token，d=256，4 个线性注意力块 ≈ 4.3 G MACs（含 Linear 与 MLP）
 
-合计约 **4.8 G MACs**，占总量 17.12 G 的 28%；其余约 12.3 G 是共享主干 +
-双尺度检测头的卷积（profiler 的 `conv 11.14 G` 中也包含记忆库评分与高斯平滑等小项）。
+合计约 **4.8 G MACs**，占总量 16.62 G 的 29%；其余约 12.3 G 是共享主干 +
+双尺度检测头的卷积（profiler 的 `conv 12.01 G` 中也包含记忆库评分与高斯平滑等小项）。
 换句话说：**两个分支并没有各跑一次主干，这是能实时的根本原因。**
 
 ---
@@ -387,14 +387,14 @@ A_rec    = sigmoid((res - tau_rec) · slope_rec)
 2. **确定性安全网**（核心，伪代码）：
 
 ```python
-A = A * fabric_mask * (1 - edge_attenuation * edge_band * (1 - defect_fg))
+A = A * fabric_mask * (1 - fold_attenuation * fold_band * (1 - defect_fg))
 mask = A >= anomaly_thresh                       # 160×160 二值图
 mask = dilate(mask, 3×3)                          # 连接断裂的长缺陷
 for cc in connectedComponents8(mask):
     if area(cc) < 0.001 * 160²: continue         # 只看"大型"连通域
     if peak(A[cc]) < anomaly_thresh: continue
     if valid_frac(cc) < min_fabric_frac: continue     # 背景
-    if fold_like(cc) and peak < edge_peak_override: continue  # 正常折入
+    if fold_like(cc) and peak < fold_peak_override: continue  # 正常折入
     box = bbox(cc) * 8 * margin                  # 映射回 1280 像素坐标
     if max IoU(box, 已有检测框) > 0.1:
         boost(那些框的分数)                       # 已检出 → 不重复出框
@@ -407,32 +407,44 @@ for cc in connectedComponents8(mask):
    这一步专治形态相近的小类（蚊虫小黑点 vs 小黑点 vs 油点线）。
    低置信度时宁可输出"未知异常"也不给错类 → 分类"比较精准"。
 
-### 5.8 前景/背景分离与布幅边缘折入抑制
+### 5.8 前景/背景分离与布幅边缘折入抑制（局部+全局注意力）
 
 布幅左右移动 / 宽度变化时，布边正常折入会形成长条状暗区，原安全网会把它
-当成大缺陷输出 `未知异常`。为此在融合门前引入 `FabricContext`
-（[FOREGROUND.md](FOREGROUND.md)）：
+当成大缺陷输出 `未知异常`。**折入在图像上的像素位置并不固定**，所以旧版
+“距图像边缘固定 64 px 的带”是错的。当前实现改为类似 Transformer 的
+**局部 + 全局注意力**上下文头 `FabricContext`
+（详见 [FOREGROUND.md](FOREGROUND.md)）：
 
-- **无参数逐帧布幅掩膜** `fabric_mask`：从织纹高频能量估计有效布面，背景为 0；
-- **边缘折入带** `edge_band`：由布幅左/右边界的内侧距离得到；
-- **弱监督缺陷前景头** `defect_fg`：用 YOLO 框内缩区域作正样本，正常折入
-  无框 → 负样本；初始 bias=-3，未训练时也不把折入当前景。
+- **局部分支**：在 stride-8 的 P3 上用 depthwise conv + GroupNorm 提取织纹、
+  暗条、缺陷边缘等像素级特征；
+- **全局分支**：在 stride-32 的 P3/P5 token 上加可学习 `[CLS]`，经过
+  `LinearAttention2`（Dinomaly 同款 ELU+1 线性注意力）`VitBlock` 堆叠，
+  得到整幅图的布幅位置 / 宽度 / 背景先验；`[CLS]` 输出生成 FiLM (γ, β)
+  调制局部特征；
+- **三个 1×1 头**输出动态每帧图：
+  - `defect_fg`：YOLO 框内缩区域作正样本，正常图 / 折入图作负样本；
+  - `fabric_mask`：由亮度归一化织纹能量伪目标 + 网络修正得到布面 mask；
+  - `fold_band`：由动态布面边界的形态学伪目标 + 网络修正得到折入带，
+    **跟随布边移动，而不是固定图像边缘像素**；
+- 训练时另用 `build_fabric_context_targets()` 生成逐帧伪目标并监督 CLS 头的
+  全局布幅占比；伪目标只在 loss 中使用，推理图不含 numpy / 形态学算子。
 
 有效异常图：
 
 ```
-A_eff = A * fabric_mask * (1 - edge_attenuation * edge_band * (1 - defect_fg))
+A_eff = A * fabric_mask * (1 - fold_attenuation * fold_band * (1 - defect_fg))
 ```
 
 `A_eff` 同时喂给 objectness 增强和安全网；三个上下文图打包成
 `context (1,3,G,G)` 一起导出。安全网对大异常连通域额外检查：
 布面占比低于 `min_fabric_frac` → 背景跳过；
-位于 `edge_band`、形状细长、`defect_fg` 低且峰值未超过
-`edge_peak_override` → 判为正常折入跳过；
+位于动态 `fold_band` 且 `defect_fg` 低、峰值未超过 `fold_peak_override`
+→ 判为正常折入跳过（长宽比只是默认关闭的可选辅助）；
 `defect_fg` 高或峰值极高 → **仍然兜底输出**，因此 §5.9 的召回下界不变。
 
 `data.py` 还以 25% 概率合成边缘折入增广（只改亮度、不移动框），让
-normaltrain / 记忆库与 detector 都把折入见成正常背景。
+normaltrain / 记忆库与 detector 都把折入见成正常背景。注意力头在
+stride-32 token 上计算，1280² 下只增加约 0.12~0.26 G MACs。
 
 ### 5.9 "大缺陷一定不漏"的形式化说明
 
@@ -453,9 +465,10 @@ Recall_large ≥ R_A + (1 - R_A) · R_det
   两类信号互补使 `R_A` 很高；
 - **残余风险**：只有当大缺陷在 A 上也不显著时才漏，
   这靠 §9 的布种自适应 + `normalval` 阈值标定 + 训练时合成异常增广来压低；
-- **前景上下文不破坏下界**：§5.8 的 `fabric_mask / edge_band / defect_fg`
-  只跳过「背景 + 低前景折入状」连通域；真实大缺陷要么 `defect_fg` 高、
-  要么峰值超过 `edge_peak_override`、要么不在边缘带，仍进入上述确定性兜底。
+- **前景上下文不破坏下界**：§5.8 的局部+全局注意力
+  `fabric_mask / fold_band / defect_fg` 只跳过「背景 + 低前景动态折入状」
+  连通域；真实大缺陷要么 `defect_fg` 高、要么峰值超过 `fold_peak_override`、
+  要么不在预测折入带，仍进入上述确定性兜底。固定图像边缘像素不再参与判定。
 
 > 严格地说，"100% 不漏"是工程保证而非数学定理：本设计把问题从
 > "检测器必须召回" 转化为 "异常图必须召回"，后者由双无监督信号 +
@@ -553,16 +566,16 @@ obj_o2o 1.5, fg_align 0.5, rec 0.5`。
 
 ### 8.1 实测计算量（`tools/benchmark.py`，hook-based MAC counter）
 
-> 下表已包含 §5.8 新增的前景/折入上下文头；相比早期版本约 +0.8~3.3 G MACs。
+> 下表已包含 §5.8 新的局部+全局注意力前景头；注意力部分约 +0.12~0.26 G MACs。
 
 | 变体 | 参数 | 640² MACs | **1280² MACs** | conv | linear | attention |
 |---|---|---|---|---|---|---|
-| **jingwei_p**（无 TC 卡专用） | 2.87 M | 2.16 G | **8.42 G** | 6.83 G | 1.47 G | 0.11 G |
-| **jingwei_n** | **6.32 M** | 4.50 G | **17.12 G** | 12.62 G | 4.30 G | 0.20 G |
-| **jingwei_s** | 11.52 M | 9.24 G | **35.80 G** | 31.24 G | 4.30 G | 0.25 G |
+| **jingwei_p**（无 TC 卡专用） | 2.93 M | 2.45 G | **8.09 G** | 6.39 G | 1.58 G | 0.12 G |
+| **jingwei_n** | **6.36 M** | 5.11 G | **16.62 G** | 12.01 G | 4.40 G | 0.21 G |
+| **jingwei_s** | 11.48 M | 10.05 G | **34.11 G** | 29.45 G | 4.40 G | 0.26 G |
 
 对照：YOLO27n 官方 640² = 7.2 G FLOPs / 3.0 M 参数。
-按像素线性外推到 1280² 约 28.8 G；**JingWei-n 在 1280² 只有 17.12 G，
+按像素线性外推到 1280² 约 28.8 G；**JingWei-n 在 1280² 只有 16.62 G，
 约为其六成**，因为双尺度头 + 深度可分离浅层。
 
 > MAC counter 只统计 Conv2d / Linear / 自定义注意力；池化、BN、softmax、
@@ -577,13 +590,13 @@ obj_o2o 1.5, fg_align 0.5, rec 0.5`。
 
 | 设备 | jingwei_n | jingwei_s |
 |---|---|---|
-| RTX PRO 6000（参考） | **2.87 ms / 348 FPS** | 4.70 ms / 213 FPS |
-| RTX 4090 | 3.71 ms / 269 FPS | 6.45 ms / 155 FPS |
-| RTX 3060 | 7.90 ms / 127 FPS | 15.20 ms / 66 FPS |
-| Jetson AGX Orin | 14.59 ms / 69 FPS | 29.20 ms / 34 FPS |
+| RTX PRO 6000（参考） | **2.83 ms / 354 FPS** | 4.54 ms / 221 FPS |
+| RTX 4090 | 3.64 ms / 275 FPS | 6.20 ms / 161 FPS |
+| RTX 3060 | 7.70 ms / 130 FPS | 14.54 ms / 69 FPS |
+| Jetson AGX Orin | 14.20 ms / 70 FPS | 27.88 ms / 36 FPS |
 
 **结论**：n 变体在主流 GPU / 边缘设备上都留有很大余量（>> 40 FPS 需求）；
-s 变体在 Jetson 上约 34 FPS，仍可用。**必须用 `trtexec` 在目标设备实测**，
+s 变体在 Jetson 上约 36 FPS，仍可用。**必须用 `trtexec` 在目标设备实测**，
 上表只是选型依据。
 
 > ⚠️ **上表只适用于有 Tensor Core 的 GPU**。GTX 1660 SUPER / 1660 Ti / 1650
@@ -593,7 +606,7 @@ s 变体在 Jetson 上约 34 FPS，仍可用。**必须用 `trtexec` 在目标�
 > 不是不能用 TensorRT**——1660S 的 sm_75 可以正常构建 TRT engine，
 > 只是 FP16/INT8 没有 TC 加速；术语澄清见 [DEPLOYMENT.md §4.1](DEPLOYMENT.md)。
 > 按独立的峰值×效率模型估算：
-> **p 13.6–20.7 ms ✅ / n 23.5–38.0 ms ⚠️临界 / s 44.7–75.2 ms ❌**。
+> **p 13.2–20.1 ms ✅ / n 22.9–37.0 ms ⚠️临界 / s 42.8–71.8 ms ❌**。
 > 完整分析、A/B 步骤与实测脚本见 [DEPLOYMENT.md §4.1](DEPLOYMENT.md)。
 > 用 `tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both` 在你的卡上验证。
 
@@ -605,8 +618,10 @@ s 变体在 Jetson 上约 34 FPS，仍可用。**必须用 `trtexec` 在目标�
 4. **P5 轴向注意力**：O(HW(H+W)C) 而非 O((HW)²C)；
 5. **无 NMS**：一对一分支，top-k 固定上界，延迟确定；
 6. **低分辨率后处理**：连通域在 160² 上做，不是 1280²；
-7. **前景上下文全是静态小算子**：`fabric_mask / edge_band` 无参数，
-   `defect_fg` 只有两个 3×3/1×1 卷积，增量约 +0.8~3.3 G MACs；
+7. **前景上下文局部+全局注意力**：局部 depthwise conv 在 stride-8，
+   全局 `LinearAttention2` 只在 stride-32 token（40×40+1）上跑，
+   `fabric_mask / fold_band / defect_fg` 三个 1×1 头输出动态布边；
+   注意力部分仅约 +0.12~0.26 G MACs，且全静态、ONNX/TRT 友好；
 8. **FP16 / INT8 TRT + Conv-BN 折叠 + 训练辅助分支导出即删**。
 
 ### 8.4 延迟确定性
@@ -726,7 +741,7 @@ jingwei/
   losses.py      检测损失 + 匈牙利 + 宽松重建损失   → §7
   fabric.py      布种描述符 / 原型聚类 / 记忆库压缩 → §9
   data.py        YOLO 数据集 / 纯正常图集 / 布种 / 折入增广 → §6
-  foreground.py 布幅掩膜 / 边缘折入带 / 缺陷前景头 → §5.8
+  foreground.py 局部+全局注意力 / 动态布幅掩膜 / 折入带 / 缺陷前景头 → §5.8
   image_io.py   中文/Unicode 安全的图像与视频 I/O → §12.5
   utils.py      框工具 / MACs profiler / 安全 torch_load（weights_only=True）
   dino.py       阶段 0 DINOv2 离线 teacher 工具
@@ -735,22 +750,22 @@ tools/           阶段 0 + A–E 的 CLI（pretrain_dino / train / build / cali
                  evaluate / predict / export / benchmark / bench_device）
 tools/_common.py 共享数据/模型加载 + log()/format_eta() 进度日志 +
                  save_checkpoint()/resume_checkpoint()/RNG 断点续训工具
-tests/test_model.py  28 项单元测试（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG 回归）
+tests/test_model.py  29 项单元测试（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态注意力前景）
 docs/DESIGN.md   本文
 docs/TRAINING.md 训练与数据准备手册
 docs/DEPLOYMENT.md 实时部署手册
-docs/FOREGROUND.md 前景/背景与边缘折入抑制
+docs/FOREGROUND.md 局部+全局注意力前景/背景与动态折入抑制
 docs/DINO_PRETRAIN.md 阶段 0 DINOv2 蒸馏
 ```
 
 ### 12.2 两个变体的选择
 
-- **jingwei_n**（默认）：6.32 M / 17.12 G，实时优先，建议先用它跑通产线；
-- **jingwei_s**：11.52 M / 35.80 G，精度优先，边缘设备上仍 ~34 FPS；
-- **jingwei_p**（pico）：2.87 M / 8.42 G，专为**无 Tensor Core 的老卡**
+- **jingwei_n**（默认）：6.36 M / 16.62 G，实时优先，建议先用它跑通产线；
+- **jingwei_s**：11.48 M / 34.11 G，精度优先，边缘设备上仍 ~36 FPS；
+- **jingwei_p**（pico）：2.93 M / 8.09 G，专为**无 Tensor Core 的老卡**
   （GTX 1660 SUPER / 1660 Ti / 1650）在 1280² 下实时而裁剪：
   通道 ×0.75、重建块 4→2、网格 80→64、记忆库中心 256→128、关闭 ROI 二级分类。
-  **LocalContrastNorm、布种原型、双无监督信号、前景/折入上下文、确定性安全网全部保留**，
+  **LocalContrastNorm、布种原型、双无监督信号、局部+全局注意力动态前景/折入上下文、确定性安全网全部保留**，
   即"大缺陷不漏"与"边缘折入不误报"的机制都没有被削弱。详见
   [DEPLOYMENT.md §4.1](DEPLOYMENT.md) 与 [FOREGROUND.md](FOREGROUND.md)。
 - 若需要更高精度，可把 `attn_heads` / `recon_dim` / `n_centroids` 调大，
@@ -902,15 +917,16 @@ python tools/train_normality.py --cfg configs/jingwei_p.yaml \
 执行 `python -m unittest discover -s tests -v`（CPU 即可，无需数据/GPU）：
 
 ```
-Ran 28 tests in ~106 s — OK
+Ran 29 tests in ~67 s — OK
 
-  params = 6.32 M        MACs @1280 = 17.12 G   (jingwei_n)
-  pico   = 2.87 M        MACs @1280 =  8.42 G   (jingwei_p)
+  params = 6.36 M        MACs @1280 = 16.62 G   (jingwei_n)
+  pico   = 2.93 M        MACs @1280 =  8.09 G   (jingwei_p)
   Chinese/Unicode image, folder, video and .npz paths = OK
   non-square 1040x2448-like fabric frame augmentation = OK
   stage 0 / A / B startup + per-iteration progress logs = OK
   stage 0 / A / B full checkpoint resume + weight-only warm start = OK
   numpy BitGenerator RNG state (PCG64/Philox/SFC64/MT19937) = OK
+  local+global attention dynamic fold_band (no fixed edge pixels) = OK
 ```
 
 覆盖内容：
@@ -938,13 +954,14 @@ Ran 28 tests in ~106 s — OK
 | 19 | `jingwei_p` 非整除 normality grid 的静态 ONNX 导出（onnx.checker） |
 | 20 | DINO 阶段 0：synthetic teacher → student adaptor → cosine loss 反向传播 |
 | 21 | `tools/pretrain_dino.py --smoke` 端到端跑通并保存可用 checkpoint |
-| 22 | 前景上下文：逐帧布幅掩膜 + 边缘折入带估计 |
+| 22 | 前景上下文：布幅平移时动态 `fabric_mask / fold_band / global_target` 伪目标跟随布边，而非固定图像边缘 |
 | 23 | 安全网拒绝正常折入，但保留中央大缺陷与高前景边缘缺陷 |
 | 24 | **中文 / Unicode 图片、目录、视频、`.npz` 原型路径 + `predict.py` 端到端** |
 | 25 | **非方形 / 长条布幅图（如 1040×2448）在反光增广下的广播正确性** |
 | 26 | 阶段 0 / A / B 训练脚本的启动日志与按 iteration 的进度 / ETA 日志 |
 | 27 | 阶段 0 / A / B 完整 checkpoint 断点续训（optimizer / scheduler / RNG / epoch / iter）与 weight-only 热启动 |
 | 28 | numpy `BitGenerator.state` 的 dict / ndarray 形态在 `weights_only=True` checkpoint 中递归保存与恢复（Windows / numpy 2.x `.tolist()` 崩溃回归） |
+| 29 | **局部+全局注意力前景头**：`LinearAttention2` 全局 token、动态 FiLM、三个上下文头、损失与梯度；布幅位置变化时 context 由特征决定而非固定图像边缘 |
 
 **布种描述符实测**（合成织纹，周期 5/9/13/19 px、亮度 100/170、反光 0/0.9）：
 

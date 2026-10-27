@@ -14,8 +14,9 @@
 再用一个**确定性安全网**把异常图上任何未被覆盖的大连通域强制输出成框 ——
 因此大型缺陷不依赖检测器的置信度，也不会被漏标污染。布种变化
 （经纬线粗细 / 经纬密 / 反光）由「局部对比度归一化 + 布种原型 + 每原型独立记忆库」处理。
-**布幅变化导致的边缘正常折入**则由逐帧 `fabric_mask / edge_band / defect_fg`
-前景上下文单独处理，避免被安全网误判成疵点；详见
+**布幅变化导致的边缘正常折入**则由逐帧**局部+全局注意力**
+`fabric_mask / fold_band / defect_fg` 前景上下文单独处理（动态跟随布边，
+不再依赖固定边缘像素），避免被安全网误判成疵点；详见
 [docs/FOREGROUND.md](docs/FOREGROUND.md)。
 
 ---
@@ -28,11 +29,11 @@
 | [docs/TRAINING.md](docs/TRAINING.md) | 数据准备、阶段 0 + 五阶段训练命令、调参与故障排查 |
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | ONNX/TensorRT 导出、延迟预算、流水线、上线清单 |
 | **[docs/DINO_PRETRAIN.md](docs/DINO_PRETRAIN.md)** | **用 DINOv2 做阶段 0 离线蒸馏预训练：为什么需要、命令、许可证、A/B 验证** |
-| **[docs/FOREGROUND.md](docs/FOREGROUND.md)** | **前景/背景分离、布幅变化跟随、边缘正常折入误报抑制** |
+| **[docs/FOREGROUND.md](docs/FOREGROUND.md)** | **局部+全局注意力前景/背景分离、动态布幅跟随、边缘正常折入误报抑制** |
 | `jingwei/` | 参考实现：主干 / 双尺度头 / 记忆库 / 线性注意力重建 / 安全网 / 损失 / 数据集 / **Unicode 安全图像 I/O** / **安全 checkpoint 加载** / DINO teacher 工具 |
 | `configs/` | `jingwei_n.yaml`（实时优先）、`jingwei_s.yaml`（精度优先）、**`jingwei_p.yaml`（GTX 1660 SUPER 等无 Tensor Core 卡专用）**、`fabric19.yaml`（数据）；均含 `dino:` 阶段 0 配置 |
 | `tools/` | **DINOv2 蒸馏预训练**、训练（启动 / batch 级日志 + **完整断点续训**）、建库、标定、评估、推理、导出、算力剖析、**真实设备延迟实测** CLI |
-| `tests/test_model.py` | 28 项单元测试（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG 回归） |
+| `tests/test_model.py` | 29 项单元测试（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态注意力前景） |
 
 > `dataset/dataset.yaml` 保持原样，作为 19 个类别名的真源。
 
@@ -43,7 +44,7 @@
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m unittest discover -s tests -v     # 应输出 OK (28 tests，含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG 回归)
+python -m unittest discover -s tests -v     # 应输出 OK (29 tests，含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态注意力前景)
 python tools/benchmark.py --both            # 参数量 / MACs / 延迟估算
 ```
 
@@ -81,7 +82,7 @@ python tools/train_normality.py  --cfg configs/jingwei_n.yaml --resume runs/norm
 完整 checkpoint 断点续训；详见
 [docs/DESIGN.md §12.5–12.8](docs/DESIGN.md)。
 
-阶段 A 会同时训练 `defect_fg` 前景头；`data.py` 还会合成布幅边缘正常折入增广，
+阶段 A 会同时训练局部+全局注意力的 `defect_fg / fabric_mask / fold_band`；`data.py` 还会合成布幅边缘正常折入增广，
 避免产线把折入误判成疵点，详见 [docs/FOREGROUND.md](docs/FOREGROUND.md)。
 
 无数据也能验证全流程（随机权重 + 合成织纹，只验证可运行）：
@@ -93,26 +94,27 @@ python tools/train_normality.py  --cfg configs/jingwei_n.yaml --resume runs/norm
 
 ```
 python -m unittest discover -s tests -v
-Ran 28 tests in ~106 s — OK
-  jingwei_n = 6.32 M / 17.12 G MACs @1280
-  jingwei_p = 2.87 M /  8.42 G MACs @1280
-  stage 0 DINOv2 distillation + foreground/fold context = smoke OK
+Ran 29 tests in ~67 s — OK
+  jingwei_n = 6.36 M / 16.62 G MACs @1280
+  jingwei_p = 2.93 M /  8.09 G MACs @1280
+  stage 0 DINOv2 distillation + local+global attention fg context = smoke OK
   Chinese/Unicode image, folder, video and .npz paths = OK
   non-square 1040x2448-like fabric frame augmentation = OK
   stage 0 / A / B startup + per-iteration progress logs = OK
   stage 0 / A / B full checkpoint resume + weight-only warm start = OK
   numpy BitGenerator RNG state (PCG64/Philox/SFC64/MT19937) = OK
+  local+global attention dynamic fold_band (no fixed edge pixels) = OK
 ```
 
 | 变体 | 参数 | 1280² MACs | 640² MACs | RTX 4090 估算 | Jetson AGX Orin 估算 | **GTX 1660 SUPER 估算** |
 |---|---|---|---|---|---|---|
-| **jingwei_p** | 2.87 M | **8.42 G** | 2.16 G | 2.43 ms / 411 FPS | 7.78 ms / 129 FPS | **13.6–20.7 ms / 48–74 FPS ✅** |
-| **jingwei_n** | 6.32 M | **17.12 G** | 4.50 G | 3.71 ms / 269 FPS | 14.59 ms / 69 FPS | 23.5–38.0 ms / 26–43 FPS ⚠️ |
-| **jingwei_s** | 11.52 M | 35.80 G | 9.24 G | 6.45 ms / 155 FPS | 29.20 ms / 34 FPS | 44.7–75.2 ms / 13–22 FPS ❌ |
+| **jingwei_p** | 2.93 M | **8.09 G** | 2.45 G | 2.39 ms / 419 FPS | 7.52 ms / 133 FPS | **13.2–20.1 ms / 50–76 FPS ✅** |
+| **jingwei_n** | 6.36 M | **16.62 G** | 5.11 G | 3.64 ms / 275 FPS | 14.20 ms / 70 FPS | 22.9–37.0 ms / 27–44 FPS ⚠️ |
+| **jingwei_s** | 11.48 M | 34.11 G | 10.05 G | 6.20 ms / 161 FPS | 27.88 ms / 36 FPS | 42.8–71.8 ms / 14–23 FPS ❌ |
 
 > 1660 SUPER 一列用的是**独立的"FP32 峰值 × 实际效率"模型**，不是右表其它列的
 > Tensor-Core 锚点（该卡无 Tensor Core）。详见 [docs/DEPLOYMENT.md §4.1](docs/DEPLOYMENT.md)。
-> 上述数字已包含新增的前景/折入上下文头（约 +0.8~3.3 G MACs）。
+> 上述数字已包含新的局部+全局注意力前景头（注意力部分约 +0.12~0.26 G MACs）。
 
 对照：YOLO27n 官方 640² = 7.2 G FLOPs / 3.0 M 参数（线性外推到 1280² 约 28.8 G）。
 JingWei-n 在 1280² 仍只用了约六成的计算量。
@@ -120,8 +122,9 @@ JingWei-n 在 1280² 仍只用了约六成的计算量。
 其他实测：
 
 - **ONNX 导出成功**，`onnx.checker` 通过，输出全部静态形状：
-  pico 为 8 个（`cls3 … anomaly` + `context (1,3,160,160) =
-  [defect_fg, fabric_mask, edge_band]`），n/s 因 ROI 二级分类额外输出 `n3/n5` 共 10 个。
+  pico 为 8 个（`cls3 … anomaly` + `context (1,3,128,128) =
+  [defect_fg, fabric_mask, fold_band]`），n/s 的 context 为 `(1,3,160,160)`，
+  且因 ROI 二级分类额外输出 `n3/n5` 共 10 个。
 - **安全网**：160² 异常图上一个大连通域、零检测框 → 强制输出 1 个
   "未知异常"框；已有框则提分且不重复出框；正常图 0 框。
 - **布种描述符**：周期 5/9/13/19 px、亮度 100/170、反光 0/0.9 的合成织纹下，
@@ -162,12 +165,12 @@ shader 速率，336 GB/s）[1](https://www.tomshardware.com/reviews/nvidia-gefor
 
 | 变体 | 1660S 估算 | 结论 |
 |---|---|---|
-| **jingwei_p** (8.42 G MACs) | **13.6–20.7 ms / 48–74 FPS** | ✅ 稳定实时 |
-| jingwei_n (17.12 G) | 23.5–38.0 ms / 26–43 FPS | ⚠️ 临界，需实测 |
-| jingwei_s (35.80 G) | 44.7–75.2 ms / 13–22 FPS | ❌ 达不到 |
+| **jingwei_p** (8.09 G MACs) | **13.2–20.1 ms / 50–76 FPS** | ✅ 稳定实时 |
+| jingwei_n (16.62 G) | 22.9–37.0 ms / 27–44 FPS | ⚠️ 临界，需实测 |
+| jingwei_s (34.11 G) | 42.8–71.8 ms / 14–23 FPS | ❌ 达不到 |
 
-`jingwei_p` 保留了全部关键机制（去反光、布种原型、双无监督信号、**前景/背景与
-边缘折入抑制**、确定性安全网），只砍了通道数 / 重建块数 / 网格分辨率 /
+`jingwei_p` 保留了全部关键机制（去反光、布种原型、双无监督信号、**局部+全局注意力前景/背景与
+动态折入抑制**、确定性安全网），只砍了通道数 / 重建块数 / 网格分辨率 /
 ROI 二级分类，**"大缺陷不漏"没有被削弱**。
 
 > **术语澄清：TensorRT ≠ Tensor Core。** 1660S 是 sm_75，**可以用 TensorRT**

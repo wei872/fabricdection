@@ -1,32 +1,43 @@
-"""Fabric foreground / background separation + edge fold-in suppression.
+"""Local + global attention foreground / background context.
 
 Problem this module solves
 --------------------------
 On a loom the fabric web (布幅) shifts and changes width.  A normal fold-in /
-turned edge (折入) at the left/right border creates a long, dark, high-contrast
-strip.  A purely anomaly-driven detector sees that strip as a large defect and
+turned edge (折入) can appear at *any* image column, not at a fixed pixel band.
+A purely anomaly-driven detector sees that long dark strip as a large defect and
 the deterministic safety-net emits a false ``未知异常`` box.
 
-We therefore give the model an explicit **foreground context**:
+The OLD implementation used a fixed ``edge_band_px`` strip measured from the
+image border.  That is explicitly wrong for moving 布幅.  This module replaces
+it with a **learned, transformer-like local + global attention context**:
 
-* ``fabric_mask``  — soft, per-frame estimate of the valid cloth region
-  (background / non-fabric = 0).  Estimated from weave texture energy, so it
-  follows 布幅变化 without any fixed ROI.
-* ``edge_band``    — soft band just *inside* the cloth boundary, where normal
-  fold-in / curling / shadow lives.
-* ``defect_fg``    — a small learned head supervised by the YOLO defect boxes.
-  It learns "defect foreground"; normal fold-in has no boxes, so it stays low.
+* A ``[CLS]`` token + linear-attention ``VitBlock`` stack over stride-32 tokens
+  gives every cell a **global view** of the whole frame: where the cloth is,
+  where the background is, and how wide the web is in this particular frame.
+* A depthwise-conv local branch over stride-8 features gives **local texture /
+  boundary awareness** (weave, fold shadow, defect edges).
+* The global token modulates the fused feature map (FiLM-style), and three 1x1
+  heads output dynamic per-frame maps at the anomaly grid:
+
+  ``defect_fg``   - learned defect foreground (weakly supervised by YOLO boxes)
+  ``fabric_mask`` - soft cloth / non-cloth (background) mask
+  ``fold_band``   - dynamic band where a NORMAL fold-in is plausible; it follows
+                    the predicted cloth boundary, NOT fixed image-border pixels.
 
 Effective anomaly used by decode + safety net:
 
-    A_eff = A * fabric_mask * (1 - edge_attenuation * edge_band * (1 - defect_fg))
+    A_eff = A * fabric_mask * (1 - fold_attenuation * fold_band * (1 - defect_fg))
 
-So a normal fold-in (low ``defect_fg``, inside ``edge_band``) is attenuated,
+So a normal fold-in (low ``defect_fg``, high ``fold_band``) is attenuated,
 while a real edge defect (high ``defect_fg`` or very high anomaly peak) survives.
-The safety net additionally skips background components and fold-like
-edge components unless the learned foreground or the anomaly peak overrides it.
+The safety net additionally rejects background components using the dynamic
+``fabric_mask``.
 
-All ops are static-shape / ONNX-friendly (avg_pool, cumsum, sigmoid, interpolate).
+Training is weakly supervised, so no pixel-level cloth masks are required:
+``build_fabric_context_targets`` derives a per-frame pseudo cloth mask from
+brightness-normalised weave energy and a dynamic morphological boundary.  Those
+targets are used ONLY in the loss; the deployed graph is all learned convs +
+linear attention with static shapes (ONNX / TensorRT friendly).
 """
 from __future__ import annotations
 
@@ -36,132 +47,162 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .normality import LinearAttention2, VitBlock
+
 
 # --------------------------------------------------------------------------------------
-# Deterministic, label-free cloth / boundary estimation
+# Learned local + global attention context (deployed)
 # --------------------------------------------------------------------------------------
-def estimate_fabric_context(x: torch.Tensor, out_grid: int, band_cells: float,
-                            texture_thresh: float = 0.2, slope: float = 30.0,
-                            eps: float = 1e-6):
-    """Return (fabric_mask, edge_band), both (B,1,G,G) in [0,1].
+class LocalGlobalForegroundAttention(nn.Module):
+    """Transformer-like context head with local conv + global linear attention.
 
-    ``x`` is RGB float in [0,1], shape (B,3,H,W).  No parameters, no labels:
-    woven cloth has high local high-frequency energy, background / machine is
-    comparatively flat.  The boundary is estimated per frame, so 布幅变化 is
-    handled automatically.  ``band_cells`` is the fold-in band width expressed
-    in anomaly-grid cells (precomputed from the fixed deployment input size).
+    Input dict uses ``n3`` (stride 8) and ``n5`` (stride 32) from
+    :class:`jingwei.neck.DualScalePAN`.  All grid sizes are precomputed from
+    the fixed deployment config, so there are no tensor-dependent control
+    flows or dynamic ``Resize(size=...)`` nodes in the exported graph.
     """
-    g = (0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3])
-    # local high-pass energy (same spirit as LocalContrastNorm)
-    low = F.avg_pool2d(g, kernel_size=15, stride=1, padding=7,
-                       count_include_pad=False)
-    energy = (g - low) * (g - low)
-    # static-shape downsample to the anomaly grid (1280/160=8, 1280/128=10)
-    e = F.adaptive_avg_pool2d(energy, (out_grid, out_grid))
-
-    col = e.mean(dim=2, keepdim=True)                 # (B,1,1,G)
-    row = e.mean(dim=3, keepdim=True)                 # (B,1,G,1)
-    # Smooth the 1-D profiles first: the sharp cloth/background boundary and a
-    # fold-in shadow create isolated energy spikes that would otherwise drown
-    # the normal weave when computing a robust scale.
-    col_s = F.avg_pool2d(col, kernel_size=(1, 15), stride=1,
-                         padding=(0, 7), count_include_pad=False)
-    row_s = F.avg_pool2d(row, kernel_size=(15, 1), stride=1,
-                         padding=(7, 0), count_include_pad=False)
-    # remove the flat-background floor before normalising
-    col_s = (col_s - col_s.amin(dim=-1, keepdim=True)).clamp(min=0.0)
-    row_s = (row_s - row_s.amin(dim=-2, keepdim=True)).clamp(min=0.0)
-    cscale = col_s.mean(dim=-1, keepdim=True) + 2.0 * col_s.std(
-        dim=-1, keepdim=True, unbiased=False) + eps
-    rscale = row_s.mean(dim=-2, keepdim=True) + 2.0 * row_s.std(
-        dim=-2, keepdim=True, unbiased=False) + eps
-    col_norm = (col_s / cscale).clamp(0.0, 1.5)
-    row_norm = (row_s / rscale).clamp(0.0, 1.5)
-    fabric_col = torch.sigmoid((col_norm - texture_thresh) * slope)
-    fabric_row = torch.sigmoid((row_norm - texture_thresh) * slope)
-    fabric_mask = fabric_col * fabric_row             # (B,1,G,G) via broadcast
-
-    # distance (in grid cells) from the nearest boundary, *inside* the cloth.
-    d_left = torch.cumsum(fabric_col, dim=-1)
-    total_col = d_left[..., -1:]
-    d_right = (total_col - d_left).clamp(min=0.0)
-    d_col = torch.minimum(d_left, d_right)            # (B,1,1,G)
-    edge_col = torch.exp(-d_col / band_cells) * fabric_col
-
-    # 布幅变化 mainly moves the left/right selvedge; top/bottom are usually
-    # continuous cloth in a web inspection camera.  Only the column boundary
-    # is treated as the fold-in band, otherwise every frame's top/bottom rows
-    # would be falsely marked as edge.
-    e_col = edge_col.expand(-1, -1, out_grid, -1)
-    edge_band = e_col * fabric_mask
-    return fabric_mask.contiguous(), edge_band.contiguous()
-
-
-# --------------------------------------------------------------------------------------
-# Learned defect-foreground head (weakly supervised by YOLO boxes)
-# --------------------------------------------------------------------------------------
-class DefectForegroundHead(nn.Module):
-    """Tiny conv head: n3 + n5 -> 1-channel defect-foreground probability.
-
-    Trained with box-filled targets from ``train`` (defect images).  Normal
-    images / normal fold-in have no boxes, so they are explicit negatives.
-    """
-
-    def __init__(self, c3: int, c5: int, hidden: int, out_grid: int):
-        super().__init__()
-        self.reduce5 = nn.Conv2d(c5, c3, 1)
-        self.fuse = nn.Sequential(
-            nn.Conv2d(c3 * 2, hidden, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, 1, 1))
-        # start as "background everywhere"; normal fold-in must NOT look like
-        # defect foreground before the head has learned from boxes.
-        nn.init.constant_(self.fuse[-1].bias, -3.0)
-        self.out_grid = int(out_grid)
-
-    def forward(self, feats: dict) -> torch.Tensor:
-        n3 = feats["n3"]
-        n5 = F.interpolate(self.reduce5(feats["n5"]), size=n3.shape[-2:],
-                           mode="nearest")
-        y = self.fuse(torch.cat([n3, n5], dim=1))
-        y = F.interpolate(y, size=(self.out_grid, self.out_grid),
-                          mode="bilinear", align_corners=False)
-        return torch.sigmoid(y)
-
-
-class FabricContext(nn.Module):
-    """Combine deterministic cloth/edge masks with the learned defect fg."""
 
     def __init__(self, cfg, channels):
         super().__init__()
         fg = cfg.foreground
         self.out_grid = int(cfg.normality.out_grid)
-        self.edge_attenuation = float(fg.edge_attenuation)
-        self.band_cells = max(0.5, float(fg.edge_band_px) * self.out_grid /
-                              float(cfg.input_size[0]))
-        self.texture_thresh = float(fg.get("texture_thresh", 0.2))
+        self.global_grid = int(cfg.input_size[0]) // 32     # 40 @1280
+        self.hidden = int(fg.get("hidden", 32))
+        self.attn_dim = int(fg.get("attention_dim", 64))
+        heads = int(fg.get("attention_heads", 4))
+        n_blocks = max(1, int(fg.get("attention_blocks", 2)))
+        if self.attn_dim % heads != 0:
+            raise ValueError("foreground.attention_dim must be divisible by attention_heads")
+        c3, c5 = int(channels[1]), int(channels[3])
+
+        self.local = nn.Sequential(
+            nn.Conv2d(c3, c3, 3, padding=1, groups=c3, bias=False),
+            nn.GroupNorm(max(1, min(8, c3)), c3),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c3, self.hidden, 1),
+            nn.ReLU(inplace=True),
+        )
+        self.token_proj = nn.Conv2d(c3 + c5, self.attn_dim, 1)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, self.attn_dim) * 0.02)
+        self.blocks = nn.ModuleList([
+            VitBlock(self.attn_dim, heads, mlp_ratio=2.0, drop=0.0)
+            for _ in range(n_blocks)
+        ])
+        self.global_proj = nn.Linear(self.attn_dim, self.hidden)
+        self.global_head = nn.Linear(self.attn_dim, 1)       # cloth / background prior
+
+        self.fuse = nn.Sequential(
+            nn.Conv2d(self.hidden + self.attn_dim, self.hidden, 3, padding=1),
+            nn.GroupNorm(max(1, min(8, self.hidden)), self.hidden),
+            nn.ReLU(inplace=True),
+        )
+        self.fg_head = nn.Conv2d(self.hidden, 1, 1)
+        self.mask_head = nn.Conv2d(self.hidden, 1, 1)
+        self.fold_head = nn.Conv2d(self.hidden, 1, 1)
+        # Safe initial state: no defect foreground, cloth mostly present,
+        # fold band sparse.  Training sharpens all three from data.
+        nn.init.constant_(self.fg_head.bias, -3.0)
+        nn.init.constant_(self.mask_head.bias, 2.0)
+        nn.init.constant_(self.fold_head.bias, -2.0)
+
+    def forward(self, feats: dict) -> dict:
+        n3, n5 = feats["n3"], feats["n5"]
+        B = n3.shape[0]
+        G, g = self.out_grid, self.global_grid
+
+        # ---- local branch: high-res texture / boundary detail -----------------
+        local = F.interpolate(n3, size=(G, G), mode="bilinear", align_corners=False)
+        local = self.local(local)                              # (B, hidden, G, G)
+
+        # ---- global branch: tokens over the WHOLE frame ----------------------
+        n3g = F.interpolate(n3, size=(g, g), mode="bilinear", align_corners=False)
+        n5g = F.interpolate(n5, size=(g, g), mode="bilinear", align_corners=False)
+        tok = self.token_proj(torch.cat([n3g, n5g], dim=1))  # (B, D, g, g)
+        tok = tok.flatten(2).transpose(1, 2)                  # (B, N, D)
+        cls = self.cls_token.expand(B, -1, -1)
+        tok = torch.cat([cls, tok], dim=1)                    # (B, N+1, D)
+        for blk in self.blocks:
+            tok = blk(tok)                                    # LinearAttention2
+        cls_out = tok[:, 0]                                   # (B, D)
+        spatial = tok[:, 1:].transpose(1, 2).reshape(B, self.attn_dim, g, g)
+
+        global_up = F.interpolate(spatial, size=(G, G), mode="bilinear",
+                                  align_corners=False)
+        global_ctx = torch.tanh(self.global_proj(cls_out)).view(B, self.hidden, 1, 1)
+        fused = self.fuse(torch.cat([local, global_up], dim=1))
+        fused = fused * (1.0 + 0.5 * global_ctx)              # FiLM-style global prior
+
+        defect_fg = torch.sigmoid(self.fg_head(fused))
+        fabric_mask = torch.sigmoid(self.mask_head(fused))
+        fold_band = torch.sigmoid(self.fold_head(fused))
+        context = torch.cat([defect_fg, fabric_mask, fold_band], dim=1)
+        global_logit = self.global_head(cls_out)              # (B, 1)
+        return {
+            "context": context,
+            "defect_fg": defect_fg,
+            "fabric_mask": fabric_mask,
+            "fold_band": fold_band,
+            "global_logit": global_logit,
+        }
+
+
+class FabricContext(nn.Module):
+    """Deployed foreground context + anomaly gating.
+
+    ``context_only`` / ``forward`` keep the old call signatures so
+    :class:`jingwei.model.JingWei`, ``tools/calibrate_fusion.py`` and ONNX
+    export do not change.  Internally everything now comes from
+    :class:`LocalGlobalForegroundAttention`; the RGB image ``x`` is ignored at
+    inference (it is only used to build weak training targets).
+    """
+
+    def __init__(self, cfg, channels):
+        super().__init__()
+        fg = cfg.foreground
+        self.out_grid = int(cfg.normality.out_grid)
+        self.fold_attenuation = float(
+            fg.get("fold_attenuation", fg.get("edge_attenuation", 0.80)))
+        self.texture_thresh = float(fg.get("texture_thresh", 0.20))
         self.slope = float(fg.get("slope", 30.0))
-        self.defect_head = DefectForegroundHead(
-            channels[1], channels[3], int(fg.hidden), self.out_grid)
+        self.boundary_kernel = int(fg.get("boundary_kernel", 5))
+        self.pos_weight = float(fg.get("pos_weight", 5.0))
+        self.fabric_weight = float(fg.get("fabric_loss_weight", 1.0))
+        self.fold_weight = float(fg.get("fold_loss_weight", 0.5))
+        self.global_weight = float(fg.get("global_loss_weight", 0.2))
+        self.attention = LocalGlobalForegroundAttention(cfg, channels)
+
+    def forward_parts(self, feats: dict) -> dict:
+        return self.attention(feats)
 
     def context_only(self, x, feats):
-        fabric_mask, edge_band = estimate_fabric_context(
-            x, self.out_grid, self.band_cells,
-            texture_thresh=self.texture_thresh, slope=self.slope)
-        defect_fg = self.defect_head(feats)
-        context = torch.cat([defect_fg, fabric_mask, edge_band], dim=1)
-        return context, defect_fg
+        parts = self.forward_parts(feats)
+        return parts["context"], parts["defect_fg"]
 
     def forward(self, x, feats, anomaly):
-        context, defect_fg = self.context_only(x, feats)
-        fabric_mask, edge_band = context[:, 1:2], context[:, 2:3]
+        parts = self.forward_parts(feats)
+        context = parts["context"]
+        defect_fg, fabric_mask, fold_band = (
+            parts["defect_fg"], parts["fabric_mask"], parts["fold_band"])
         eff = anomaly * fabric_mask * (
-            1.0 - self.edge_attenuation * edge_band * (1.0 - defect_fg))
+            1.0 - self.fold_attenuation * fold_band * (1.0 - defect_fg))
         return eff.clamp(0.0, 1.0), context, defect_fg
+
+    # ---- training-only helpers -------------------------------------------------
+    def build_targets(self, x, defect_target):
+        return build_fabric_context_targets(
+            x, self.out_grid, defect_target,
+            texture_thresh=self.texture_thresh, slope=self.slope,
+            boundary_kernel=self.boundary_kernel)
+
+    def loss(self, parts, tgt_fg, tgt_fabric, tgt_fold, tgt_global):
+        return foreground_context_loss(
+            parts, tgt_fg, tgt_fabric, tgt_fold, tgt_global,
+            pos_weight=self.pos_weight, fabric_weight=self.fabric_weight,
+            fold_weight=self.fold_weight, global_weight=self.global_weight)
 
 
 # --------------------------------------------------------------------------------------
-# Weak box supervision for the learned foreground head (training only)
+# Weak box supervision for the learned defect-foreground head
 # --------------------------------------------------------------------------------------
 def build_foreground_target(targets, img_size, grid, device, dtype,
                             shrink: float = 0.08):
@@ -186,15 +227,101 @@ def build_foreground_target(targets, img_size, grid, device, dtype,
     return tgt
 
 
-def foreground_loss(pred: torch.Tensor, target: torch.Tensor,
-                    pos_weight: float = 5.0) -> torch.Tensor:
-    """BCE (positive-weighted, boxes are sparse) + soft Dice.
+# --------------------------------------------------------------------------------------
+# Dynamic pseudo targets for fabric_mask / fold_band / global cloth prior
+# --------------------------------------------------------------------------------------
+@torch.no_grad()
+def build_fabric_context_targets(x: torch.Tensor, out_grid: int,
+                                 defect_target: torch.Tensor | None = None,
+                                 texture_thresh: float = 0.20,
+                                 slope: float = 30.0,
+                                 boundary_kernel: int = 5,
+                                 pool_size: int = 320):
+    """Per-frame WEAK targets; NOT part of the deployed graph.
 
-    ``pred`` is already a sigmoid probability, so use functional BCE with an
-    explicit per-pixel weight instead of ``binary_cross_entropy_with_logits``.
+    The cloth mask is derived from brightness-normalised local weave energy,
+    so it follows 布幅变化 and is not tied to any fixed image border.  The fold
+    band is the morphological boundary of THAT dynamic mask, again following
+    the cloth edge wherever it is.  ``boundary_kernel`` only smooths the
+    training label in grid cells; the deployed ``fold_band`` is learned by the
+    attention head.
     """
+    G = int(out_grid)
+    B = x.shape[0]
+    rgb = F.interpolate(x.detach().float(), size=(pool_size, pool_size),
+                        mode="bilinear", align_corners=False)
+    gray = (0.299 * rgb[:, 0:1] + 0.587 * rgb[:, 1:2] + 0.114 * rgb[:, 2:3])
+    low = F.avg_pool2d(gray, kernel_size=9, stride=1, padding=4,
+                       count_include_pad=False)
+    # Brightness-normalised high-pass energy: a dark fold-in shadow keeps the
+    # same relative weave contrast and must NOT be classified as background.
+    energy = ((gray - low) ** 2) / (low ** 2 + 0.02)
+    e = F.adaptive_avg_pool2d(energy, (G, G))
+    mu = e.mean(dim=(2, 3), keepdim=True)
+    sigma = e.std(dim=(2, 3), keepdim=True, unbiased=False)
+    e_norm = e / (mu + 2.0 * sigma + 1e-6)
+    sm = F.avg_pool2d(e_norm, kernel_size=7, stride=1, padding=3,
+                      count_include_pad=False)
+    fabric_target = torch.sigmoid((sm - texture_thresh) * slope)
+
+    k = max(3, int(boundary_kernel) | 1)                  # odd kernel
+    dil = F.max_pool2d(fabric_target, kernel_size=k, stride=1, padding=k // 2)
+    ero = -F.max_pool2d(-fabric_target, kernel_size=k, stride=1, padding=k // 2)
+    boundary = (dil - ero).clamp(0.0, 1.0) * fabric_target   # inner cloth side
+    if defect_target is not None:
+        boundary = boundary * (1.0 - defect_target.clamp(0.0, 1.0))
+    fold_target = boundary
+    global_target = fabric_target.mean(dim=(2, 3), keepdim=True)
+    return (fabric_target.contiguous(), fold_target.contiguous(),
+            global_target.contiguous())
+
+
+# --------------------------------------------------------------------------------------
+# Losses
+# --------------------------------------------------------------------------------------
+def _bce_dice(pred: torch.Tensor, target: torch.Tensor,
+              pos_weight: float = 1.0) -> torch.Tensor:
+    pred = pred.clamp(1e-6, 1.0 - 1e-6)
     w = 1.0 + (float(pos_weight) - 1.0) * target
     bce = F.binary_cross_entropy(pred, target, weight=w)
     inter = (pred * target).sum()
     dice = 1.0 - (2.0 * inter + 1.0) / (pred.sum() + target.sum() + 1.0)
     return bce + 0.5 * dice
+
+
+def foreground_loss(pred: torch.Tensor, target: torch.Tensor,
+                    pos_weight: float = 5.0) -> torch.Tensor:
+    """Backward-compatible single-map BCE+Dice loss."""
+    return _bce_dice(pred, target, pos_weight)
+
+
+def foreground_context_loss(parts: dict, tgt_fg: torch.Tensor,
+                            tgt_fabric: torch.Tensor, tgt_fold: torch.Tensor,
+                            tgt_global: torch.Tensor,
+                            pos_weight: float = 5.0,
+                            fabric_weight: float = 1.0,
+                            fold_weight: float = 0.5,
+                            global_weight: float = 0.2):
+    """Joint weak supervision for the three attention heads + global prior."""
+    defect_fg = parts["defect_fg"]
+    fabric_mask = parts["fabric_mask"]
+    fold_band = parts["fold_band"]
+    global_logit = parts["global_logit"]
+
+    l_defect = _bce_dice(defect_fg, tgt_fg, pos_weight)
+    l_fabric = _bce_dice(fabric_mask, tgt_fabric, 1.0)
+    l_fold = _bce_dice(fold_band, tgt_fold, 1.0)
+    g = global_logit.view(-1, 1)
+    gt = tgt_global.detach().view(-1, 1).clamp(0.0, 1.0)
+    l_global = F.binary_cross_entropy_with_logits(g, gt)
+
+    total = (l_defect + float(fabric_weight) * l_fabric +
+             float(fold_weight) * l_fold + float(global_weight) * l_global)
+    sub = {"defect": l_defect, "fabric": l_fabric,
+           "fold": l_fold, "global": l_global}
+    return total, sub
+
+
+# Keep the public symbol imported by older notebooks / scripts.  It is a thin
+# alias of the attention module and is NOT a fixed edge-band estimator.
+DefectForegroundHead = LocalGlobalForegroundAttention

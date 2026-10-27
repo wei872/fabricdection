@@ -106,20 +106,28 @@ dino:
 # 前景/背景 + 布幅边缘折入抑制（见 docs/FOREGROUND.md）
 foreground:
   enabled: true
-  hidden: 32                  # 缺陷前景小头隐层通道
-  edge_band_px: 64            # 布边内侧折入带宽度（像素）
-  edge_attenuation: 0.80      # 折入带内异常衰减强度
-  texture_thresh: 0.20        # 纹理能量→布幅掩膜阈值
+  mode: local_global_attention
+  hidden: 32                    # local conv branch channels
+  attention_dim: 64             # global token dim (LinearAttention2)
+  attention_heads: 4
+  attention_blocks: 2
+  boundary_kernel: 5            # ONLY smooths training pseudo labels, not deployed
+  fold_attenuation: 0.80        # dynamic fold_band attenuation (no fixed edge pixels)
+  texture_thresh: 0.20          # weave-energy -> pseudo fabric_mask
   slope: 30.0
-  target_shrink: 0.08         # YOLO 框内缩后作前景正样本
+  target_shrink: 0.08
   pos_weight: 5.0
   loss_weight: 0.5
-  fabric_mask_thresh: 0.30    # 安全网判定“在布幅内”
-  edge_band_thresh: 0.08
-  defect_fg_thresh: 0.25      # 学习到的缺陷前景阈值
+  fabric_loss_weight: 1.0
+  fold_loss_weight: 0.5
+  global_loss_weight: 0.2
+  fabric_mask_thresh: 0.30
+  fold_band_thresh: 0.08
+  defect_fg_thresh: 0.25
   min_fabric_frac: 0.50
-  fold_aspect_ratio: 3.0      # 长宽比 > 此值视为折入状
-  edge_peak_override: 0.80    # 异常峰值高于此值仍强制报警
+  use_aspect_cue: false         # primary cue is learned fold_band, not shape heuristic
+  fold_aspect_ratio: 3.0        # optional secondary cue
+  fold_peak_override: 0.80
 
 deploy:
   half: true

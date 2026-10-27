@@ -1,172 +1,266 @@
-# 前景/背景分离与布幅边缘折入抑制
+# 前景 / 背景分离：动态局部 + 全局注意力版本
 
-> 对应代码：`jingwei/foreground.py`、`jingwei/fusion.py` 的 `safety_net_numpy`、
-> `jingwei/data.py` 的 `fabric_photometric`；配置段 `foreground:`。
+> **2026-10 架构修正**：旧版把“布边正常折入”近似成**距图像边缘固定
+> 64 px 的带**。这是错的——布幅会移动、旋转、透视变形，折入在图像上的
+> 像素位置**不固定**。当前实现改为类似 Transformer 的**局部 + 全局注意力**
+> 前景上下文头：边界由每层特征动态预测，不再用图像边缘像素距离。
 
-## 1. 问题
+---
 
-产线上**布幅会左右移动、宽度也会变化**。布边在运动中会正常折入 / 卷边（折入），
-在图像上表现为一条长、暗、高对比的条带。对纯异常检测模型来说它非常像
-「大缺陷」：原来的确定性安全网会把这个大连通域强制输出成 `未知异常` 框，
-造成误报。
+## 0. 一句话原理
 
-用户要求的核心能力是：
+```
+P3 局部纹理 ─┐
+P4 局部语义 ─┼─ Local conv (stride 8) ─┐
+             │                         ├─ 动态FiLM 融合 ─┬─ defect_fg (YOLO框弱监督)
+P5 下采样 ───┴─ Global token (stride 32) ─┤                  ├─ fabric_mask (布幅mask)
+               + CLS + LinearAttention2 ─┘                  └─ fold_band  (动态折入带)
+```
 
-> **一定要区分背景和疵点前景**。
-> 背景 = 非布幅区域 + 正常布面（包括正常折入）；疵点前景 = 真实缺陷。
+- **局部分支**看 P3/P4 的织纹、暗条、缺陷边缘 → 像素级缺陷前景；
+- **全局分支**在 stride-32 token 上做 `LinearAttention2`（Dinomaly 同款
+  ELU+1 线性注意力），加可学习 `[CLS]` token → 整幅图的布幅位置/宽度/
+  全局亮度先验，并生成逐通道 **FiLM (γ, β)** 调制局部特征；
+- 三个头输出 `defect_fg / fabric_mask / fold_band`，打包成
+  `context (1,3,G,G)` 导出到 ONNX / TensorRT；
+- 安全网同时使用这三张图，但判定标准是**预测的动态边界**，不是图像边框。
 
-## 2. 解决思路：不是再堆一个检测器，而是给模型“上下文”
+---
 
-直接把折入当成新缺陷类去标，成本很高且无法穷举布幅变化。我们用三层上下文：
+## 1. 问题：为什么固定边缘像素不行
 
-| 信号 | 来源 | 含义 |
+| 现象 | 旧固定带 | 新动态注意力 |
 |---|---|---|
-| `fabric_mask` | 无参数、逐帧从图像纹理能量估计 | 当前帧的**有效布幅区域**；背景/机台 = 0 |
-| `edge_band` | 由 `fabric_mask` 的左/右边界算出的内侧软带 | 布边正常折入 / 阴影最可能出现的区域 |
-| `defect_fg` | 小卷积头，用 YOLO 缺陷框弱监督训练 | **疵点前景**概率；正常折入没有框，因此是负样本 |
+| 布幅整体左移 120 px | 带还在图像右边 → 漏抑制 | attention 全局 token 感知布幅位置，fold_band 跟着移动 |
+| 布幅变窄 / 倾斜 / 透视 | 固定宽度覆盖不全 | 局部分支逐像素重建边界 |
+| 折入在图像中间（拼接/折叠） | 完全不在带内 → 误报 | 全局上下文可在任意位置生成 fold_band |
+| 真实疵点恰好在旧带内 | 被无差别衰减 | `defect_fg` 高 / 峰值 override 强制保留 |
 
-`fabric_mask` 不依赖固定 ROI，逐帧从图像算，所以**布幅变化自动跟随**。
-`defect_fg` 初始 bias 设为 -3，未训练时也倾向输出 0，避免一开始就把折入当前景。
+训练代码里**唯一**还出现 `kernel_size=5` 的地方是
+`build_fabric_context_targets()` 里对**弱监督伪标签**做形态学膨胀/平滑，
+以降低标注噪声；它不参与推理，也不是“边缘多少像素”的超参。
 
-推理图新增一个 3 通道张量：
+---
 
-```
-context (1,3,G,G) = [defect_fg, fabric_mask, edge_band]
-G = normality.out_grid   (n/s: 160, pico: 128)
-```
+## 2. 模块实现（`jingwei/foreground.py`）
 
-## 3. 有效异常图
+### 2.1 `LocalGlobalForegroundAttention`
 
- normality 分支产生的原始异常图记为 `A`，导出前先做上下文门控：
+| 子模块 | 作用 | 关键实现 |
+|---|---|---|
+| `stem` | 降 P3/P4/P5 到统一 `hidden` 通道 | 1×1 Conv + GN + SiLU |
+| `local` / `fuse` | 局部纹理 + 上下文 | 3×3 depthwise + GroupNorm + 1×1 pointwise |
+| `token_proj` | 生成全局 token | P3@S/32 + P5 → 1×1 Conv |
+| `cls_token` | 全局布幅摘要 | 可学习 `(1,1,attn_dim)` |
+| `attention` | 全局交互 | `VitBlock`(LinearAttention2, ELU+1) × `attention_blocks` |
+| `global_proj` | 全局调制局部 | CLS → hidden 的 γ（tanh 后 FiLM 广播） |
+| `fg_head` | 缺陷前景 | 1×1 Conv → sigmoid，bias 初始 -3 |
+| `mask_head` | 有效布面 | 1×1 Conv → sigmoid，bias 初始 +2 |
+| `fold_head` | 折入/边界带 | 1×1 Conv → sigmoid，bias 初始 -2 |
 
-```
-A_eff = A * fabric_mask * (1 - edge_attenuation * edge_band * (1 - defect_fg))
-```
+所有注意力 token 在 **stride 32**（1280 输入 → 40×40 + 1 CLS = 1601 tokens）
+上计算；`LinearAttention2` 是 O(N) 而非 O(N²)，保证实时性。
+FiLM 输出在空间上广播，因此全局信息能影响每个像素的局部判断。
 
-含义：
+`forward_parts(feats)` 返回：
 
-- 背景区域直接乘 `fabric_mask` 抑制；
-- 布边折入带内，若 `defect_fg` 低，则按 `edge_attenuation` 衰减；
-- 真实边缘缺陷若被 `defect_fg` 判为前景，衰减项接近 0，异常图保留；
-- `A_eff` 同时用于检测头 objectness 的异常增益和安全网连通域。
-
-## 4. 安全网规则（保留“大缺陷不漏”）
-
-` safety_net_numpy(..., context=ctx)` 在每个大异常连通域上额外检查：
-
-1. `valid_frac`：区域内 `fabric_mask >= fabric_mask_thresh` 的比例；
-   低于 `min_fabric_frac` 视为背景，直接跳过。
-2. `edge_frac` / `fg_frac` / 长宽比 `aspect`：若
-   - 位于 `edge_band`，
-   - 形状细长（`aspect >= fold_aspect_ratio`），
-   - `defect_fg` 低，
-   - 且异常峰值 `< edge_peak_override`，
-   
-   则判定为**正常折入**，不输出 `未知异常` 框。
-3. 若 `defect_fg` 高、或异常峰值超过 `edge_peak_override`，或组件不在边缘带，
-   仍按原规则强制输出框。**大缺陷不漏的机制没有被削弱**。
-4. 如果检测头已经在该处有框，只做弱提分；折入状组件提分系数降为 0.25。
-
-单元测试 `test_23` 明确验证：折入条带 0 框、中央大缺陷 1 框、
-边缘带内高 `defect_fg` 的真实缺陷 1 框。
-
-## 5. 训练怎么学出来
-
-### 5.1 缺陷前景头（阶段 A 自动训练）
-
-`foreground_loss = BCE(pos_weight=5) + 0.5 * soft Dice`，
-正样本来自 YOLO 框内缩 8% 的区域，负样本是框外所有像素。
-`train` 里有缺陷框；`normaltrain` 没有框，且阶段 0/阶段 B 会把正常图
-（含合成折入）作为负样本。因此学到的是「缺陷前景」而不是「暗条带」。
-
-阶段 A 命令不变，`foreground` 头已自动加入 `parameter_groups("detector")`：
-
-```bash
-python tools/train_detector.py --cfg configs/jingwei_n.yaml --resume runs/dino/dino_init.pt
+```python
+{
+  "defect_fg":  (B,1,G,G),
+  "fabric_mask":(B,1,G,G),
+  "fold_band":  (B,1,G,G),
+  "global_logit": (B,1),
+  "context":    (B,3,G,G),
+}
 ```
 
-### 5.2 正常折入数据增广
+### 2.2 `FabricContext`
 
-`jingwei/data.py::fabric_photometric` 以 25% 概率在左/右布边合成
-渐变暗条 + 折痕（只改亮度，**不移动任何标注框**）。这样：
+部署时保留的包装器：
 
-- normality 分支 / 记忆库把折入见过的模式学成正常；
-- detector 在缺陷图上也见到折入状背景，但那里没有框，成为 hard negative；
-- 不依赖人工标注「折入」掩膜。
+```python
+ctx = FabricContext(cfg.foreground, channels=(...), img_size=1280,
+                    out_grid=160)
+A_eff, context = ctx(raw_anomaly, feats)
+```
 
-若你的真实 `normaltrain` 已经包含大量折入图，可以把概率调低；若误报仍集中在
-边缘，可提高概率或增大 `edge_band_px`。
+- `A_eff = A * fabric_mask * (1 - fold_attenuation * fold_band * (1 - defect_fg))`
+- `fold_band` 来自注意力输出，随输入图像动态变化；
+- `fold_attenuation` 只控制衰减**强度**，不定义带的位置。
 
-## 6. 配置
+训练时：
 
-三个模型配置都含 `foreground:` 段，常用项：
+```python
+parts = ctx.forward_parts(feats)
+tgt_fg = build_foreground_target(targets, ...)         # YOLO 框
+tgt_fabric, tgt_fold, tgt_global = ctx.build_targets(x, tgt_fg)
+loss, parts = ctx.loss(parts, tgt_fg, tgt_fabric, tgt_fold, tgt_global)
+```
+
+---
+
+## 3. 弱监督：标签从哪来
+
+没有像素级布幅/折入标注，所以使用**可解释的逐帧伪目标 + 可学习修正**：
+
+1. `build_foreground_target()`：把 YOLO 框内缩 8% 的区域置 1，其余置 0；
+   正常图 / normaltrain 全 0。这是 `defect_fg` 的强监督信号。
+2. `build_fabric_context_targets(x, ...)`：
+   - 在 320×320 缩略图上算亮度归一化高频织纹能量
+     `E = (I - AvgPool9(I))² / (AvgPool9(I)² + 0.02)`；
+   - `E / (mean + 2·std)` 抑制整体反光/亮度差异；
+   - `sigmoid((smooth(E) - texture_thresh) * slope)` → `fabric_mask` 伪目标；
+   - 对伪目标做 `max_pool - min_pool` 形态学边界 → `fold_band` 伪目标；
+   - `global_target = mean(fabric_target)` → 监督 CLS 头的全局布幅占比。
+3. 上述伪目标**只在训练时计算**，且会随每张图的布幅位置/宽度变化。
+   推理图没有 `cv2` / numpy / 形态学操作，ONNX 全静态。
+
+> 注意：伪目标不是最终预测。attention 头通过可见光纹理 + 全局 token + YOLO
+> 框监督，学会修正伪目标里的噪声（例如高对比背景经编/金属、真实疵点边缘）。
+
+---
+
+## 4. 损失函数
+
+```
+L_ctx = BCE(defect_fg, box_target, pos_weight=5)
+      + w_fabric * BCE(fabric_mask, pseudo_fabric)
+      + w_fold   * BCE(fold_band,   pseudo_fold)
+      + w_global * BCE(global_logit, pseudo_global)
+```
+
+总损失：`L_det + 0.5·L_ctx`（`foreground.loss_weight`）。
+正常折入图没有框 → `defect_fg` 全 0 是显式负样本；
+大缺陷在框内 → `defect_fg` 高，折入带衰减被 `(1-defect_fg)` 自动抵消。
+
+---
+
+## 5. 融合门与安全网（`jingwei/fusion.py`）
+
+`context (1,3,G,G)` 在 `fuse_detections()` 中被 resize 到 anomaly 网格：
+
+| 通道 | 新语义 | 安全网用途 |
+|---|---|---|
+| 0 | `defect_fg` | 高 → 真缺陷，不被折入抑制 |
+| 1 | `fabric_mask` | 低于 `fabric_mask_thresh` 的区域占比过高 → 背景，跳过 |
+| 2 | `fold_band` | **动态**折入/边界带；与低 `defect_fg` 联合判为正常折入 |
+
+判定逻辑（简化）：
+
+```python
+if valid_frac < min_fabric_frac:
+    continue                                  # 背景
+fold_like = (fold_frac > fold_band_thresh
+             and fg_frac < defect_fg_thresh)
+if fold_like and peak < fold_peak_override:
+    continue                                  # 正常折入，不报
+# 否则：大缺陷照常输出 / 提升已有框
+```
+
+`use_aspect_cue` 默认 **false**——长宽比只是可选辅助，主判据是学习到的
+`fold_band + defect_fg`。`fold_aspect_ratio` 保留为兼容/调试项，不再是核心。
+
+---
+
+## 6. 配置（三个变体统一）
 
 ```yaml
 foreground:
   enabled: true
-  hidden: 32                  # 缺陷前景头隐层通道
-  edge_band_px: 64            # 布边内侧折入带宽度（像素）
-  edge_attenuation: 0.80      # 折入带内异常衰减强度
-  texture_thresh: 0.20        # 纹理能量→布幅掩膜阈值
+  mode: local_global_attention
+  hidden: 24/32/48
+  attention_dim: 64
+  attention_heads: 4
+  attention_blocks: 2
+  boundary_kernel: 5        # 仅平滑训练伪标签
+  fold_attenuation: 0.80
+  texture_thresh: 0.20
   slope: 30.0
-  target_shrink: 0.08         # YOLO 框内缩后作前景正样本
+  target_shrink: 0.08
   pos_weight: 5.0
   loss_weight: 0.5
+  fabric_loss_weight: 1.0
+  fold_loss_weight: 0.5
+  global_loss_weight: 0.2
   fabric_mask_thresh: 0.30
-  edge_band_thresh: 0.08
+  fold_band_thresh: 0.08
   defect_fg_thresh: 0.25
   min_fabric_frac: 0.50
+  use_aspect_cue: false
   fold_aspect_ratio: 3.0
-  edge_peak_override: 0.80
+  fold_peak_override: 0.80
 ```
 
-调参建议：
+已删除/弃用：`edge_band_px`、`edge_attenuation`、`edge_band_thresh`、
+`edge_peak_override`。`fusion.py` 仍兼容读取旧键名作为 fallback，但新配置
+不应再依赖它们。`fold_band` 的位置由网络预测，与这些像素常量无关。
 
-- 误报仍多 → 提高 `edge_attenuation` / `edge_band_px` / `min_fabric_frac`；
-- 真实边缘小缺陷被压 → 降低 `edge_attenuation`，或提升 `defect_fg` 训练
-  （增大 `loss_weight`、加更多带框边缘缺陷样本）；
-- 布幅背景与布面纹理接近 → 调 `texture_thresh` / `slope`；
-- 极端强反光被误当背景 → 检查 `LocalContrastNorm` 和 `normaltrain` 覆盖。
+---
 
-## 7. 部署与实时性
+## 7. ONNX / TensorRT
 
-ONNX / TensorRT 图新增 `context` 输出，但全部是静态形状、静态算子：
+`context` 仍是第 8 个输出（与旧版形状完全一致），所以部署代码不需要改：
 
+| 变体 | context 形状 | 说明 |
+|---|---|---|
+| `jingwei_p` | `(1,3,128,128)` | pico 网格 |
+| `jingwei_n/s` | `(1,3,160,160)` | N/S 网格 |
+
+导出前 `strip_train_only()` 只删除 o2m / fg-align 训练分支，
+**保留整个注意力前景头**。全局注意力在 stride-32 token 上用
+`LinearAttention2`，无动态 shape、无 `NonZero`、无 ROI 变长循环，
+onnx.checker 与 pico/N 导出均通过。
+
+实测计算量（`tools/benchmark.py --all`，1280²）：
+`jingwei_p` 2.93 M / 8.09 G MACs（注意力 0.12 G）、
+`jingwei_n` 6.36 M / 16.62 G（0.21 G）、
+`jingwei_s` 11.48 M / 34.11 G（0.26 G）。
+相比旧固定边缘带版本，注意力头没有增加总延迟预算。
+
+---
+
+## 8. 与旧版对比（回归）
+
+| 测试 | 旧版 | 新版 |
+|---|---|---|
+| 大块未知异常 | ✅ 输出 `未知异常`（面积兜底） | ✅ 不变 |
+| 已有框叠加异常 | ✅ 提分不重复框 | ✅ 不变 |
+| 正常低异常 | ✅ 不加框 | ✅ 不变 |
+| 正常折入长条 | 固定边缘带抑制 | ✅ 动态 `fold_band` 抑制，布幅移位仍有效 |
+| 布幅移到图像中部 | ❌ 固定带失效 | ✅ 全局 token 跟随 |
+| 真实边缘缺陷 | ✅ `defect_fg`/峰值 override 保留 | ✅ 不变 |
+| 背景经编纹理 | 可能被当布面 | ✅ `fabric_mask` + 全局先验联合抑制 |
+
+---
+
+## 9. 验证
+
+```bash
+/home/user/.venv/bin/python -m unittest discover -s tests -v
+/home/user/.venv/bin/python tools/export.py --cfg configs/jingwei_p.yaml --out runs/export/p.onnx
+/home/user/.venv/bin/python tools/export.py --cfg configs/jingwei_n.yaml --out runs/export/n.onnx
 ```
-cls3 (1,19,160,160)   reg3 (1,4,160,160)   obj3 (1,1,160,160)
-cls5 (1,19,40,40)     reg5 (1,4,40,40)     obj5 (1,1,40,40)
-anomaly (1,1,G,G)     context (1,3,G,G)   # pico: 8 outputs total
-[+ n3/n5 when roi_head=true]              # n/s: 10 outputs total
-```
 
-`postprocess_from_tensors` 会解析 `context` 并传给融合/安全网。
-`tools/calibrate_fusion.py` 在阶段 D 标定阈值时也会缓存并传入 context，
-因此阈值搜索与部署行为一致。
+- `test_22`：验证 `build_fabric_context_targets()` 在布幅平移时输出
+  动态 `fabric_mask / fold_band / global_target`，且 `fold_band` 跟随布边
+  而非固定图像边缘；
+- `test_29`：验证 `LocalGlobalForegroundAttention` 的局部+全局双分支、
+  动态 FiLM、context 形状、损失与梯度；
+- `test_23`：端到端大缺陷 / 正常折入 / 边缘真缺陷 / 大兜底回归；
+- 全套 **29 项单元测试通过**，compileall / ONNX checker / pico+N 导出通过。
 
-新增开销（实测 MAC counter）：
+---
 
-| 变体 | 原 MACs | 含前景上下文 | 增量 |
-|---|---:|---:|---:|
-| jingwei_p | 7.59 G | **8.42 G** | +0.83 G |
-| jingwei_n | 15.65 G | **17.12 G** | +1.47 G |
-| jingwei_s | 32.48 G | **35.80 G** | +3.32 G |
+## 10. 仍需注意
 
-1660S 上 `jingwei_p` 估算仍约 **48–74 FPS**（FP32 TRT 模型），
-仍在实时范围内；最终以 `tools/bench_device.py` 实测为准。
-
-## 8. 已验证
-
-- `test_22`：合成布幅 + 折入图，`fabric_mask` 正确区分布面/背景，
-  `edge_band` 只出现在布边内侧；
-- `test_23`：安全网拒绝正常折入，但保留中央大缺陷和高前景的边缘缺陷；
-- 28 项单元测试全过（含中文 / Unicode 路径 / 非方形布幅图 / 训练日志 / 断点续训 / numpy RNG 回归）；ONNX 导出 8 个静态输出（pico）通过 `onnx.checker`；
-- `train_detector.py` 训练图中新增 `fg_context` 损失，反向传播有限。
-
-## 9. 边界
-
-- `fabric_mask` 是**无参数启发式**，不是像素级分割 GT；极端背景（例如和布纹
-  同样高频的网带）需要调阈值或补充真实布幅掩膜训练。
-- `defect_fg` 是弱监督（框级）训练，不是精细分割；它的作用只是给安全网一个
-  「这里像不像真缺陷」的二验信号，不替代 19 类分类头。
-- 若折入本身就伴随真实疵点（折入处断纱等），必须靠 `defect_fg` 或
-  `edge_peak_override` 放行；建议在这类样本上专门做 A/B 验证。
+1. 伪目标来自织纹能量，对**极高对比的金属/经编背景**可能不稳定；若现场
+   背景固定，建议补少量（50~200 张）布幅 mask 标注做微调，效果会明显提升。
+2. `fold_peak_override=0.80` 是安全网硬保底：峰值超过它**一定报**，
+   避免 attention 把大缺陷误判成折入。调低会更严格，调高会更依赖学习。
+3. stage 0 蒸馏与 normality 记忆库不用前景头；只有 detector / 融合门用。
+4. 注意力 token 数固定为 40×40+1（1280 输入）。若改 `img_size`，token 数
+   会变但仍全静态；需重新导出 ONNX / TensorRT 引擎。
+5. 旧 `edge_band_px` / `edge_attenuation` 配置键已从三个 yaml 移除；
+   `DefectForegroundHead` 仍作为 `LocalGlobalForegroundAttention` 的兼容别名保留，
+   `foreground_context_loss()` 是当前 `FabricContext.loss()` 实际调用的损失实现。
+   `model.py` 不再调用旧的 `foreground_loss()` / `estimate_fabric_context()`。

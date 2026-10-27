@@ -70,7 +70,7 @@ def main():
                   f"(1,1,{G},{G})"]
     if model.foreground is not None:
         names += ["context"]
-        shape_note += [f"(1,3,{G},{G}) = [defect_fg, fabric_mask, edge_band]"]
+        shape_note += [f"(1,3,{G},{G}) = [defect_fg, fabric_mask, fold_band]"]
     if wrapper.return_feats:
         names += ["n3", "n5"]
         shape_note += ["(1,96,160,160)", "(1,384,40,40)"]

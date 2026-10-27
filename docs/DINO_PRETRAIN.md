@@ -28,7 +28,7 @@ Dinomaly 原版也正是用冻结 DINOv2 特征做异常检测。
 | **离线 teacher + 在线轻量 student 蒸馏** | 接近前者的特征质量 | ✅ 推理图不变 | **采用** |
 
 关键：**teacher 只在训练机上跑一次/每个 epoch 跑，导出 ONNX/TRT 时完全不存在**。
-加入前景/折入上下文后 `jingwei_p` 为 2.87 M / 8.42 G MACs、`jingwei_n` 为 6.32 M / 17.12 G MACs，
+加入局部+全局注意力前景上下文后 `jingwei_p` 为 2.93 M / 8.09 G MACs、`jingwei_n` 为 6.36 M / 16.62 G MACs，
 ONNX 输出张量数量、形状全部不变。
 
 ```
@@ -125,8 +125,8 @@ python tools/pretrain_dino.py --smoke 4 --iters 2 --cfg configs/jingwei_p.yaml
 # 用合成织纹 + synthetic teacher 跑通完整蒸馏循环，不下载任何权重
 ```
 
-单元测试 `tests/test_model.py::test_20/21`（另见 `test_22/23` 前景/折入）覆盖同一路径：
-`python -m unittest discover -s tests -v` 应输出 `OK (28 tests)`（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG 回归）。
+单元测试 `tests/test_model.py::test_20/21`（另见 `test_22/23/29` 动态局部+全局注意力前景/折入）覆盖同一路径：
+`python -m unittest discover -s tests -v` 应输出 `OK (29 tests)`（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态注意力前景）。
 本地 teacher 权重与 checkpoint 统一通过 `jingwei.utils.torch_load` 读取，默认
 `weights_only=True`，不再触发 PyTorch 2.6+ 的 `FutureWarning`。
 阶段 0 启动即打印 teacher / 数据 / device / 参数量，并按

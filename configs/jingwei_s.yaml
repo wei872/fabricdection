@@ -103,20 +103,28 @@ dino:
 # 前景/背景 + 布幅边缘折入抑制
 foreground:
   enabled: true
-  hidden: 48
-  edge_band_px: 64
-  edge_attenuation: 0.80
-  texture_thresh: 0.20
+  mode: local_global_attention
+  hidden: 48                    # local conv branch channels
+  attention_dim: 64             # global token dim (LinearAttention2)
+  attention_heads: 4
+  attention_blocks: 2
+  boundary_kernel: 5            # ONLY smooths training pseudo labels, not deployed
+  fold_attenuation: 0.80        # dynamic fold_band attenuation (no fixed edge pixels)
+  texture_thresh: 0.20          # weave-energy -> pseudo fabric_mask
   slope: 30.0
   target_shrink: 0.08
   pos_weight: 5.0
   loss_weight: 0.5
+  fabric_loss_weight: 1.0
+  fold_loss_weight: 0.5
+  global_loss_weight: 0.2
   fabric_mask_thresh: 0.30
-  edge_band_thresh: 0.08
+  fold_band_thresh: 0.08
   defect_fg_thresh: 0.25
   min_fabric_frac: 0.50
-  fold_aspect_ratio: 3.0
-  edge_peak_override: 0.80
+  use_aspect_cue: false         # primary cue is learned fold_band, not shape heuristic
+  fold_aspect_ratio: 3.0        # optional secondary cue
+  fold_peak_override: 0.80
 
 deploy:
   half: true

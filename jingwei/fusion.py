@@ -98,9 +98,11 @@ def safety_net_numpy(anomaly: np.ndarray, boxes: np.ndarray, scores: np.ndarray,
         boxes:   (N, 4) xyxy pixels
         scores:  (N,) float
         labels:  (N,) int
-        context: (3, G, G) = [defect_fg, fabric_mask, edge_band], or None.
-                 Lets the net reject non-fabric background and normal fold-in
-                 at the cloth edge without losing real edge defects.
+        context: (3, G, G) = [defect_fg, fabric_mask, fold_band], or None.
+                 Learned local+global attention maps.  ``fold_band`` follows the
+                 predicted cloth boundary (not fixed image-border pixels), so a
+                 moving 布幅 / normal fold-in is rejected as background while
+                 real edge defects (high defect_fg / high peak) still survive.
     """
     import cv2
 
@@ -112,17 +114,20 @@ def safety_net_numpy(anomaly: np.ndarray, boxes: np.ndarray, scores: np.ndarray,
     if context is None:
         defect_fg = np.ones_like(anomaly, np.float32)
         fabric_mask = np.ones_like(anomaly, np.float32)
-        edge_band = np.zeros_like(anomaly, np.float32)
+        fold_band = np.zeros_like(anomaly, np.float32)
     else:
-        defect_fg, fabric_mask, edge_band = (np.asarray(context[0], np.float32),
+        defect_fg, fabric_mask, fold_band = (np.asarray(context[0], np.float32),
                                              np.asarray(context[1], np.float32),
                                              np.asarray(context[2], np.float32))
     fabric_thresh = float(fcfg.get("fabric_mask_thresh", 0.30))
-    edge_thresh = float(fcfg.get("edge_band_thresh", 0.08))
+    fold_thresh = float(fcfg.get("fold_band_thresh",
+                                 fcfg.get("edge_band_thresh", 0.08)))
     fg_thresh = float(fcfg.get("defect_fg_thresh", 0.25))
     min_fabric_frac = float(fcfg.get("min_fabric_frac", 0.50))
     fold_aspect = float(fcfg.get("fold_aspect_ratio", 3.0))
-    edge_peak_override = float(fcfg.get("edge_peak_override", 0.80))
+    use_aspect_cue = bool(fcfg.get("use_aspect_cue", False))
+    fold_peak_override = float(fcfg.get("fold_peak_override",
+                                        fcfg.get("edge_peak_override", 0.80)))
     mask = (anomaly >= float(f.anomaly_thresh)).astype(np.uint8)
 
     # dilate slightly to connect fragmented elongated defects (断纬 / 稀缝)
@@ -148,16 +153,19 @@ def safety_net_numpy(anomaly: np.ndarray, boxes: np.ndarray, scores: np.ndarray,
 
         # ---- foreground context: reject background / normal edge fold-in ----
         valid_frac = float((fabric_mask[region_mask] >= fabric_thresh).mean())
-        edge_frac = float((edge_band[region_mask] >= edge_thresh).mean())
+        fold_frac = float((fold_band[region_mask] >= fold_thresh).mean())
         fg_frac = float((defect_fg[region_mask] >= fg_thresh).mean())
         if valid_frac < min_fabric_frac:
             continue                              # outside the cloth / 背景
         aspect = max(w, h) / max(1, min(w, h))
-        fold_like = (edge_frac > edge_thresh and aspect >= fold_aspect
-                     and fg_frac < fg_thresh)
+        # Primary decision is the LEARNED dynamic fold_band + defect_fg.
+        # The old aspect-ratio heuristic is optional and off by default.
+        fold_like = (fold_frac > fold_thresh and fg_frac < fg_thresh)
+        if use_aspect_cue:
+            fold_like = fold_like and aspect >= fold_aspect
         # A real edge defect survives if the learned foreground says so, or if
         # the anomaly peak is simply too strong to be a normal fold shadow.
-        if fold_like and peak < edge_peak_override:
+        if fold_like and peak < fold_peak_override:
             continue
 
         # component bbox -> pixel coords, with a small margin
@@ -205,8 +213,9 @@ def fuse_detections(det: dict, anomaly: torch.Tensor, img_size, cfg,
                     context=None) -> dict:
     """Torch wrapper around :func:`safety_net_numpy` (+ optional ROI refiner).
 
-    ``context`` is (1,3,G,G) = [defect_fg, fabric_mask, edge_band] from the
-    deployed foreground head; it is what suppresses normal edge fold-in.
+    ``context`` is (1,3,G,G) = [defect_fg, fabric_mask, fold_band] from the
+    deployed local+global attention head; it is what suppresses background and
+    normal edge fold-in without assuming fixed image-border pixels.
     """
     device = det["boxes"].device
     a = anomaly[0, 0].detach().cpu().numpy().astype(np.float32)

@@ -29,8 +29,7 @@ import torch.nn as nn
 
 from .backbone import WeaveCSP
 from .config import Cfg, load_config
-from .foreground import (FabricContext, build_foreground_target,
-                         foreground_loss)
+from .foreground import FabricContext, build_foreground_target
 from .fusion import ROIRefiner, fuse_detections
 from .head import NMSFreeDetect
 from .losses import DetectionLoss, HardMiningCosineLoss
@@ -87,23 +86,32 @@ class JingWei(nn.Module):
                     rec = self.rec_loss(nrm["target"], nrm["reconstructed"], it)
                     losses["rec"] = rec
                     losses["total"] = losses["total"] + self.rec_weight * rec
-            # Weakly-supervised defect-foreground head: boxes are positive,
-            # normal images / normal fold-in are explicit negatives.
+            # Weakly-supervised LOCAL + GLOBAL attention foreground context:
+            # YOLO boxes supervise defect_fg; per-frame dynamic pseudo targets
+            # supervise fabric_mask / fold_band / global cloth prior.  Normal
+            # fold-in has no boxes, so it is an explicit negative for defect_fg.
             if self.foreground is not None and targets is not None:
-                _, defect_fg = self.foreground.context_only(x, feats)
+                parts = self.foreground.forward_parts(feats)
                 tgt_fg = build_foreground_target(
                     targets, self.img_size, self.foreground.out_grid,
                     x.device, x.dtype,
                     shrink=float(self.cfg.foreground.target_shrink))
-                fgl = foreground_loss(
-                    defect_fg, tgt_fg,
-                    pos_weight=float(self.cfg.foreground.pos_weight))
+                tgt_fabric, tgt_fold, tgt_global = self.foreground.build_targets(
+                    x, tgt_fg)
+                fgl, fgl_parts = self.foreground.loss(
+                    parts, tgt_fg, tgt_fabric, tgt_fold, tgt_global)
                 if losses is None:
                     losses = {"total": fgl * self.fg_loss_weight}
                 else:
                     losses["fg_context"] = fgl
+                    losses["fg_defect"] = fgl_parts["defect"]
+                    losses["fg_fabric"] = fgl_parts["fabric"]
+                    losses["fg_fold"] = fgl_parts["fold"]
+                    losses["fg_global"] = fgl_parts["global"]
                     losses["total"] = losses["total"] + self.fg_loss_weight * fgl
-                out["foreground"] = defect_fg
+                out["foreground"] = parts["defect_fg"]
+                out["fabric_mask"] = parts["fabric_mask"]
+                out["fold_band"] = parts["fold_band"]
             if losses is not None:
                 out["losses"] = losses
             return out
@@ -146,8 +154,10 @@ class JingWei(nn.Module):
 
         ``decode`` + the connected-component safety net run OUTSIDE the graph
         via :meth:`postprocess_from_tensors`. With ``foreground.enabled`` an
-        8th tensor ``context (1,3,G,G) = [defect_fg, fabric_mask, edge_band]``
-        is exported. When ``roi_head`` is enabled n3/n5 are appended last.
+        8th tensor ``context (1,3,G,G) = [defect_fg, fabric_mask, fold_band]``
+        is exported.  All three maps come from the local+global attention
+        context head; ``fold_band`` is dynamic, not a fixed pixel edge strip.
+        When ``roi_head`` is enabled n3/n5 are appended last.
 
         Returns: cls3, reg3, obj3, cls5, reg5, obj5, anomaly [, context]
                  [, n3, n5]
@@ -175,7 +185,8 @@ class JingWei(nn.Module):
         """Graph-external decode + safety net (+ optional ROI refiner).
 
         Counterpart of :meth:`export_forward`.  The optional ``context`` tensor
-        is what lets the safety net reject background and normal edge fold-in.
+        (learned local+global attention maps) is what lets the safety net reject
+        background and normal edge fold-in without fixed image-border pixels.
         """
         cls3, reg3, obj3, cls5, reg5, obj5, anomaly = outs[:7]
         idx = 7
@@ -206,7 +217,8 @@ class JingWei(nn.Module):
     def strip_train_only(self):
         """Remove o2m / train-only fg-alignment branches before export.
 
-        The deployed ``FabricContext`` foreground head is deliberately kept.
+        The deployed ``FabricContext`` local+global attention head is
+        deliberately kept; it is part of the inference graph.
         """
         for h in self.head.heads:
             h.obj_pred = None

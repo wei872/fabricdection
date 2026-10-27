@@ -8,7 +8,8 @@ No pytest / no GPU / no real data needed. It checks shapes at the required
 1280x1280 input, trainability, the deterministic safety net, fabric-type
 invariance, memory-bank algebra, the dataset readers, Chinese / Unicode
 file paths, non-square fabric augmentation, training progress logs,
-full checkpoint resume, and numpy RNG state checkpointing (28 tests).
+full checkpoint resume, numpy RNG state checkpointing, and dynamic
+local+global attention foreground context (29 tests).
 """
 from __future__ import annotations
 
@@ -383,25 +384,64 @@ class TestModel(unittest.TestCase):
             self.assertIn("model", state)
 
     # ------------------------------------------------ foreground / edge fold-in
-    def test_22_foreground_context_estimation(self):
-        """Per-frame cloth mask follows 布幅; edge band marks normal fold-in."""
-        from jingwei.foreground import estimate_fabric_context
+    def test_22_dynamic_foreground_context_targets(self):
+        """Dynamic fabric/fold targets follow moving 布幅, not fixed image edges."""
+        from jingwei.foreground import build_fabric_context_targets
 
-        G, H, W = 160, 1280, 1280
-        yy, xx = np.mgrid[0:H, 0:W]
-        weave = (np.sin(2 * np.pi * xx / 7) * np.sin(2 * np.pi * yy / 11)) * 0.25 + 0.5
-        img = np.ones((H, W, 3), np.float32) * 0.5
-        fabric = np.zeros((H, W), np.float32)
-        fabric[:, 200:1080] = 1.0
-        img = img * (1 - fabric[..., None]) + (0.45 + 0.2 * weave[..., None]) * fabric[..., None]
-        img[:, 205:250] *= 0.35                       # normal fold-in shadow
-        x = torch.from_numpy(img.transpose(2, 0, 1)).float()[None]
-        fm, eb = estimate_fabric_context(x, G, band_cells=8.0)  # 64px @1280/160
-        fm, eb = fm[0, 0].numpy(), eb[0, 0].numpy()
-        self.assertGreater(fm[:, 100:140].mean(), 0.5, "cloth centre is fabric")
-        self.assertLess(fm[:, :20].mean(), 0.2, "outside web is background")
-        self.assertGreater(eb[:, 25:40].mean(), 0.15, "fold-in band detected")
-        self.assertLess(eb[:, 70:90].mean(), 0.05, "cloth centre is not edge")
+        G, size = 128, 320
+
+        def make(shift, fold=False):
+            yy, xx = np.mgrid[0:size, 0:size]
+            weave = ((np.sin(2 * np.pi * xx / 7) *
+                      np.sin(2 * np.pi * yy / 11)) * 0.25 + 0.5)
+            bg = np.ones((size, size, 3), np.float32) * 0.5
+            cloth_img = (0.35 + 0.3 * weave[..., None]).astype(np.float32)
+            fabric = np.zeros((size, size), np.float32)
+            fabric[:, shift:shift + 180] = 1.0
+            img = (bg * (1 - fabric[..., None]) +
+                   cloth_img * fabric[..., None])
+            if fold:
+                img[:, shift:shift + 20] *= 0.4     # normal fold-in shadow
+            img = np.clip(img, 0.0, 1.0)
+            return torch.from_numpy(img.transpose(2, 0, 1)).float()[None]
+
+        fm1, fb1, g1 = build_fabric_context_targets(make(30), G)
+        fm2, fb2, g2 = build_fabric_context_targets(make(120, fold=True), G)
+        fm1, fb1, fm2, fb2 = (t[0, 0].numpy()
+                              for t in (fm1, fb1, fm2, fb2))
+        self.assertEqual(fm1.shape, (G, G))
+        self.assertEqual(fb1.shape, (G, G))
+        self.assertEqual(fm2.shape, (G, G))
+        self.assertEqual(fb2.shape, (G, G))
+
+        c1a, c1b = 30 * G // size, (30 + 180) * G // size
+        c2a, c2b = 120 * G // size, (120 + 180) * G // size
+        self.assertGreater(fm1[:, c1a + 10:c1b - 10].mean(),
+                           fm1[:, :max(1, c1a - 5)].mean(),
+                           "cloth region must be fabric in shifted image 1")
+        self.assertGreater(fm2[:, c2a + 20:c2b - 10].mean(),
+                           fm2[:, :max(1, c2a - 5)].mean(),
+                           "cloth region must be fabric in shifted image 2")
+        self.assertFalse(np.allclose(fm1, fm2, atol=0.1),
+                         "fabric target must move with 布幅, not be static")
+
+        # fold_band peak must be near a learned cloth boundary (c2a), and
+        # must NOT be pinned to the left image border.
+        peak2 = int(fb2.mean(axis=0).argmax())
+        self.assertLess(abs(peak2 - c2a), 10,
+                        "dynamic fold band should follow shifted cloth edge")
+        self.assertGreater(fb2[:, max(0, peak2 - 2):peak2 + 3].mean(),
+                           fb2[:, :5].mean(),
+                           "fold band at cloth boundary > fixed image border")
+        peak1 = int(fb1.mean(axis=0).argmax())
+        self.assertGreater(fb1[:, max(0, peak1 - 2):peak1 + 3].mean(),
+                           fb1[:, :5].mean(),
+                           "fold band follows cloth edge in image 1 too")
+
+        self.assertNotAlmostEqual(float(g1), float(g2), places=3,
+                                  msg="global cloth prior changes with 布幅")
+        self.assertGreaterEqual(float(g1), 0.0)
+        self.assertLessEqual(float(g2), 1.0)
 
     def test_23_safety_net_rejects_fold_keeps_real_defect(self):
         """Fold-like edge component is suppressed; centre/foreground defects survive."""
@@ -409,8 +449,8 @@ class TestModel(unittest.TestCase):
         cfg = load_config(CFG_N)
         ctx = np.zeros((3, G, G), np.float32)
         ctx[1, :, 20:140] = 1.0            # fabric_mask
-        ctx[2, :, 20:30] = 0.8            # left edge_band
-        ctx[2, :, 130:140] = 0.8          # right edge_band
+        ctx[2, :, 20:30] = 0.8            # learned dynamic left fold_band
+        ctx[2, :, 130:140] = 0.8          # learned dynamic right fold_band
 
         empty_b = np.zeros((0, 4), np.float32)
         empty_s = np.zeros(0, np.float32)
@@ -802,6 +842,71 @@ class TestModel(unittest.TestCase):
             expected = [ds.rng.random() for _ in range(5)]
             restore_rng_state(loaded, ds)
             self.assertEqual([ds.rng.random() for _ in range(5)], expected)
+
+    # ------------------------------------------- local + global attention fg context
+    def test_29_local_global_attention_foreground(self):
+        """Learned fg context has local+global branches, dynamic FiLM and loss."""
+        from jingwei.foreground import FabricContext
+        from jingwei.normality import LinearAttention2
+
+        torch.manual_seed(0)
+        cfg = load_config(CFG_P)
+        self.assertEqual(str(cfg.foreground.mode), "local_global_attention")
+        ctx = FabricContext(cfg, channels=(16, 32, 64, 128))
+        G = int(cfg.normality.out_grid)
+        feats = {"n3": torch.randn(1, 32, 160, 160),
+                 "n5": torch.randn(1, 128, 40, 40)}
+
+        # global branch really is LinearAttention2 (Dinomaly ELU+1).
+        self.assertIsInstance(ctx.attention.blocks[0].attn, LinearAttention2)
+        self.assertEqual(len(ctx.attention.blocks),
+                         int(cfg.foreground.attention_blocks))
+        self.assertEqual(tuple(ctx.attention.cls_token.shape),
+                         (1, 1, int(cfg.foreground.attention_dim)))
+
+        parts = ctx.forward_parts(feats)
+        self.assertEqual(tuple(parts["context"].shape), (1, 3, G, G))
+        self.assertEqual(tuple(parts["defect_fg"].shape), (1, 1, G, G))
+        self.assertEqual(tuple(parts["fabric_mask"].shape), (1, 1, G, G))
+        self.assertEqual(tuple(parts["fold_band"].shape), (1, 1, G, G))
+        self.assertEqual(tuple(parts["global_logit"].shape), (1, 1))
+        self.assertTrue(torch.equal(parts["context"][:, 2:3],
+                                    parts["fold_band"]))
+        self.assertTrue(torch.isfinite(parts["context"]).all())
+
+        # Inference context depends on FEATURES, not on raw RGB / fixed borders:
+        # same feats + different image -> identical context.
+        x1 = torch.rand(1, 3, 1280, 1280)
+        x2 = torch.rand(1, 3, 1280, 1280)
+        anomaly = torch.rand(1, 1, G, G)
+        eff1, c1, _ = ctx.forward(x1, feats, anomaly)
+        _, c2, _ = ctx.forward(x2, feats, anomaly)
+        self.assertTrue(torch.allclose(c1, c2))
+        self.assertEqual(tuple(eff1.shape), (1, 1, G, G))
+        self.assertLessEqual(float(eff1.max()), float(anomaly.max()) + 1e-6)
+        feats2 = {"n3": torch.randn(1, 32, 160, 160) * 0.5 + 1.0,
+                  "n5": torch.randn(1, 128, 40, 40) * 0.5 - 1.0}
+        c3 = ctx.forward_parts(feats2)["context"]
+        self.assertFalse(torch.allclose(c1, c3, atol=1e-3),
+                         "context must respond to local/global feature changes")
+
+        # Training loss is finite and reaches BOTH local and global parameters.
+        tgt_fg = torch.zeros(1, 1, G, G)
+        tgt_fg[..., 40:80, 40:80] = 1.0
+        tgt_fabric, tgt_fold, tgt_global = ctx.build_targets(x1, tgt_fg)
+        loss, loss_parts = ctx.loss(parts, tgt_fg, tgt_fabric,
+                                    tgt_fold, tgt_global)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(set(loss_parts),
+                         {"defect", "fabric", "fold", "global"})
+        loss.backward()
+        named = dict(ctx.named_parameters())
+        for key in ("attention.blocks.0.attn.qkv.weight",
+                    "attention.cls_token",
+                    "attention.local.0.weight",
+                    "attention.fg_head.weight"):
+            self.assertIsNotNone(named[key].grad, key)
+            self.assertTrue(torch.isfinite(named[key].grad).all(), key)
 
 
 if __name__ == "__main__":
