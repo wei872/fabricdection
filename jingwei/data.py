@@ -56,6 +56,10 @@ def fabric_photometric(img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     经纬密 (density): handled by anisotropic resize in the geometric aug
     """
     x = img.astype(np.float32) / 255.0
+    if x.ndim == 2:
+        x = np.repeat(x[:, :, None], 3, axis=2)
+    elif x.shape[2] == 1:
+        x = np.repeat(x, 3, axis=2)
     h, w = x.shape[:2]
 
     # global exposure / contrast
@@ -64,9 +68,14 @@ def fabric_photometric(img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     # smooth illumination field (反光)
     if rng.random() < 0.5:
         gh, gw = max(2, h // 16), max(2, w // 16)
-        field = rng.normal(0, 1, (gh, gw, 1)).astype(np.float32)
+        field = rng.normal(0, 1, (gh, gw)).astype(np.float32)
         field = cv2.resize(field, (w, h), interpolation=cv2.INTER_CUBIC)
         field = cv2.GaussianBlur(field, (0, 0), sigmaX=max(4, w / 12))
+        # OpenCV squeezes a single-channel (H, W, 1) array to (H, W).
+        # Restore the channel axis so it broadcasts against RGB (H, W, 3),
+        # including long non-square fabric frames such as 1040x2448.
+        if field.ndim == 2:
+            field = field[:, :, None]
         x = np.clip(x * (1.0 + 0.18 * field), 0, 1)
 
     # yarn width: mild blur or sharpen

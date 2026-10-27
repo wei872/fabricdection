@@ -40,6 +40,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .utils import torch_load
+
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
@@ -119,7 +121,7 @@ def load_teacher(name: str, repo: str | None = None, weights: str | None = None,
                 # DINOv1 hub functions do not accept a `weights=` kwarg.
                 model = torch.hub.load(hub_repo, name, source=source,
                                        pretrained=False)
-                sd = torch.load(str(weights), map_location="cpu")
+                sd = torch_load(str(weights), map_location="cpu")
                 sd = {k.replace("module.", ""): v for k, v in sd.items()}
                 model.load_state_dict(sd, strict=False)
             else:

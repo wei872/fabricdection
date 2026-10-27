@@ -25,7 +25,7 @@
 
 **已验证**（见 §13）：参考实现在 1280×1280 下 n 变体 **6.32 M 参数 / 17.12 G MACs**，
 无 Tensor Core 卡专用的 pico 变体 **2.87 M / 8.42 G MACs**，
-24 项单元测试全过（含中文 / Unicode 路径回归），ONNX 导出成功且输出全为静态形状。
+25 项单元测试全过（含中文 / Unicode 路径 / 非方形图回归），ONNX 导出成功且输出全为静态形状。
 
 > ⚠️ **诚实声明**：仓库里目前只有 `dataset/dataset.yaml`（路径指向你本机的
 > `D:/tyhn/yolo/...`），**没有真实图片**。因此本文所有的精度数字都是**设计目标 / 验收指标**，
@@ -728,11 +728,12 @@ jingwei/
   data.py        YOLO 数据集 / 纯正常图集 / 布种 / 折入增广 → §6
   foreground.py 布幅掩膜 / 边缘折入带 / 缺陷前景头 → §5.8
   image_io.py   中文/Unicode 安全的图像与视频 I/O → §12.5
+  utils.py      框工具 / MACs profiler / 安全 torch_load（weights_only=True）
   dino.py       阶段 0 DINOv2 离线 teacher 工具
   model.py       JingWei 顶层（训练 / 推理 / 导出）
 tools/           阶段 0 + A–E 的 CLI（pretrain_dino / train / build / calibrate /
                  evaluate / predict / export / benchmark / bench_device）
-tests/test_model.py  24 项单元测试（含中文路径回归）
+tests/test_model.py  25 项单元测试（含中文路径 / 非方形图回归）
 docs/DESIGN.md   本文
 docs/TRAINING.md 训练与数据准备手册
 docs/DEPLOYMENT.md 实时部署手册
@@ -794,6 +795,20 @@ OpenCV 构建的 `cv2.imread` / `cv2.imwrite` / `cv2.VideoCapture` 接收窄字�
 `VideoCaptureUnicode` / `predict.py` 图片与视频端到端；`test_14` 另覆盖
 中文 YOLO 标签文件名。所有工具都不再直接调用 `cv2.imread` / `cv2.imwrite`。
 
+### 12.6 非方形布幅图与 checkpoint 加载
+
+产线相机常输出 `1040×2448` 这类长条非方形帧。`fabric_photometric` 里的
+反光场是单通道低频图，经 `cv2.resize` / `GaussianBlur` 后 OpenCV 会把
+`(H, W, 1)` 压成 `(H, W)`；旧代码直接用它与 `(H, W, 3)` 相乘，触发
+`ValueError: operands could not be broadcast together`。现在在相乘前显式
+补回 `field[:, :, None]`，并把灰度/单通道输入统一扩成 3 通道；`test_25`
+同时覆盖直接增广调用和 `YOLODefectDataset(augment=True)` 全路径。
+
+PyTorch 2.6+ 对 `torch.load` 默认 `weights_only=False` 会发 `FutureWarning`。
+所有 checkpoint 读取统一走 `jingwei.utils.torch_load`，默认
+`weights_only=True`；若第三方 DINOv1 权重里含 `argparse.Namespace` 等对象，
+则回退到 `weights_only=False` 并给出 `RuntimeWarning`（仅加载可信文件）。
+
 ---
 
 ## 13. 已验证结果（实测，非目标值）
@@ -801,11 +816,12 @@ OpenCV 构建的 `cv2.imread` / `cv2.imwrite` / `cv2.VideoCapture` 接收窄字�
 执行 `python -m unittest discover -s tests -v`（CPU 即可，无需数据/GPU）：
 
 ```
-Ran 24 tests in ~55 s — OK
+Ran 25 tests in ~55 s — OK
 
   params = 6.32 M        MACs @1280 = 17.12 G   (jingwei_n)
   pico   = 2.87 M        MACs @1280 =  8.42 G   (jingwei_p)
   Chinese/Unicode image, folder, video and .npz paths = OK
+  non-square 1040x2448-like fabric frame augmentation = OK
 ```
 
 覆盖内容：
@@ -836,6 +852,7 @@ Ran 24 tests in ~55 s — OK
 | 22 | 前景上下文：逐帧布幅掩膜 + 边缘折入带估计 |
 | 23 | 安全网拒绝正常折入，但保留中央大缺陷与高前景边缘缺陷 |
 | 24 | **中文 / Unicode 图片、目录、视频、`.npz` 原型路径 + `predict.py` 端到端** |
+| 25 | **非方形 / 长条布幅图（如 1040×2448）在反光增广下的广播正确性** |
 
 **布种描述符实测**（合成织纹，周期 5/9/13/19 px、亮度 100/170、反光 0/0.9）：
 

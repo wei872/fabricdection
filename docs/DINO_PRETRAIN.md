@@ -126,7 +126,9 @@ python tools/pretrain_dino.py --smoke 4 --iters 2 --cfg configs/jingwei_p.yaml
 ```
 
 单元测试 `tests/test_model.py::test_20/21`（另见 `test_22/23` 前景/折入）覆盖同一路径：
-`python -m unittest discover -s tests -v` 应输出 `OK (24 tests)`（含中文路径回归）。
+`python -m unittest discover -s tests -v` 应输出 `OK (25 tests)`（含中文路径 / 非方形图回归）。
+本地 teacher 权重与 checkpoint 统一通过 `jingwei.utils.torch_load` 读取，默认
+`weights_only=True`，不再触发 PyTorch 2.6+ 的 `FutureWarning`。
 
 ## 6. teacher 选择
 

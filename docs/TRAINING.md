@@ -15,7 +15,7 @@ pip install onnx tensorrt ultralytics
 
 最低验证环境（本仓库实测）：Python 3.11 + torch 2.2.2 (CPU 即可) +
 numpy 1.26 + opencv-python-headless + PyYAML + scipy + tqdm。
-跑 `python -m unittest discover -s tests -v` 应输出 `OK`（24 项）。
+跑 `python -m unittest discover -s tests -v` 应输出 `OK`（25 项）。
 阶段 0 的 `--smoke` 模式用 synthetic teacher，不需要下载 DINOv2 权重。
 
 ## 2. 数据准备
@@ -78,6 +78,8 @@ PY
 （`.JPG/.PNG/.WEBP`）也能识别；`jingwei/data.py::list_images` 与
 `jingwei/image_io.py` 已统一处理，Windows 下**不需要重命名数据**，也不要把
 工具里的 `imread_unicode` / `imwrite_unicode` 改回 `cv2.imread` / `cv2.imwrite`。
+图像也不需要预先裁成正方形：`1040×2448` 这类长条布幅帧在
+`fabric_photometric` 反光增广下已修复广播问题（见 [DESIGN.md §12.6](DESIGN.md)）。
 
 ### 2.3 normaltrain 的关键要求
 
@@ -188,7 +190,7 @@ subject to FPR ≤ max(3·target_fpr, 0.02)
 ## 4. 快速自检（无真实数据）
 
 ```bash
-python -m unittest discover -s tests -v                 # 24 项，约 55 s（含中文路径回归）
+python -m unittest discover -s tests -v                 # 25 项，约 55 s（含中文路径 / 非方形图回归）
 python tools/benchmark.py --all                         # p/n/s 参数量 / MACs / 延迟估算
 python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both  # 在你的 GPU 上实测
 python tools/train_detector.py   --smoke 2 --epochs 1 --batch 1 --device cpu
@@ -208,6 +210,8 @@ python tools/export.py --check --out runs/export/jingwei_n.onnx
 |---|---|---|
 | `no images under ...` | 路径没改 / 图片扩展名不在列表 | 检查 `configs/fabric19.yaml`；支持 jpg/jpeg/png/bmp/tif/tiff/webp（含大写） |
 | 中文图片名报错 / 读图返回 `None` / 无法保存中文结果 | Windows 下 `cv2.imread` / `cv2.imwrite` / `cv2.VideoCapture` 直接吃非 ASCII 路径失败 | 已统一改用 `jingwei/image_io.py` 的 `imread_unicode` / `imwrite_unicode` / `VideoCaptureUnicode`；升级代码后若仍报错，贴完整 traceback，不要回退到直接 `cv2.imread`；详见 [DESIGN.md §12.5](DESIGN.md) |
+| `ValueError: operands could not be broadcast together with shapes (H,W,3) (H,W)` | 旧版 `fabric_photometric` 反光场经 OpenCV 后变成 2D，未补通道维 | 已修复：`field[:, :, None]` 后再与 RGB 相乘；`test_25` 覆盖 1040×2448 类长条图，见 [DESIGN.md §12.6](DESIGN.md) |
+| `FutureWarning: You are using torch.load with weights_only=False` | PyTorch 2.6+ 提示未来默认值改为 `True` | 已统一走 `jingwei.utils.torch_load`（默认 `weights_only=True`）；含自定义对象的第三方权重会自动回退并给出 `RuntimeWarning`，仅加载可信文件 |
 | 标签全空 | `labels` 目录推断失败 | 显式传 `--labels`（工具会自动把 `/images/` 换成 `/labels/`）；中文标签文件名同样支持 |
 | `rec_loss` → 0 | 主干没冻结，出现塌缩解 | 检查阶段 B 只把 `normality_parameters()` 加入优化器 |
 | 全图误报 | 记忆库没标定 / 用了未训练权重 | 必须先跑阶段 C；`tau` 由 `normalval` 标定 |

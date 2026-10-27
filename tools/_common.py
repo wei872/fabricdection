@@ -23,6 +23,7 @@ from jingwei import build_model, load_config
 from jingwei.data import NormalImageDataset, YOLODefectDataset, collate, list_images
 from jingwei.fabric import fabric_descriptor, fit_fabric_prototypes
 from jingwei.image_io import console_safe, imread_unicode
+from jingwei.utils import torch_load
 
 
 def data_paths(cfg, override: str | None = None) -> dict:
@@ -42,7 +43,7 @@ def load_model(cfg_path: str, ckpt: str | None = None, device="cpu"):
     cfg = load_config(cfg_path)
     model = build_model(cfg)
     if ckpt:
-        state = torch.load(ckpt, map_location="cpu")
+        state = torch_load(ckpt, map_location="cpu")
         sd = state.get("model", state)
         model.load_state_dict(sd, strict=False)
     return model.to(device), cfg

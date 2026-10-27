@@ -29,10 +29,10 @@
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | ONNX/TensorRT 导出、延迟预算、流水线、上线清单 |
 | **[docs/DINO_PRETRAIN.md](docs/DINO_PRETRAIN.md)** | **用 DINOv2 做阶段 0 离线蒸馏预训练：为什么需要、命令、许可证、A/B 验证** |
 | **[docs/FOREGROUND.md](docs/FOREGROUND.md)** | **前景/背景分离、布幅变化跟随、边缘正常折入误报抑制** |
-| `jingwei/` | 参考实现：主干 / 双尺度头 / 记忆库 / 线性注意力重建 / 安全网 / 损失 / 数据集 / **Unicode 安全图像 I/O** / DINO teacher 工具 |
+| `jingwei/` | 参考实现：主干 / 双尺度头 / 记忆库 / 线性注意力重建 / 安全网 / 损失 / 数据集 / **Unicode 安全图像 I/O** / **安全 checkpoint 加载** / DINO teacher 工具 |
 | `configs/` | `jingwei_n.yaml`（实时优先）、`jingwei_s.yaml`（精度优先）、**`jingwei_p.yaml`（GTX 1660 SUPER 等无 Tensor Core 卡专用）**、`fabric19.yaml`（数据）；均含 `dino:` 阶段 0 配置 |
 | `tools/` | **DINOv2 蒸馏预训练**、训练、建库、标定、评估、推理、导出、算力剖析、**真实设备延迟实测** CLI |
-| `tests/test_model.py` | 24 项单元测试（含中文路径回归） |
+| `tests/test_model.py` | 25 项单元测试（含中文路径 / 非方形图回归） |
 
 > `dataset/dataset.yaml` 保持原样，作为 19 个类别名的真源。
 
@@ -43,7 +43,7 @@
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m unittest discover -s tests -v     # 应输出 OK (24 tests，含中文路径回归)
+python -m unittest discover -s tests -v     # 应输出 OK (25 tests，含中文路径 / 非方形图回归)
 python tools/benchmark.py --both            # 参数量 / MACs / 延迟估算
 ```
 
@@ -66,7 +66,8 @@ python tools/export.py            --cfg configs/jingwei_n.yaml --ckpt runs/bank/
 图片 / 目录 / 视频文件名支持中文、空格及大写扩展名（`.JPG/.PNG/.WEBP`）；
 `jingwei/image_io.py` 统一用 `np.fromfile+imdecode` / `imencode+tofile` 读写，
 `VideoCaptureUnicode` 处理中文视频路径，Windows 下无需重命名数据。
-详见 [docs/DESIGN.md §12.5](docs/DESIGN.md)。
+非方形长条布幅图（如 1040×2448）也可直接训练；详见
+[docs/DESIGN.md §12.5–12.6](docs/DESIGN.md)。
 
 阶段 A 会同时训练 `defect_fg` 前景头；`data.py` 还会合成布幅边缘正常折入增广，
 避免产线把折入误判成疵点，详见 [docs/FOREGROUND.md](docs/FOREGROUND.md)。
@@ -80,11 +81,12 @@ python tools/export.py            --cfg configs/jingwei_n.yaml --ckpt runs/bank/
 
 ```
 python -m unittest discover -s tests -v
-Ran 24 tests in ~55 s — OK
+Ran 25 tests in ~55 s — OK
   jingwei_n = 6.32 M / 17.12 G MACs @1280
   jingwei_p = 2.87 M /  8.42 G MACs @1280
   stage 0 DINOv2 distillation + foreground/fold context = smoke OK
   Chinese/Unicode image, folder, video and .npz paths = OK
+  non-square 1040x2448-like fabric frame augmentation = OK
 ```
 
 | 变体 | 参数 | 1280² MACs | 640² MACs | RTX 4090 估算 | Jetson AGX Orin 估算 | **GTX 1660 SUPER 估算** |
@@ -117,6 +119,10 @@ JingWei-n 在 1280² 仍只用了约六成的计算量。
 - **中文 / Unicode 路径**：`jingwei/image_io.py` 收敛了全部图像/视频 I/O；
   单元 24 覆盖中文图片名/目录名/中文 `.npz` 原型/中文视频名，以及
   `predict.py --source/--out` 的端到端读写与 ASCII 控制台输出。
+- **非方形长条布幅图**：`fabric_photometric` 的反光场经 `cv2.resize` 后会被压成
+  2D，现已补回通道维；1040×2448 这类长条图可直接 `augment=True` 训练，单元 25 覆盖。
+- **checkpoint 加载**：统一走 `jingwei.utils.torch_load`，默认 `weights_only=True`，
+  消除 PyTorch 2.6+ 的 `FutureWarning`；第三方权重含自定义对象时自动回退并提示。
 
 ---
 

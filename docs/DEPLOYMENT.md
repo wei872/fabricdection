@@ -232,6 +232,7 @@ python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both
 - [ ] 每个布种都有 normaltrain 覆盖；未覆盖原型走 conservative fallback
 - [ ] 正常折入/布幅变化样本已覆盖；`foreground` 阈值按产线 A/B 调好
 - [ ] 生产图片/视频路径含中文/空格时用 `jingwei/image_io.py` 读写（已默认接入）；回归测试 `test_24_unicode_paths` 通过
+- [ ] 非方形长条布幅帧（如 1040×2448）在 `augment=True` 下能正常训练；回归测试 `test_25_non_square_photometric_augment` 通过
 - [ ] ONNX 8 个输出（含 context）形状静态；TRT engine 在目标设备构建成功
 - [ ] INT8 情况下阈值已重新标定
 - [ ] 1000 帧 P50/P99 延迟达标，P99/P50 ≤ 1.3

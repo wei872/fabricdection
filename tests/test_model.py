@@ -6,8 +6,8 @@ Run from the repo root::
 
 No pytest / no GPU / no real data needed. It checks shapes at the required
 1280x1280 input, trainability, the deterministic safety net, fabric-type
-invariance, memory-bank algebra, the dataset readers, and Chinese / Unicode
-file paths (24 tests).
+invariance, memory-bank algebra, the dataset readers, Chinese / Unicode
+file paths, and non-square fabric augmentation (25 tests).
 """
 from __future__ import annotations
 
@@ -36,7 +36,8 @@ from jingwei.image_io import (VideoCaptureUnicode, ascii_safe,     # noqa: E402
                               imwrite_unicode)
 from jingwei.layers import LocalContrastNorm                     # noqa: E402
 from jingwei.losses import hungarian_match                       # noqa: E402
-from jingwei.utils import count_parameters, profile_macs          # noqa: E402
+from jingwei.utils import (count_parameters, profile_macs,         # noqa: E402
+                           torch_load)
 
 CFG_N = str(ROOT / "configs/jingwei_n.yaml")
 CFG_P = str(ROOT / "configs/jingwei_p.yaml")
@@ -375,7 +376,7 @@ class TestModel(unittest.TestCase):
                 cwd=ROOT, capture_output=True, text=True, timeout=180)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertTrue((out / "dino_init.pt").is_file())
-            state = torch.load(out / "dino_init.pt", map_location="cpu")
+            state = torch_load(out / "dino_init.pt", map_location="cpu")
             self.assertEqual(state["teacher"], "synthetic")
             self.assertIn("model", state)
 
@@ -542,6 +543,60 @@ class TestModel(unittest.TestCase):
             res_v = json.loads((out_vid / "results.json").read_text(encoding="utf-8"))
             self.assertIn("000000.jpg", res_v)
             self.assertNotIn("布匹视频", proc_v.stdout)
+
+    # --------------------------------------- non-square fabric augmentation
+    def test_25_non_square_photometric_augment(self):
+        """Reflectance field must broadcast on long non-square RGB frames."""
+        from jingwei.data import (NormalImageDataset, YOLODefectDataset,
+                                  fabric_photometric, geometric_augment)
+
+        class ZeroRng:
+            """Deterministically enable every augmentation branch."""
+            def uniform(self, a, b):
+                return (a + b) / 2.0
+            def random(self):
+                return 0.0
+            def normal(self, loc, scale, size):
+                return np.zeros(size, np.float32)
+            def integers(self, a, b):
+                return a
+
+        # 1040x2448-like aspect ratio, scaled down for CI speed.
+        img = np.full((104, 244, 3), 128, np.uint8)
+        out = fabric_photometric(img, ZeroRng())
+        self.assertEqual(out.shape, img.shape)
+        self.assertEqual(out.dtype, np.uint8)
+
+        boxes = np.array([[10., 10., 50., 40.],
+                          [100., 50., 200., 90.]], np.float32)
+        out2, boxes2 = geometric_augment(out, boxes.copy(), ZeroRng(), 128)
+        self.assertEqual(out2.shape, (128, 128, 3))
+        self.assertEqual(boxes2.shape, boxes.shape)
+        self.assertTrue(np.isfinite(boxes2).all())
+        self.assertTrue((boxes2 >= 0).all() and (boxes2 <= 128).all())
+
+        # Full dataset path with augment=True and a seed that enables the
+        # reflectance branch on a non-square image.
+        with tempfile.TemporaryDirectory() as tmp:
+            imgs = Path(tmp) / "images" / "train"
+            labs = Path(tmp) / "labels" / "train"
+            normal = Path(tmp) / "normal" / "images" / "train"
+            for d in (imgs, labs, normal):
+                d.mkdir(parents=True, exist_ok=True)
+            gray = weave(9, 128, 0.2, 128)[:, :96]     # 128 x 96, non-square
+            imwrite_unicode(imgs / "长条布幅.jpg", gray)
+            (labs / "长条布幅.txt").write_text(
+                "1 0.25 0.30 0.10 0.08\n", encoding="utf-8")
+            imwrite_unicode(normal / "正常长条.jpg", gray)
+            ds = YOLODefectDataset(imgs, labs, img_size=64,
+                                   augment=True, seed=2)
+            item = ds[0]
+            self.assertEqual(tuple(item["image"].shape), (3, 64, 64))
+            nd = NormalImageDataset(normal, img_size=64, augment=True, seed=2,
+                                    with_descriptor=True)
+            item2 = nd[0]
+            self.assertEqual(tuple(item2["image"].shape), (3, 64, 64))
+            self.assertEqual(tuple(item2["descriptor"].shape), (8,))
 
 
 if __name__ == "__main__":

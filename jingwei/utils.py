@@ -2,11 +2,39 @@
 from __future__ import annotations
 
 import math
+import pickle
+import warnings
 from typing import Iterable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def torch_load(file, map_location="cpu", **kwargs):
+    """Load a checkpoint with ``weights_only=True`` by default (torch >= 2.0).
+
+    Silences the PyTorch ``FutureWarning`` about ``weights_only=False`` for our
+    own checkpoints, which contain only tensors / primitives / containers.
+    Third-party DINOv1 weights sometimes store an ``argparse.Namespace``; for
+    those we fall back to ``weights_only=False`` with a warning — only load
+    checkpoints you trust.
+    """
+    kwargs.setdefault("weights_only", True)
+    try:
+        return torch.load(file, map_location=map_location, **kwargs)
+    except TypeError:
+        # torch < 2.0 has no weights_only argument.
+        kwargs.pop("weights_only", None)
+        return torch.load(file, map_location=map_location, **kwargs)
+    except (pickle.UnpicklingError, RuntimeError, AttributeError) as exc:
+        kwargs.pop("weights_only", None)
+        warnings.warn(
+            f"torch.load(weights_only=True) failed ({exc}); "
+            "retrying with weights_only=False. Only load trusted checkpoints.",
+            RuntimeWarning,
+        )
+        return torch.load(file, map_location=map_location, **kwargs)
 
 
 # --------------------------------------------------------------------------------------
