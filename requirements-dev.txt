@@ -1,0 +1,6 @@
+# Development / CI extras (the runtime deps live in requirements.txt).
+-r requirements.txt
+
+onnx>=1.15              # tools/export.py + tests/test_19_pico_onnx_export.py
+onnxsim>=0.4            # optional graph simplification before trtexec
+pytest>=7.4             # nicer local runs; the suite itself is plain unittest

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 import os
+import random
 from pathlib import Path
 
 import cv2
@@ -26,13 +27,23 @@ IMG_EXTS = (
     "*.JPG", "*.JPEG", "*.PNG", "*.BMP", "*.TIF", "*.TIFF", "*.WEBP",
 )
 
+# Suffix set used by the single-pass directory scan below (`list_images`).
+_IMG_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff",
+                           ".webp"})
+
 
 def list_images(root: str | Path):
+    """Recursively list image files under ``root`` (sorted, case-insensitive).
+
+    One ``rglob("*")`` pass with a suffix check instead of one ``rglob`` per
+    extension: ``IMG_EXTS`` has 14 patterns, so the old version walked the
+    whole tree 14 times (a 20k-image train split paid that at every dataset
+    construction, i.e. once per worker per run).  It also cannot accidentally
+    return a *directory* whose name ends in ``.jpg``.
+    """
     root = Path(root)
-    files = set()
-    for ext in IMG_EXTS:
-        files.update(root.rglob(ext))
-    return sorted(str(f) for f in files)
+    return sorted(str(p) for p in root.rglob("*")
+                  if p.suffix.lower() in _IMG_SUFFIXES and p.is_file())
 
 
 def infer_labels_dir(images_dir) -> str:
@@ -64,6 +75,11 @@ def to_chw_float(img: np.ndarray) -> torch.Tensor:
 def _seed_worker(worker_id: int, base_seed: int) -> None:
     seed = int(base_seed) * 1009 + int(worker_id)
     np.random.seed(seed)
+    # The standard library ``random`` module is used by the stage-0 view /
+    # photometric augmentation (jingwei.dino) and by nothing else.  Under the
+    # Linux ``fork`` start method every worker inherits the *same* state, so
+    # without this line all workers draw identical crop / erase decisions.
+    random.seed(seed)
     info = torch.utils.data.get_worker_info()
     if info is None:
         return

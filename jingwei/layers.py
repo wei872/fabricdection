@@ -126,8 +126,22 @@ class LocalContrastNorm(nn.Module):
             self.register_buffer("beta", torch.zeros(1, 3, 1, 1))
 
     def _box(self, x):
+        """Separable box filter: two 1-D passes instead of one k x k window.
+
+        A box kernel is exactly separable, and with ``count_include_pad=False``
+        the 2-D result divides by the number of *valid* cells (n_rows*n_cols),
+        which is precisely what the two 1-D passes produce -- so this is
+        numerically identical (max |diff| ~ 2e-7 in float32) while costing
+        ``2k`` instead of ``k*k`` multiply-adds per pixel.
+
+        At 1280x1280 the old k=15 window did 4 x 225 = 900 ops/pixel/channel
+        (~4.4 GMAC for the whole layer, ~26% of the network's 16.6 GMACs) --
+        the profiler does not count pooling, so it was invisible in the MACs
+        table. The separable form needs ~120 ops/pixel/channel.
+        """
         k = self.k
-        return F.avg_pool2d(x, k, 1, k // 2, count_include_pad=False)
+        y = F.avg_pool2d(x, (1, k), 1, (0, k // 2), count_include_pad=False)
+        return F.avg_pool2d(y, (k, 1), 1, (k // 2, 0), count_include_pad=False)
 
     def forward(self, x):
         mu = self._box(self._box(x))

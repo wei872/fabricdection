@@ -42,7 +42,8 @@ normality:
   local_pool: 3              # PatchCore 局部聚合 3x3
   n_prototypes: 8            # 布种原型数 K_f (用 normaltrain 聚类得到)
   n_centroids: 256           # 每个原型压缩后的记忆库中心数 K
-  coreset_ratio: 0.1
+  coreset_ratio: 0.1       # NOTE: 未使用；压缩率实际由 n_centroids 决定
+                           # (tools/build_memory_bank.py)，见 docs/CODE_REVIEW.md
   bank_method: spherical_kmeans   # spherical_kmeans | coreset
   seed: 0
   recon_dim: 256             # Dinomaly 重建器 token 维度

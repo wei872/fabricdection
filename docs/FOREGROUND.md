@@ -254,7 +254,7 @@ onnx.checker 与 pico/N 导出均通过。
   动态 FiLM、context 形状、损失与梯度；
 - `test_23`：端到端大缺陷 / 正常折入 / 边缘真缺陷 / 大兜底回归；
 - `test_31`：未知疵点类型（含小面积异常连通域）也生成 `未知异常` 框，大缺陷兜底不被 `max_unknown_boxes` 丢弃；
-- 全套 **31 项单元测试通过**（含验证指标 / 未知缺陷框回归），compileall / ONNX checker / pico+N 导出通过。
+- 全套 **42 项单元测试通过**（含验证指标 / 未知缺陷框回归），compileall / ONNX checker / pico+N 导出通过。
 
 ---
 

@@ -148,7 +148,12 @@ class JingWei(nn.Module):
                                     context=ctx)
             else:
                 keep = d["scores"] >= float(self.cfg.fusion.final_score_thresh)
+                # keep the same keys/shape contract as the fused path so
+                # downstream tools (evaluate / predict) never see a different
+                # dict schema depending on ``set_stage``.
                 d = {k: v[keep] for k, v in d.items()}
+                d.update(n_safety_boxes=0, n_unknown_boxes=0,
+                         n_global_components=0)
             results.append(d)
         return results
 

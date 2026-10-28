@@ -44,6 +44,53 @@ def load_proto(path, cfg):
     return FabricPrototypes(centers=z["centers"], mean=z["mean"], std=z["std"])
 
 
+def boxes_to_image_pixels(boxes: np.ndarray, net_size: int,
+                          w0: int, h0: int) -> np.ndarray:
+    """Map xyxy boxes from the squashed ``net_size x net_size`` frame back to
+    the original image resolution (and clip to it).
+
+    ``boxes`` is (N, 4) float; returns a new (N, 4) float32 array.
+    """
+    b = np.asarray(boxes, np.float32).reshape(-1, 4).copy()
+    if b.size == 0:
+        return b
+    sx, sy = w0 / float(net_size), h0 / float(net_size)
+    b *= np.array([sx, sy, sx, sy], np.float32)
+    b[:, 0::2] = b[:, 0::2].clip(0, w0)
+    b[:, 1::2] = b[:, 1::2].clip(0, h0)
+    return b
+
+
+def iter_sources(src: Path, dump_frames: bool = False, out: Path | None = None):
+    """Yield ``(name, bgr_frame)`` for a single image, a folder, or a video.
+
+    Videos are decoded lazily: the old implementation first wrote *every*
+    frame to ``out/_frames`` and then re-read them, which doubles the I/O and
+    can fill the disk on a long 产线 video.  ``dump_frames`` brings the old
+    behaviour back for debugging.
+    """
+    if src.is_dir():
+        for f in list_images(src):
+            yield Path(f).name, imread_unicode(f, cv2.IMREAD_COLOR)
+        return
+    if src.suffix.lower() in (".mp4", ".avi", ".mov", ".mkv"):
+        with VideoCaptureUnicode(src) as cap:
+            if not cap.isOpened():
+                raise FileNotFoundError(f"cannot open video: {console_safe(src)}")
+            i = 0
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                name = f"{i:06d}.jpg"
+                if dump_frames and out is not None:
+                    imwrite_unicode(out / "_frames" / name, frame)
+                yield name, frame
+                i += 1
+        return
+    yield src.name, imread_unicode(src, cv2.IMREAD_COLOR)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cfg", default="configs/jingwei_n.yaml")
@@ -68,6 +115,9 @@ def main():
                     help="force unknown-defect boxes on")
     ap.add_argument("--no-unknown", action="store_true",
                     help="force unknown-defect boxes off")
+    ap.add_argument("--dump-frames", action="store_true",
+                    help="also write every decoded video frame to out/_frames "
+                         "(debug only; predates streaming decode)")
     args = ap.parse_args()
 
     info = gpu_info() if (args.realtime_1660 or args.bench) else {"cuda": False}
@@ -145,32 +195,17 @@ def main():
             log(f"[bench] failed: {e}")
 
     src = Path(args.source)
-    if src.is_dir():
-        files = list_images(src)
-    elif src.suffix.lower() in (".mp4", ".avi", ".mov", ".mkv"):
-        files = []
-        with VideoCaptureUnicode(src) as cap:
-            if not cap.isOpened():
-                raise FileNotFoundError(f"cannot open video: {console_safe(src)}")
-            i = 0
-            while True:
-                ok, fr = cap.read()
-                if not ok:
-                    break
-                f = out / f"_frames/{i:06d}.jpg"
-                f.parent.mkdir(parents=True, exist_ok=True)
-                imwrite_unicode(f, fr)
-                files.append(str(f))
-                i += 1
-    else:
-        files = [str(src)]
-
     all_results = {}
-    for f in files:
-        bgr = imread_unicode(f, cv2.IMREAD_COLOR)
+    for name, bgr in iter_sources(src, args.dump_frames, out):
         if bgr is None:
-            print(f"[warn] cannot read image: {console_safe(f)}")
+            print(f"[warn] cannot read image: {console_safe(name)}")
             continue
+        h0, w0 = bgr.shape[:2]
+        # The network always sees a squashed size x size frame; predictions are
+        # therefore in NETWORK pixels and must be mapped back before they mean
+        # anything to the operator.  The old code drew them straight onto the
+        # original frame, so every box on a non-1280 image landed in the wrong
+        # place (usually completely outside the canvas).
         rgb = cv2.cvtColor(cv2.resize(bgr, (size, size)), cv2.COLOR_BGR2RGB)
         x = torch.from_numpy(rgb.transpose(2, 0, 1)).float()[None] / 255.0
         if args.half:
@@ -182,19 +217,22 @@ def main():
         boxes = det["boxes"].cpu().numpy()
         scores = det["scores"].cpu().numpy()
         labels = det["labels"].cpu().numpy()
+        boxes_px = boxes_to_image_pixels(boxes, size, w0, h0)
         items = [dict(box=[round(float(v), 1) for v in bb],
                       score=round(float(s), 4),
                       label=names[int(l)] if int(l) < len(names) else str(int(l)))
-                 for bb, s, l in zip(boxes, scores, labels)]
+                 for bb, s, l in zip(boxes_px, scores, labels)]
         n_unknown = int((labels == int(cfg.data.nc)).sum())
-        all_results[Path(f).name] = dict(
+        all_results[name] = dict(
+            image_size=[int(w0), int(h0)],
+            network_size=[int(size), int(size)],
             fabric_prototype=int(k), detections=items,
             unknown_boxes=n_unknown,
             realtime_1660=bool(args.realtime_1660),
             emit_unknown=bool(cfg.fusion.get("emit_unknown_boxes", True)))
 
         if not args.no_draw:
-            for bb, s, l in zip(boxes, scores, labels):
+            for bb, s, l in zip(boxes_px, scores, labels):
                 c = COLORS[int(l) % len(COLORS)]
                 x0, y0, x1, y1 = [int(v) for v in bb]
                 cv2.rectangle(bgr, (x0, y0), (x1, y1), c, 2)
@@ -205,8 +243,8 @@ def main():
                 txt = f"{label} {s:.2f}"
                 cv2.putText(bgr, txt, (x0, max(16, y0 - 4)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1, cv2.LINE_AA)
-            imwrite_unicode(out / Path(f).name, bgr)
-        print(f"{console_safe(Path(f).name)}: {len(items)} detections "
+            imwrite_unicode(out / name, bgr)
+        print(f"{console_safe(name)}: {len(items)} detections "
               f"({n_unknown} unknown, prototype {k})")
 
     with (out / "results.json").open("w", encoding="utf-8") as fh:

@@ -64,16 +64,24 @@ def main():
     wrapper = ExportWrapper(model, args.proto).eval()
     dummy = torch.zeros(1, 3, size, size, device=args.device)
     names = ["cls3", "reg3", "obj3", "cls5", "reg5", "obj5", "anomaly"]
+    # Shapes are derived from the config: the old hard-coded "(1,19,160,160)" /
+    # "(1,96,160,160)" strings were wrong for jingwei_p (nc-independent grid
+    # 128, n3=72ch) and for any config with a different width.
+    nc = int(cfg.data.nc)
     G = int(cfg.normality.out_grid)
-    shape_note = ["(1,19,160,160)", "(1,4,160,160)", "(1,1,160,160)",
-                  "(1,19,40,40)", "(1,4,40,40)", "(1,1,40,40)",
+    w_sc = float(cfg.model.width)
+    s3, s5 = size // 8, size // 32
+    c3 = int(cfg.model.p3_ch * w_sc)
+    c5 = int(cfg.model.p5_ch * w_sc)
+    shape_note = [f"(1,{nc},{s3},{s3})", f"(1,4,{s3},{s3})", f"(1,1,{s3},{s3})",
+                  f"(1,{nc},{s5},{s5})", f"(1,4,{s5},{s5})", f"(1,1,{s5},{s5})",
                   f"(1,1,{G},{G})"]
     if model.foreground is not None:
         names += ["context"]
         shape_note += [f"(1,3,{G},{G}) = [defect_fg, fabric_mask, fold_band]"]
     if wrapper.return_feats:
         names += ["n3", "n5"]
-        shape_note += ["(1,96,160,160)", "(1,384,40,40)"]
+        shape_note += [f"(1,{c3},{s3},{s3})", f"(1,{c5},{s5},{s5})"]
         print("roi_head is ON -> engine also exports n3/n5 for the ROI refiner. "
               "On GTX 1660 SUPER prefer configs/jingwei_p.yaml (roi_head: false).")
     torch.onnx.export(

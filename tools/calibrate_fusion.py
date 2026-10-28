@@ -22,7 +22,8 @@ import yaml
 from torch.utils.data import DataLoader, Subset
 
 from _common import ROOT, data_paths, load_model, resolve, subset_indices
-from jingwei.data import NormalImageDataset, YOLODefectDataset, collate
+from jingwei.data import (NormalImageDataset, YOLODefectDataset, collate,
+                          infer_labels_dir)
 from jingwei.fusion import fuse_detections
 from jingwei.utils import box_iou
 from jingwei.image_io import console_safe
@@ -128,14 +129,19 @@ def main():
                                  batch_size=1, collate_fn=collate)
     else:
         vdir = resolve(paths["val"])
-        ldir = str(vdir).replace("/images/", "/labels/")
+        # infer_labels_dir() handles "…/images/train" AND "…/images" and
+        # Windows backslashes.  The old str.replace("/images/", "/labels/")
+        # silently did nothing on Windows (Path renders "\\"), so stage D
+        # scored every prediction as a false positive there.
+        ldir = infer_labels_dir(vdir)
         val_ds = YOLODefectDataset(vdir, ldir, img_size=size, augment=False)
         idx = subset_indices(len(val_ds), args.max_val, args.subset_seed)
         if idx is not None:
             val_ds = Subset(val_ds, idx)
         val_loader = DataLoader(val_ds, batch_size=1, shuffle=False,
                                 collate_fn=collate)
-        ndir = resolve(paths["normalval"])
+        n_key = "normalval" if "normalval" in paths else "normaltrain"
+        ndir = resolve(paths[n_key])
         norm_loader = DataLoader(NormalImageDataset(ndir, img_size=size, augment=False),
                                  batch_size=1, shuffle=False, collate_fn=collate)
 

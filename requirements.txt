@@ -2,7 +2,8 @@
 # Python >= 3.9
 torch>=2.0
 torchvision>=0.15        # only needed for optional ROIAlign
-numpy>=1.23,<2          # torch 2.x CPU/GPU wheels still expect numpy 1.x
+numpy>=1.23,<2          # 代码已兼容 numpy 2.x（tools/evaluate.py 用 numpy.trapezoid）；
+                        # 这里仍钉 <2 是因为部分 torch 2.x wheel 期望 numpy 1.x ABI
 opencv-python-headless>=4.7
 PyYAML>=6.0
 scipy>=1.10             # Hungarian matcher in the one-to-one assignment

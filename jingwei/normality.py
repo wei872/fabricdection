@@ -290,6 +290,32 @@ class ReconstructionResidual(nn.Module):
 # Fusion of the two normality signals
 # ======================================================================================
 class AnomalyFusion(nn.Module):
+    """Combine the two calibrated anomaly probabilities.
+
+    ``fixed``  — ``alpha * a_nn + beta * a_rec`` (linear, calibration preserving).
+    ``gate``   — a learnable 1x1 conv, but applied in **logit space**:
+                 ``sigmoid(w1 * logit(a_nn) + w2 * logit(a_rec) + b)``.
+
+    Why logit space matters
+    -----------------------
+    ``a_nn`` and ``a_rec`` are already probabilities produced by *calibrated*
+    sigmoids (per-prototype ``mu/sigma/tau`` and ``rec_tau``), and the
+    deployments compare the fused map against ``fusion.anomaly_thresh=0.5``.
+    The old ``gate`` fed the probabilities into another conv + sigmoid, i.e. a
+    second squashing.  Because ``sigmoid(0) == 0.5``, *every* non-zero input
+    mapped above the 0.5 threshold (0.01 -> 0.5025, 0.10 -> 0.525, the
+    calibrated 0.5 -> 0.6225), so the threshold stopped meaning "beyond the
+    calibrated tau" and the connected-component safety net saw an almost
+    fully-anomalous frame.
+
+    Blending the logits instead keeps the calibration point: with
+    ``w1 + w2 == 1`` and ``b == 0`` (the initialisation) the mapping is the
+    identity for ``a_nn == a_rec``, so ``a == tau`` still fuses to exactly
+    ``tau`` and the whole downstream threshold chain stays valid.
+    """
+
+    EPS = 1e-4
+
     def __init__(self, mode: str = "gate", alpha: float = 0.6, beta: float = 0.4):
         super().__init__()
         self.mode = mode
@@ -302,10 +328,16 @@ class AnomalyFusion(nn.Module):
         else:
             self.register_buffer("w", torch.tensor([alpha, beta]).reshape(1, 2, 1, 1))
 
+    @classmethod
+    def _logit(cls, p: torch.Tensor) -> torch.Tensor:
+        p = p.clamp(cls.EPS, 1.0 - cls.EPS)
+        return torch.log(p) - torch.log1p(-p)
+
     def forward(self, a_nn: torch.Tensor, a_rec: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([a_nn, a_rec], 1)
         if self.mode == "gate":
-            return torch.sigmoid(self.gate(x))
+            z = torch.cat([self._logit(a_nn), self._logit(a_rec)], 1)
+            return torch.sigmoid(self.gate(z))
+        x = torch.cat([a_nn, a_rec], 1)
         return (x * self.w).sum(1, keepdim=True)
 
 

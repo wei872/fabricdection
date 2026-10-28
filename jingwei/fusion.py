@@ -149,6 +149,15 @@ def safety_net_numpy(anomaly: np.ndarray, boxes: np.ndarray, scores: np.ndarray,
     unknown_min = max(1, int(float(unknown_ratio) * G * G))
     min_area_cells = min(large_min, unknown_min) if emit_unknown else large_min
     margin = float(f.box_margin)
+    # Guard against a GLOBAL anomaly (whole fabric darker / light flicker / a
+    # mis-calibrated threshold).  Such a frame produces ONE connected component
+    # covering the entire image, and the old code duly emitted a full-frame
+    # 未知异常 box -- useless for the operator and a guaranteed false alarm.
+    # A real defect never fills the whole field of view, so components above
+    # this fraction are treated as a global event, not a defect.
+    max_area_ratio = float(f.get("max_component_area_ratio", 0.90))
+    max_area_cells = int(max_area_ratio * G * G) if max_area_ratio < 1.0 else G * G
+    n_global = 0
 
     # Large components are NEVER dropped (recall guarantee).  Smaller unknown
     # candidates are kept up to ``max_unknown_boxes`` by peak anomaly score.
@@ -158,6 +167,9 @@ def safety_net_numpy(anomaly: np.ndarray, boxes: np.ndarray, scores: np.ndarray,
     for i in range(1, n_cc):
         x, y, w, h, area = stats[i]
         if area < min_area_cells:
+            continue
+        if area > max_area_cells:
+            n_global += 1                         # global event, see above
             continue
         is_large = area >= large_min
         is_unknown = (emit_unknown and (not is_large) and
@@ -236,7 +248,8 @@ def safety_net_numpy(anomaly: np.ndarray, boxes: np.ndarray, scores: np.ndarray,
     scores = np.clip(scores + boost * (1.0 - scores), 0.0, 1.0)
     return dict(boxes=boxes, scores=scores, labels=labels,
                 n_safety_boxes=len(extra_boxes),
-                n_unknown_boxes=n_unknown_boxes)
+                n_unknown_boxes=n_unknown_boxes,
+                n_global_components=n_global)
 
 
 def fuse_detections(det: dict, anomaly: torch.Tensor, img_size, cfg,
@@ -268,5 +281,6 @@ def fuse_detections(det: dict, anomaly: torch.Tensor, img_size, cfg,
     keep = scores >= float(cfg.fusion.final_score_thresh)
     result = dict(boxes=boxes[keep], scores=scores[keep], labels=labels[keep],
                   n_safety_boxes=out["n_safety_boxes"],
-                  n_unknown_boxes=out.get("n_unknown_boxes", 0))
+                  n_unknown_boxes=out.get("n_unknown_boxes", 0),
+                  n_global_components=out.get("n_global_components", 0))
     return result

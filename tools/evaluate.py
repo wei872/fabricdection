@@ -25,13 +25,19 @@ from jingwei.utils import box_iou, count_parameters, profile_macs
 PR_THRESHOLDS = (0.05, 0.10, 0.15, 0.25, 0.40)
 
 
+# ``np.trapz`` was renamed to ``np.trapezoid`` in NumPy 2.0 and removed from the
+# namespace; the old call raised ``AttributeError: module 'numpy' has no
+# attribute 'trapz'`` and killed every validation pass on a NumPy 2 install.
+_TRAPZ = getattr(np, "trapezoid", None) or getattr(np, "trapz")
+
+
 def average_precision(recall, precision):
     mrec = np.concatenate(([0.0], recall, [1.0]))
     mpre = np.concatenate(([0.0], precision, [0.0]))
     for i in range(len(mpre) - 2, -1, -1):
         mpre[i] = max(mpre[i], mpre[i + 1])
     x = np.linspace(0, 1, 101)
-    return float(np.trapz(np.interp(x, mrec, mpre), x))
+    return float(_TRAPZ(np.interp(x, mrec, mpre), x))
 
 
 def _flatten_records(records):
@@ -237,17 +243,21 @@ def validate_detector(model, val_loader, norm_loader, device, cfg,
 
 @torch.no_grad()
 def benchmark(model, device, size, iters=5, warmup=2):
+    # ``--device cuda:0`` used to skip every synchronize() (the check compared
+    # the string to plain "cuda"), so the reported latency was the time to
+    # *enqueue* kernels, not to run them.
+    on_cuda = str(device).startswith("cuda")
     x = torch.randn(1, 3, size, size, device=device)
-    if device == "cuda":
+    if on_cuda:
         torch.cuda.synchronize()
     for _ in range(warmup):
         model(x)
-    if device == "cuda":
+    if on_cuda:
         torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(iters):
         model(x)
-    if device == "cuda":
+    if on_cuda:
         torch.cuda.synchronize()
     return (time.perf_counter() - t0) / iters * 1000.0
 

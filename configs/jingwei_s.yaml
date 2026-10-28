@@ -41,7 +41,8 @@ normality:
   local_pool: 3
   n_prototypes: 12
   n_centroids: 384
-  coreset_ratio: 0.1
+  coreset_ratio: 0.1       # NOTE: 未使用；压缩率实际由 n_centroids 决定
+                           # (tools/build_memory_bank.py)，见 docs/CODE_REVIEW.md
   bank_method: spherical_kmeans
   seed: 0
   recon_dim: 256

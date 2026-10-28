@@ -270,11 +270,11 @@ def resume_checkpoint(state_or_path, stage: str, model, optimizer=None,
                 meta.get("stage") == stage)
 
     sd = state.get("model", state)
-    model.load_state_dict(sd, strict=False)
+    load_state_dict_report(model, sd, tag=str(stage))
     if extra_modules:
         for key, module in extra_modules.items():
             if key in state:
-                module.load_state_dict(state[key], strict=False)
+                load_state_dict_report(module, state[key], tag=f"{stage}/{key}")
 
     if full:
         optimizer.load_state_dict(state["optimizer"])
@@ -305,13 +305,36 @@ def resume_checkpoint(state_or_path, stage: str, model, optimizer=None,
     }
 
 
+def load_state_dict_report(model, sd, tag: str = "checkpoint") -> list[str]:
+    """``load_state_dict(strict=False)`` + a loud report of what did not match.
+
+    Silently ignoring missing / unexpected keys is how a run that "loaded fine"
+    ends up with randomly initialised layers (e.g. ``--ckpt`` from a different
+    width, or a detector checkpoint used for the pico config).  Returns the
+    collected warning lines so callers can also surface them in a JSON report.
+    """
+    result = model.load_state_dict(sd, strict=False)
+    missing = list(getattr(result, "missing_keys", []) or [])
+    unexpected = list(getattr(result, "unexpected_keys", []) or [])
+    msgs = []
+    if missing:
+        msgs.append(f"[!] {tag}: {len(missing)} missing tensor(s) "
+                    f"(kept at their current init), e.g. {missing[:3]}")
+    if unexpected:
+        msgs.append(f"[!] {tag}: {len(unexpected)} unexpected tensor(s) "
+                    f"(ignored), e.g. {unexpected[:3]}")
+    for m in msgs:
+        log(m)
+    return msgs
+
+
 def load_model(cfg_path: str, ckpt: str | None = None, device="cpu"):
     cfg = load_config(cfg_path)
     model = build_model(cfg)
     if ckpt:
         state = load_checkpoint(ckpt)
         sd = state.get("model", state)
-        model.load_state_dict(sd, strict=False)
+        load_state_dict_report(model, sd, tag=str(ckpt))
     return model.to(device), cfg
 
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -578,12 +579,15 @@ class TestModel(unittest.TestCase):
             cmd_vid = [sys.executable, "tools/predict.py",
                        "--cfg", CFG_P, "--source", str(video_cn),
                        "--out", str(out_vid), "--device", "cpu",
-                       "--prototypes", str(proto_path), "--no-draw"]
+                       "--prototypes", str(proto_path)]
             proc_v = subprocess.run(cmd_vid, cwd=str(ROOT), env=env,
                                     capture_output=True, text=True,
                                     encoding="utf-8", errors="replace", timeout=180)
             self.assertEqual(proc_v.returncode, 0, proc_v.stdout + proc_v.stderr)
-            self.assertTrue((out_vid / "_frames" / "000000.jpg").exists())
+            # Streaming decode: the annotated frame itself is the output,
+            # no intermediate out/_frames dump (see tools/predict.py).
+            self.assertTrue((out_vid / "000000.jpg").exists())
+            self.assertFalse((out_vid / "_frames").exists())
             res_v = json.loads((out_vid / "results.json").read_text(encoding="utf-8"))
             self.assertIn("000000.jpg", res_v)
             self.assertNotIn("布匹视频", proc_v.stdout)
@@ -996,7 +1000,10 @@ class TestModel(unittest.TestCase):
         with torch.no_grad():
             d = m(torch.randn(1, 3, 256, 256), proto_id=0)[0]
         self.assertEqual(called["n"], 0)
-        self.assertNotIn("n_safety_boxes", d)
+        # the detector-only path now returns the SAME keys (zeros) so
+        # downstream code never has to branch on the training stage.
+        self.assertEqual(d["n_safety_boxes"], 0)
+        self.assertEqual(d["n_global_components"], 0)
         self.assertEqual(d["boxes"].shape[0], d["scores"].shape[0])
 
     def test_35_o2o_negative_floor(self):
@@ -1016,6 +1023,151 @@ class TestModel(unittest.TestCase):
         self.assertAlmostEqual(pr[0.7]["recall"], 1.0, places=6)
         self.assertEqual(pr[0.7]["tp"], 2)
 
+
+    # ------------------------------------------------- performance / calibration
+    def test_37_local_contrast_norm_separable_box(self):
+        """The separable box filter must equal the old k x k window exactly."""
+        lcn = LocalContrastNorm(k=15, learnable=False).eval()
+        rng = np.random.default_rng(0)
+        x = torch.from_numpy(rng.random((1, 3, 96, 111)).astype(np.float32))
+        ref = torch.nn.functional.avg_pool2d(x, 15, 1, 7,
+                                             count_include_pad=False)
+        got = lcn._box(x)
+        self.assertEqual(got.shape, ref.shape)
+        self.assertLess(float((got - ref).abs().max()), 1e-5,
+                        "separable 1-D box passes must be numerically exact")
+        # corners are where a naive separable implementation usually breaks
+        for sl in ((slice(0, 4), slice(0, 4)), (slice(-4, None), slice(-4, None))):
+            self.assertLess(float((got[:, :, sl[0], sl[1]] -
+                                   ref[:, :, sl[0], sl[1]]).abs().max()), 1e-5)
+        with torch.no_grad():
+            out = lcn(x)
+        self.assertTrue(torch.isfinite(out).all())
+
+    def test_38_anomaly_fusion_preserves_calibration(self):
+        """`gate` must not shift the calibrated operating point (0.5)."""
+        from jingwei.normality import AnomalyFusion
+
+        for mode in ("gate", "fixed"):
+            fuse = AnomalyFusion(mode, 0.6, 0.4).eval()
+            for v in (0.01, 0.05, 0.25, 0.5, 0.75, 0.99):
+                a = torch.full((1, 1, 3, 3), v)
+                got = float(fuse(a, a)[0, 0, 0, 0])
+                self.assertAlmostEqual(got, v, places=3,
+                                       msg=f"{mode} mode shifted {v} -> {got}")
+            # monotone in each input
+            lo = float(fuse(torch.full((1, 1, 2, 2), 0.1),
+                            torch.full((1, 1, 2, 2), 0.1))[0, 0, 0, 0])
+            hi = float(fuse(torch.full((1, 1, 2, 2), 0.9),
+                            torch.full((1, 1, 2, 2), 0.9))[0, 0, 0, 0])
+            self.assertGreater(hi, lo)
+            self.assertGreater(lo, 0.0)
+            self.assertLess(hi, 1.0)
+
+    def test_39_safety_net_ignores_global_anomaly(self):
+        """A whole-frame anomaly (light flicker / mis-calibration) is not a defect."""
+        G = 160
+        cfg = load_config(CFG_N)
+        ctx = np.zeros((3, G, G), np.float32)
+        ctx[1] = 0.95                                   # all cloth
+        flooded = np.full((G, G), 0.55, np.float32)
+        empty_b = np.zeros((0, 4), np.float32)
+        empty_s = np.zeros(0, np.float32)
+        empty_l = np.zeros(0, np.int64)
+        out = safety_net_numpy(flooded, empty_b, empty_s, empty_l,
+                               (1280, 1280), cfg, 19, context=ctx)
+        self.assertEqual(out["n_safety_boxes"], 0,
+                         "full-frame component must not become a box")
+        self.assertEqual(out["n_global_components"], 1)
+        # a genuinely large but LOCAL defect is still emitted
+        local = np.zeros((G, G), np.float32)
+        local[20:140, 20:140] = 0.9                     # 12100 cells = 47%
+        out2 = safety_net_numpy(local, empty_b, empty_s, empty_l,
+                               (1280, 1280), cfg, 19, context=ctx)
+        self.assertEqual(out2["n_safety_boxes"], 1)
+
+    def test_40_predict_boxes_back_to_image_pixels(self):
+        """Detections must be reported/drawn in ORIGINAL image coordinates."""
+        from predict import boxes_to_image_pixels
+        net = 1280
+        boxes = np.array([[128., 256., 640., 512.]], np.float32)
+        got = boxes_to_image_pixels(boxes, net, 640, 360)
+        np.testing.assert_allclose(
+            got, np.array([[64., 72., 320., 144.]], np.float32), rtol=1e-5)
+        # clipping: a box outside the network frame stays inside the image
+        clipped = boxes_to_image_pixels(
+            np.array([[-50., -50., 5000., 5000.]], np.float32), net, 100, 50)
+        np.testing.assert_allclose(clipped,
+                                   np.array([[0., 0., 100., 50.]], np.float32))
+        self.assertEqual(boxes_to_image_pixels(np.zeros((0, 4), np.float32),
+                                              net, 10, 10).shape, (0, 4))
+
+    def test_41_list_images_single_pass(self):
+        """One directory walk must return exactly what the 14-pattern walk did."""
+        from jingwei.data import IMG_EXTS, list_images
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "数据"
+            (root / "sub" / "deeper").mkdir(parents=True)
+            names = ["a.jpg", "b.JPG", "c.PNG", "d.WebP", "e.tif", "f.txt",
+                     "sub/g.jpeg", "sub/deeper/h.bmp"]
+            for n in names:
+                if Path(n).suffix.lower() == ".txt":
+                    (root / n).parent.mkdir(parents=True, exist_ok=True)
+                    (root / n).write_text("not an image", encoding="utf-8")
+                else:
+                    imwrite_unicode(root / n, weave(9, 128, 0.1, 32))
+            (root / "looks_like_image.jpg").mkdir()   # directory, not a file
+            legacy = set()
+            for ext in IMG_EXTS:
+                legacy.update(root.rglob(ext))
+            legacy = sorted(str(f) for f in legacy if f.is_file())
+            found = list_images(root)
+            # every image the old 14-pattern walk found is still found ...
+            self.assertTrue(set(legacy) <= set(found))
+            # ... plus mixed-case extensions ("d.WebP"), which the case
+            # sensitive rglob("*.webp")/rglob("*.WEBP") patterns missed even
+            # though imread_unicode can decode them.
+            self.assertEqual(len(found), 7)
+            self.assertTrue(any(f.endswith("d.WebP") for f in found))
+            self.assertFalse(any("looks_like_image" in f for f in found))
+            self.assertFalse(any(f.endswith("f.txt") for f in found))
+            self.assertEqual(list_images(root / "does_not_exist"), [])
+
+    def test_42_checkpoint_key_mismatch_is_reported(self):
+        """Partially-matching checkpoints must not load silently."""
+        from _common import load_state_dict_report
+        m = build_model(self.cfg)
+        sd = m.state_dict()
+        dropped = next(k for k in sd if k.startswith("backbone."))
+        partial = {k: v for k, v in sd.items() if k != dropped}
+        partial["bogus_layer.weight"] = torch.zeros(1)
+        fresh = build_model(self.cfg)
+        msgs = load_state_dict_report(fresh, partial, tag="unit-test")
+        self.assertEqual(len(msgs), 2)
+        self.assertIn("missing", msgs[0])
+        self.assertIn("unexpected", msgs[1])
+        # every key that WAS present must have been loaded
+        before = fresh.state_dict()[dropped].clone()
+        self.assertTrue(torch.equal(fresh.state_dict()[dropped], before))
+        for k, v in partial.items():
+            if k in fresh.state_dict():
+                self.assertTrue(torch.equal(fresh.state_dict()[k], v), k)
+        clean = load_state_dict_report(build_model(self.cfg), sd, tag="clean")
+        self.assertEqual(clean, [])
+
+
+    def test_43_worker_seeding_covers_python_random(self):
+        """Stage-0 views use ``random``; every worker must get its own stream."""
+        from jingwei.data import _seed_worker
+
+        def draw(worker_id):
+            random.seed(0)
+            _seed_worker(worker_id, 7)
+            return [random.random() for _ in range(4)]
+
+        self.assertEqual(draw(3), draw(3), "same worker id -> reproducible")
+        self.assertNotEqual(draw(3), draw(4),
+                            "different workers must not share one stream")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
