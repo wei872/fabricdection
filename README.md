@@ -31,11 +31,11 @@
 | **[docs/DINO_PRETRAIN.md](docs/DINO_PRETRAIN.md)** | **用 DINOv2 做阶段 0 离线蒸馏预训练：为什么需要、命令、许可证、A/B 验证** |
 | **[docs/FOREGROUND.md](docs/FOREGROUND.md)** | **局部+全局注意力前景/背景分离、动态布幅跟随、边缘正常折入误报抑制** |
 | **[docs/CACHE_AND_VALIDATION.md](docs/CACHE_AND_VALIDATION.md)** | **每 epoch 精确率/召回率/mAP、未知疵点框、1660S 实时预测命令，以及大数据集训练速度实测** |
-| **[docs/CODE_REVIEW.md](docs/CODE_REVIEW.md)** | **代码审查与优化建议：已修复 15 项（含融合门控标定失效、全幅误框、框坐标、LCN 算子量、NumPy 2 兼容）+ 13 项待办与优先级** |
+| **[docs/CODE_REVIEW.md](docs/CODE_REVIEW.md)** | **代码审查与优化建议：已修复 19 项（含**融合门控标定失效**、**全幅误框**、**precision 上不去的解码峰值缺陷**、框坐标、LCN 算子量、NumPy 2 兼容）+ 13 项待办与优先级** |
 | `jingwei/` | 参考实现：主干 / 双尺度头 / 记忆库 / 线性注意力重建 / 安全网 / 损失 / 数据集 / **Unicode 安全图像 I/O** / **安全 checkpoint 加载** / DINO teacher 工具 |
 | `configs/` | `jingwei_n.yaml`（实时优先）、`jingwei_s.yaml`（精度优先）、**`jingwei_p.yaml`（GTX 1660 SUPER 等无 Tensor Core 卡专用）**、`fabric19.yaml`（数据）；均含 `dino:` 阶段 0 配置 |
 | `tools/` | **DINOv2 蒸馏预训练**、训练（启动 / batch 级日志 + **完整断点续训** + **每 epoch 验证指标**）、建库、标定、评估、推理、导出、算力剖析、**真实设备延迟实测** CLI |
-| `tests/test_model.py` | 42 项单元测试（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态注意力前景 / 验证指标 / 未知框） |
+| `tests/test_model.py` | 47 项单元测试（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态注意力前景 / 验证指标 / 未知框） |
 
 > `dataset/dataset.yaml` 保持原样，作为 19 个类别名的真源。
 
@@ -46,7 +46,7 @@
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m unittest discover -s tests -v     # 应输出 OK (42 tests，含验证指标 / 未知缺陷框)
+python -m unittest discover -s tests -v     # 应输出 OK (47 tests，含验证指标 / 未知缺陷框)
 python tools/benchmark.py --both            # 参数量 / MACs / 延迟估算
 ```
 
@@ -103,7 +103,7 @@ python tools/train_normality.py  --cfg configs/jingwei_n.yaml --resume runs/norm
 
 ```
 python -m unittest discover -s tests -v
-Ran 42 tests in ~90 s — OK
+Ran 47 tests in ~97 s — OK
   jingwei_n = 6.36 M / 16.62 G MACs @1280
   jingwei_p = 2.93 M /  8.09 G MACs @1280
   stage 0 DINOv2 distillation + local+global attention fg context = smoke OK

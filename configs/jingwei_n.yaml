@@ -33,6 +33,11 @@ model:
   score_thresh: 0.05
   reg_scale: 1.0
   fg_align: true             # 前景对齐辅助分支, 训练时才有, 导出即删
+  # NMS-free 解码仍然必须做"峰值"解码：o2o 分支在缺陷附近是一整片高原，
+  # 只做 top-k + 阈值会把高原上每个 cell 变成一个框（实测一个缺陷 144 个框，
+  # 即 1 TP + 143 FP —— 这是 precision 上不去的直接原因）。
+  peak_filter: true             # 只保留 3x3 局部极大值（每个目标一个峰）
+  peak_kernel: 3                # 1 = 关闭峰值过滤（退回旧行为，用于 A/B）
 
 normality:
   enabled: true

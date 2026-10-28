@@ -1169,5 +1169,103 @@ class TestModel(unittest.TestCase):
         self.assertNotEqual(draw(3), draw(4),
                             "different workers must not share one stream")
 
+    # ------------------------------------------------------- precision / decode
+    @staticmethod
+    def _blob_preds(nc=19, h=160, w=160, blob=(60, 72, 60, 72), obj_logit=3.0):
+        """One confident defect blob on the P3 map, nothing on P5."""
+        obj = torch.full((1, 1, h, w), -8.0)
+        y0, y1, x0, x1 = blob
+        obj[:, :, y0:y1, x0:x1] = obj_logit
+        cls = torch.full((1, nc, h, w), -6.0)
+        cls[:, 3, :, :] = 4.0
+        reg = torch.full((1, 4, h, w), 2.0)
+        p3 = dict(cls=cls, reg=reg, obj_o2o=obj)
+        p5 = dict(cls=torch.full((1, nc, 40, 40), -6.0),
+                  reg=torch.full((1, 4, 40, 40), 2.0),
+                  obj_o2o=torch.full((1, 1, 40, 40), -8.0))
+        return [p3, p5]
+
+    def test_44_peak_filter_prevents_duplicate_boxes(self):
+        """One defect must decode to ONE box, not one box per plateau cell."""
+        m = build_model(self.cfg).eval()
+        preds = self._blob_preds()
+        on = m.head.decode(preds, (1280, 1280))[0]
+        self.assertEqual(len(on["boxes"]), 1,
+                         "3x3 peak filter must collapse one defect to one box")
+
+        # A/B: disabling the filter reproduces the old (precision-killing)
+        # behaviour of one box per high-objectness cell.
+        m.head.peak_filter = False
+        off = m.head.decode(preds, (1280, 1280))[0]
+        self.assertGreater(len(off["boxes"]), 100,
+                           "without the filter every plateau cell becomes a box")
+        # sanity: the surviving box is the one in the blob
+        b = on["boxes"][0]
+        self.assertLess(abs(float(b[0] + b[2]) / 2 - 1280 * 66 / 160), 60)
+        m.head.peak_filter = True
+
+    def test_45_peak_filter_keeps_separate_defects(self):
+        """Two well-separated defects -> two peaks, not one."""
+        m = build_model(self.cfg).eval()
+        obj = torch.full((1, 1, 160, 160), -8.0)
+        obj[:, :, 20:26, 20:26] = 3.0
+        obj[:, :, 120:126, 120:126] = 2.0
+        cls = torch.full((1, 19, 160, 160), -6.0)
+        cls[:, 5, :, :] = 4.0
+        reg = torch.full((1, 4, 160, 160), 2.0)
+        preds = [dict(cls=cls, reg=reg, obj_o2o=obj),
+                 dict(cls=torch.full((1, 19, 40, 40), -6.0),
+                      reg=torch.full((1, 4, 40, 40), 2.0),
+                      obj_o2o=torch.full((1, 1, 40, 40), -8.0))]
+        d = m.head.decode(preds, (1280, 1280))[0]
+        self.assertEqual(len(d["boxes"]), 2)
+        self.assertEqual(sorted(d["labels"].tolist()), [5, 5])
+
+    def test_46_selection_metric_is_precision_aware(self):
+        """`best.pt` must not be chosen by a metric that ignores precision."""
+        import re
+        src = (ROOT / "tools" / "train_detector.py").read_text(encoding="utf-8")
+        # the old objective only used mAP50 + large_recall (both recall-ish)
+        self.assertNotIn("score = 0.5 * val_metrics[\"mAP50\"]", src)
+        self.assertIn("best_f1", src)
+        self.assertRegex(src, r"score = float\(val_metrics\[\"best_f1\"\]\)")
+        # and the per-epoch log must expose the FP breakdown
+        self.assertIn("wrong_class=", src)
+        self.assertIn("boxes/img=", src)
+
+    def test_47_fusion_calibration_ranks_by_f1(self):
+        """Stage D must measure (and rank by) precision, not recall alone."""
+        src = (ROOT / "tools" / "calibrate_fusion.py").read_text(encoding="utf-8")
+        self.assertIn("detection_precision_from_cache", src)
+        self.assertIn("F1=", src)
+        self.assertIn("--min-precision", src)
+
+    def test_48_val_loader_reports_boxes_per_image(self):
+        """evaluate_map must expose dets/image so precision is diagnosable."""
+        from evaluate import evaluate_map
+
+        class Stub(torch.nn.Module):
+            def __init__(self, n_box):
+                super().__init__()
+                self.n_box = n_box
+
+            def forward(self, x):
+                out = []
+                for _ in range(x.shape[0]):
+                    b = torch.tensor([[10., 10., 100., 100.]] * self.n_box)
+                    out.append(dict(boxes=b, scores=torch.tensor([0.9] * self.n_box),
+                                    labels=torch.zeros(self.n_box, dtype=torch.long)))
+                return out
+
+        batch = dict(image=torch.zeros(1, 3, 128, 128),
+                     boxes=[torch.tensor([[10., 10., 100., 100.]])],  # IoU 1
+                     labels=[torch.tensor([0])])
+        _, _, pr = evaluate_map(Stub(6), [batch], "cpu", 2, conf_thresh=0.5)
+        self.assertAlmostEqual(pr["dets_per_image"], 6.0)
+        # 1 TP + 5 duplicates -> precision 1/6 (class-aware TP/FP)
+        self.assertAlmostEqual(pr["precision"], 1 / 6, places=4)
+        self.assertEqual(pr["fp_breakdown"]["duplicate_same_gt"], 5)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

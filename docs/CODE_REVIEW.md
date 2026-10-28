@@ -1,9 +1,11 @@
-# 代码审查与优化建议（v0.1.8）
+# 代码审查与优化建议（v0.1.9）
 
 > 审查对象：`jingwei/`（推理库）+ `tools/`（训练/评估/部署 CLI）+ `tests/` + `configs/`。
 > 审查方式：逐文件静态审查 + 全部单元测试实跑 + 针对性探针脚本（下面每条结论都附复现方式或实测数字）。
 > 结论：**架构与工程质量已经不错，但存在 1 个会让"未知异常兜底"整体失效的 P0 级标定缺陷**，
-> 以及若干 P1 级坐标/平台/多进程/依赖兼容问题。本轮已修复 15 项（含 P0），剩余 13 项（其中 2.13 汇总了 8 个低风险小项）按优先级列在第 2 节。
+> 以及若干 P1 级坐标/平台/多进程/依赖兼容问题。本轮已修复 19 项（含 3 个 P0），剩余 13 项
+> （其中 2.13 汇总了 8 个低风险小项）按优先级列在第 2 节。
+> **第 0.5 节专门回答「precision 为什么涨不上来」**（v0.1.9 修复）。
 
 ---
 
@@ -14,14 +16,130 @@
 | 沙箱 | 2 vCPU / 3 GB RAM / 无 GPU（只为复现正确性与相对性能，不代表产线速度） |
 | Python / Torch | 3.11.2 / 2.4.1+cu121（CPU 执行） |
 | 基线（改动前） | `python -m unittest discover -s tests -v` → **Ran 35 tests in 123.6 s — OK (skipped=1)** |
-| 改动后 | **Ran 42 tests in 91.3 s — OK**（新增 7 项回归测试；同机同时长下降 26%；装上 `onnx` 后 ONNX 导出测试不再 skip） |
+| 改动后 | **Ran 47 tests in 97.4 s — OK**（新增 12 项回归测试；装上 `onnx` 后 ONNX 导出测试不再 skip） |
 | 规模 | `jingwei_n` 6.36 M 参数 / 16.62 G MACs @1280；`jingwei_p` 2.93 M / 8.09 G MACs |
 
 只装 `requirements.txt` 时 `test_19_pico_onnx_export` 会被 skip（`onnx` 只是可选依赖），也就是说**导出路径在默认环境里其实从未被验证**，见 2.12。
 
 ---
 
-## 1. 本轮已修复（按严重程度）
+## 0.5 专题：为什么 precision 涨不上来（v0.1.9，P0）
+
+用户实测（stage A，`--val-conf` 默认 = `final_score_thresh` = 0.15）：
+
+```
+epoch 1  mAP50=0.1336  P=0.0927  R=0.2956  large_recall=0.3876  normal_fpr=0.0375
+epoch 2  mAP50=0.2457  P=0.0828  R=0.6101  large_recall=0.6873  normal_fpr=0.3125
+epoch 3  mAP50=0.3306  P=0.0712  R=0.7327  large_recall=0.8078  normal_fpr=0.0250
+```
+
+recall / mAP50 / large_recall 都在稳步上涨，**只有 precision 在掉**。这不是模型没学好，
+而是三处"只关心召回、不关心精度"的机制叠加，其中第 1 条是决定性的。
+
+### 原因 1（决定性）：decode 没有做峰值抑制 → 一个缺陷变成上百个框
+
+`jingwei/head.py::NMSFreeDetect.decode` 原来只有 `top_k + score_thresh`。但 o2o 分支的 objectness
+在缺陷周围是**一片高原**，不是尖峰：
+
+* `build_dense_targets` 给 o2m 分支的正样本是 **GT 中心 ±1.5·stride 的整片区域**（1280 输入、stride 8 时约 7×7=49 个 cell）；
+* 两个分支共享 `cls/reg` 特征，所以 `cls` 概率同样是一片高原；
+* decode 之前把高原上**每一个** cell 都解码成一个框。
+
+实测（`tests/test_model.py::test_44`，一个 12×12 的自信缺陷区域）：
+
+```
+boxes for ONE defect blob: 144        # 分数全是 0.935
+```
+
+于是 `precision = TP/(TP+FP) = 1/144 ≈ 0.7%`——**即使定位完全正确，precision 也不可能超过 1%**。
+这也正好解释了"recall 涨、precision 不涨"：多放框只会给 TP 增加机会，同时按同样速率堆积 FP。
+
+修复：`model.peak_filter`（默认开）在 decode 里做 **3×3 局部极大值过滤**：
+
+```python
+ranked = obj_2d - 1e-6 * flat_index      # 平局用索引破，饱和/常量高原只留一个峰
+pooled = F.max_pool2d(ranked, k, 1, k // 2)
+score  = score.masked_fill(ranked < pooled, -1.0)
+```
+
+* 同一个缺陷：**144 → 1 个框**（`test_44`），两个分开的缺陷仍然是 2 个框（`test_45`）；
+* 仍然 **NMS-free**：没有数据相关的循环、没有 IoU 矩阵、延迟仍然是静态上界；
+* 在**图外**执行（`decode` 本来就在 TensorRT 引擎之外），导出图不变；
+* `peak_filter: false` / `peak_kernel: 1` 可一键回退做 A/B。
+
+### 原因 2：模型选择指标本身不含 precision
+
+`tools/train_detector.py` 原来：
+
+```python
+score = 0.5 * val_metrics["mAP50"] + 0.5 * val_metrics["large_recall"]   # 两项都被"多出框"单调改善
+```
+
+`large_recall` 是纯召回；`mAP50` 对每帧框数基本免疫（排序不变、AP 不变），却同样不会因为
+precision 变差而下降。于是 `best.pt` 永远是"最激进"的那个 epoch，`large_recall=0.81` 就这么被选中了，
+而它的 precision 只有 0.07。
+
+修复：
+
+```python
+score = best_f1 - 2 * max(0, normal_fpr - target_fpr)     # best_f1 是阈值无关的 P/R 联合指标
+```
+
+启动日志会打印这条公式；`large_recall` / `mAP50` 仍然原样打印，只是不再单独决定 `best.pt`。
+
+### 原因 3：阶段 D 的标定目标会把 precision 再卖一次
+
+`tools/calibrate_fusion.py` 原来 `score = large_recall - 2*max(0, fpr - target_fpr)`，
+约束只有"整图 FPR ≤ 0.5%（放宽到 2%）"。这个目标对 `final_score_thresh` 单调 →
+网格搜索必然选**最低阈值 0.10**，实测 precision ≈ 0.1，等于把刚修好的精度又换回去了。
+
+修复：每个候选都实测 val precision，默认按 **F1** 排序（`--objective f1`），
+新增 `--min-precision` 硬约束，输出 yaml 里写入 `val_precision / val_f1`。
+
+### 原因 4（新增诊断能力）：以前根本看不出 FP 的来源
+
+每个 epoch 现在多打一行：
+
+```
+val   epoch   3/150  mAP50=... precision=... recall=... best_f1=...@0.28 large_recall=...
+      boxes/img= 12.4  FP: duplicate=812 wrong_class=301 localization=88 background=120  (best operating point: conf>=0.28)
+```
+
+读法（这直接决定下一步该改什么）：
+
+| 主导项 | 含义 | 对策 |
+|---|---|---|
+| `duplicate` 高 | 同一缺陷多个框（峰值抑制/阈值） | `model.peak_filter: true`、提高 `final_score_thresh` 到 `best operating point` |
+| `wrong_class` 高 | 框对了但类别错 | 打开 `train.class_weights`（19 类长尾），或用阶段 D 的 ROI 头重分类 |
+| `localization` 高 | IoU 落在 0.1–0.5 | 回归/DFI 侧：提高 `box_*` 权重、检查 `reg_scale` |
+| `background` 高 | 纯误报（布面正常纹理） | 2.3 节的"正常图入训练"（hard negative）+ 阶段 B/C 的异常图门控 |
+
+### 复现与验证
+
+```bash
+# 一个缺陷 -> 1 个框（修复后）；144 个框（peak_filter: false）
+python -m unittest tests.test_model.TestModel.test_44_peak_filter_prevents_duplicate_boxes -v
+python -m unittest tests.test_model.TestModel.test_45_peak_filter_keeps_separate_defects -v
+python -m unittest tests.test_model.TestModel.test_46_selection_metric_is_precision_aware -v
+python -m unittest tests.test_model.TestModel.test_47_fusion_calibration_ranks_by_f1 -v
+```
+
+### 重训后应该看到什么
+
+* `boxes/img` 从几十降到个位数（每条产线帧的真实缺陷数），`duplicate` 应接近 0；
+* 在相同 `--val-conf` 下 precision 应从 ~0.1 跳到 **0.4–0.8**（取决于类别是否可分）；
+* `best_f1` 与 `best operating point` 会给出真正的上线阈值；把 `--val-conf` 设成它再复看 precision。
+
+如果 precision 仍低，按上表看 `wrong_class` / `background` 哪一项主导——那才是下一步要改的东西
+（分类权重 or 正常图 hard negative），而不是继续调阈值。
+
+> 顺带解释你日志里的 `unknown_boxes=0`：stage A 用 `set_stage('detector')` 显式关掉了 normality 分支
+> （记忆库和重建器此时都未训练，其异常图近似常量），所以安全网在 stage A 不产生框——这是设计如此，
+> 不是 bug。安全网要等阶段 B/C 之后才会出现。
+
+---
+
+## 1. 本轮已修复（按严重程度；0.5 节的三项 precision 修复也在此列）
 
 ### P0-1 `AnomalyFusion(mode="gate")` 对概率做了第二次 sigmoid → 标定阈值失效
 
@@ -271,18 +389,23 @@ AttributeError: module 'numpy' has no attribute 'trapz'. Did you mean: 'trace'?
 ## 3. 本轮变更清单
 
 ```
+jingwei/head.py        decode 增加 3x3 局部极大值过滤（一个缺陷 144 框 → 1 框），
+                       NMS-free / 静态延迟 / 可在图外执行；model.peak_filter 可回退
 jingwei/layers.py      LocalContrastNorm._box → 可分离 box（等价，-87% 算术）
 jingwei/data.py        list_images 单次遍历（+ 大小写/目录修正）；_seed_worker 增 random.seed
 jingwei/normality.py   AnomalyFusion(gate) → logit 空间混合，保标定
 jingwei/fusion.py      max_component_area_ratio：全局异常不再输出全幅框；n_global_components 上报
 jingwei/model.py       detector-only 推理返回统一 dict schema
 tools/predict.py       框坐标回投原图；视频流式解码（--dump-frames 可选）；boxes_to_image_pixels()
-tools/calibrate_fusion.py  infer_labels_dir（Windows）+ normaltrain 回退
+tools/calibrate_fusion.py  infer_labels_dir（Windows）+ normaltrain 回退；
+                       候选按 val F1 排序 + --min-precision（不再只有 FPR 约束）
+tools/train_detector.py    best.pt 选择指标改为 best_f1（含 FPR 罚项）+ 每 epoch 打印
+                       boxes/img 与 FP 四分类（duplicate/wrong_class/localization/background）
 tools/evaluate.py      benchmark 在 cuda:N 上正确同步；average_precision 兼容 numpy 2 (np.trapezoid)
 tools/export.py        输出形状按 cfg 计算
 tools/_common.py       load_state_dict_report：missing/unexpected key 显式告警
-configs/*.yaml         coreset_ratio 标注为无效键
-tests/test_model.py    +7 项回归（37–43），test_24/34 适配新契约
+configs/*.yaml         coreset_ratio 标注为无效键；新增 peak_filter / peak_kernel
+tests/test_model.py    +12 项回归（37–48），test_24/34 适配新契约
 README.md / docs/*     测试数量与时长更正；新增本文件
 ```
 

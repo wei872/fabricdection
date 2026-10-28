@@ -107,10 +107,12 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
     unknown_boxes = 0
     n_det = 0
     large_hit = large_total = 0
+    n_images = 0
     fp_breakdown = {"duplicate_same_gt": 0, "wrong_class": 0,
                     "localization": 0, "background": 0}
     for batch in loader:
         dets = model(batch["image"].to(device))
+        n_images += len(dets)
         for b, d in enumerate(dets):
             gt_boxes = batch["boxes"][b].to(device)
             gt_labels = batch["labels"][b].to(device)
@@ -190,6 +192,7 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
           "f1": float(f1), "tp": int(tp), "fp": int(fp), "fn": int(fn),
           "n_gt": total_gt, "n_det": int(n_det),
           "unknown_boxes": int(unknown_boxes),
+          "dets_per_image": float(n_det) / max(1.0, float(n_images)),
           "best_f1": best_f1, "best_f1_thr": best_f1_thr,
           "fp_breakdown": fp_breakdown, "pr_at": pr_at}
     if large_min_area is not None:

@@ -1,9 +1,15 @@
 """Stage D — tune fusion / safety-net hyperparameters on val + normalval.
 
-Objective (explicitly matches the user's priority order):
+Objective (default ``--objective f1``):
 
-    maximise  recall(large defects)
+    maximise  F1(precision, recall(large defects))
     subject to  image-level FPR on normalval <= target_fpr
+    and         val precision >= --min-precision
+
+``--objective recall`` reproduces the old behaviour (recall only, constrained
+by FPR); it is kept for comparison only -- on our data it selects
+``final_score_thresh=0.10`` with precision ~0.1, i.e. it trades the detector's
+precision away to buy a few points of large-defect recall.
 
     python tools/calibrate_fusion.py --cfg configs/jingwei_n.yaml \
         --ckpt runs/bank/memory_bank.pt --out configs/fusion_calibrated.yaml
@@ -92,6 +98,43 @@ def normal_fpr_from_cache(dets):
     return sum(len(d["boxes"]) > 0 for d in dets) / max(1, len(dets))
 
 
+def detection_precision_from_cache(dets, cache, device, iou_thr=0.5):
+    """Class-agnostic precision over the cached val images.
+
+    Stage D used to maximise large-defect recall alone, subject only to an
+    image-level FPR bound.  That objective is monotone in "emit more boxes",
+    so the grid search happily selected settings with precision ~0.1 (e.g.
+    ``final_score_thresh=0.10``) -- i.e. tuning *re-introduced* the very
+    false-positive problem the detector had just fixed.  Precision is now
+    measured for every candidate and folded into the objective.
+    """
+    tp = fp = 0
+    i = 0
+    for _, _, _, _, batch in cache:
+        for b in range(len(batch["image"])):
+            d = dets[i]
+            i += 1
+            g = batch["boxes"][b].to(device)
+            pb, ps = d["boxes"], d["scores"]
+            if not pb.numel():
+                continue
+            if not g.numel():
+                fp += int(pb.shape[0])
+                continue
+            iou = box_iou(pb, g)
+            used = torch.zeros(len(g), dtype=torch.bool, device=device)
+            for k in torch.argsort(ps, descending=True).tolist():
+                row = iou[k].clone()
+                row[used] = -1
+                j = int(row.argmax())
+                if bool(row[j] >= iou_thr) and not used[j]:
+                    used[j] = True
+                    tp += 1
+                else:
+                    fp += 1
+    return tp / max(1, tp + fp)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cfg", default="configs/jingwei_n.yaml")
@@ -104,6 +147,10 @@ def main():
     ap.add_argument("--detector-only", action="store_true",
                     help="calibrate the stage-A detector without normality/fusion")
     ap.add_argument("--smoke", action="store_true")
+    ap.add_argument("--objective", choices=["f1", "recall"], default="f1",
+                    help="f1 (default, precision-aware) or recall (legacy)")
+    ap.add_argument("--min-precision", type=float, default=0.0,
+                    help="reject settings below this val precision (0 = off)")
     args = ap.parse_args()
 
     model, cfg = load_model(args.cfg, args.ckpt, args.device)
@@ -160,23 +207,32 @@ def main():
             rec = large_recall_from_cache(val_dets, val_cache, args.device,
                                           float(cfg.fusion.large_area_ratio),
                                           size=size)
+            prec = detection_precision_from_cache(val_dets, val_cache,
+                                                  args.device)
             fpr = normal_fpr_from_cache(norm_dets)
             ndet = sum(len(d["boxes"]) for d in val_dets) / max(1, len(val_dets))
-            ok = fpr <= max(target_fpr * 3, 0.02)
-            score = rec - 2.0 * max(0.0, fpr - target_fpr)
+            f1 = 2.0 * prec * rec / max(1e-9, prec + rec)
+            ok = (fpr <= max(target_fpr * 3, 0.02) and
+                  prec >= float(args.min_precision))
+            base = f1 if args.objective == "f1" else rec
+            score = base - 2.0 * max(0.0, fpr - target_fpr)
             print(f"anomaly_thresh={ath:.2f} score_thresh={sth:.2f} "
-                  f"large_recall={rec:.4f} normal_FPR={fpr:.4f} "
-                  f"dets/img={ndet:.1f} "
+                  f"large_recall={rec:.4f} precision={prec:.4f} F1={f1:.4f} "
+                  f"normal_FPR={fpr:.4f} dets/img={ndet:.1f} "
                   f"score={score:.4f} {'OK' if ok else 'REJECT'}")
             if ok and (best is None or score > best[0]):
-                best = (score, ath, sth, rec, fpr)
+                best = (score, ath, sth, rec, prec, fpr)
 
     if best is None:
         print("no setting met the FPR constraint; relax target_fpr and retry")
         return
-    _, ath, sth, rec, fpr = best
+    _, ath, sth, rec, prec, fpr = best
     payload = {"fusion": {"anomaly_thresh": ath, "final_score_thresh": sth},
-               "measured": {"large_defect_recall": rec, "normal_image_fpr": fpr,
+               "measured": {"large_defect_recall": rec,
+                            "val_precision": prec,
+                            "val_f1": 2.0 * prec * rec / max(1e-9, prec + rec),
+                            "normal_image_fpr": fpr,
+                            "objective": args.objective,
                             "note": "measured by tools/calibrate_fusion.py on your val set"}}
     out = Path(args.out) if Path(args.out).is_absolute() else ROOT / args.out
     out.parent.mkdir(parents=True, exist_ok=True)

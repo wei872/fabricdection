@@ -214,6 +214,9 @@ def main():
         f"seed={args.seed}")
     log(f"start_epoch={start_epoch + 1}/{epochs}  global_iter={it}  "
         f"save_interval={args.save_interval}  log_interval={args.log_interval}")
+    log("model selection: score = best_f1 - 2*max(0, normal_fpr - target_fpr)"
+        "  (precision-aware; large_recall is reported but no longer optimised"
+        " on its own)")
     log(f"val_interval={args.val_interval}  val_batch={val_batch}  "
         f"val_workers={0 if args.smoke else args.val_workers}  "
         f"val_max={args.val_max}  normal_max={args.normal_max}  "
@@ -331,7 +334,31 @@ def main():
                 f"normal_fpr={val_metrics['normal_fpr']:.4f}  "
                 f"unknown_boxes={val_metrics['unknown_boxes']}  "
                 f"({val_metrics['seconds']:.1f}s)")
-            score = 0.5 * val_metrics["mAP50"] + 0.5 * val_metrics["large_recall"]
+            # Why precision is what it is: TP/FP are class-aware, so every extra
+            # box is either a duplicate of an already-matched GT, a wrong class,
+            # bad localisation, or pure background.  Without this line a low
+            # precision is unactionable.
+            fb = val_metrics.get("fp_breakdown", {})
+            log(f"      boxes/img={val_metrics.get('dets_per_image', 0.0):5.1f}  "
+                f"FP: duplicate={fb.get('duplicate_same_gt', 0)} "
+                f"wrong_class={fb.get('wrong_class', 0)} "
+                f"localization={fb.get('localization', 0)} "
+                f"background={fb.get('background', 0)}  "
+                f"(best operating point: conf>={val_metrics['best_f1_thr']:.2f})")
+            # Model selection must be precision-aware.  The old objective
+            # (0.5*mAP50 + 0.5*large_recall) ignored precision completely and
+            # is maximised by flooding the frame with boxes: recall rises,
+            # precision collapses, and `best.pt` is never a usable model.
+            # best_f1 is threshold-free and jointly ranks precision/recall;
+            # the normal-image FPR term keeps false alarms out.
+            fpr_over = max(0.0, float(val_metrics["normal_fpr"])
+                           - float(cfg.normality.target_fpr))
+            score = float(val_metrics["best_f1"]) - 2.0 * fpr_over
+            if (float(val_metrics["best_f1"]) <= 0.0 and
+                    float(val_metrics["mAP50"]) <= 0.0):
+                log("[!] no usable detections this epoch (precision = recall = 0); "
+                    "best.pt only becomes meaningful once boxes clear the "
+                    "score threshold. Check --val-conf and model.peak_filter.")
             if score > best_score:
                 best_score = score
                 save_checkpoint({"model": model.state_dict(),

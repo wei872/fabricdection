@@ -64,6 +64,14 @@ class NMSFreeDetect(nn.Module):
         self.top_k = int(m.top_k)
         self.score_thresh = float(m.score_thresh)
         self.reg_scale = float(m.reg_scale)
+        # One-to-one (NMS-free) decoding still has to be *peak* decoding.
+        # Without a local-maximum filter every cell of a high-objectness
+        # plateau becomes its own box: a single 12x12 px blob on the P3 map
+        # decoded to 144 overlapping boxes at the same score, i.e. 1 TP and
+        # 143 FP.  That is the structural reason validation precision stays
+        # near 0.1 no matter how well the detector localises.
+        self.peak_filter = bool(m.get("peak_filter", True))
+        self.peak_kernel = max(1, int(m.get("peak_kernel", 3)))
         self.heads = nn.ModuleList([
             DecoupledHead(channels[1], self.nc, m.head_width, m.fg_align),
             DecoupledHead(channels[3], self.nc, m.head_width, m.fg_align),
@@ -87,8 +95,12 @@ class NMSFreeDetect(nn.Module):
     # ----------------------------------------------------------------------------------
     @torch.no_grad()
     def decode(self, preds, img_size, anomaly_boost: torch.Tensor | None = None):
-        """top-k + threshold over the one-to-one branch. No NMS, no post-hoc
-        data-dependent loops -> fixed, bounded latency.
+        """local-peak + top-k + threshold over the one-to-one branch.
+
+        No NMS, no post-hoc data-dependent loops -> fixed, bounded latency.
+        ``model.peak_filter`` (default on) keeps only 3x3 objectness maxima,
+        which is what makes "one peak per object" actually hold at inference;
+        with ``top_k`` alone a single defect yields dozens of duplicate boxes.
 
         Returns list[B] of dict(boxes(N,4) xyxy px, scores(N,), labels(N,),
                                 obj(N,), points(N,2), scale_idx(N,)).
@@ -111,9 +123,31 @@ class NMSFreeDetect(nn.Module):
                                       mode="bilinear", align_corners=False).reshape(-1)
                     obj = obj + float(self.anomaly_logit_gain) * a
 
+                # ---- keep only local objectness maxima (one peak per object) --
+                # The o2o branch is trained with a single positive cell per GT,
+                # but objectness in the neighbourhood of a defect is a smooth
+                # plateau, so thresholding alone keeps every cell of it.  A
+                # 3x3 max-pool comparison removes those duplicates *inside*
+                # the graph-external decode (no data-dependent loops, static
+                # latency, still NMS-free).
+                peak_mask = None
+                if self.peak_filter and self.peak_kernel > 1:
+                    o2d = obj.reshape(1, 1, H, W)
+                    # tie-break ramp: 1e-6 * flat index, far below any real
+                    # logit difference, but makes saturated/constant plateaus
+                    # collapse to exactly one peak instead of surviving intact.
+                    ramp = torch.arange(H * W, device=device,
+                                        dtype=torch.float32).reshape(1, 1, H, W)
+                    ranked = o2d - 1e-6 * ramp
+                    pooled = F.max_pool2d(ranked, self.peak_kernel, 1,
+                                          self.peak_kernel // 2)
+                    peak_mask = (ranked >= pooled).reshape(-1)
+
                 cls_prob = cls.sigmoid()
                 cscore, clabel = cls_prob.max(dim=-1)
                 score = obj.sigmoid() * cscore
+                if peak_mask is not None:
+                    score = score.masked_fill(~peak_mask, -1.0)
 
                 k = min(self.top_k, score.numel())
                 top = torch.topk(score, k)
