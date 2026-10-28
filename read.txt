@@ -1,0 +1,4 @@
+python tools/pretrain_dino.py --cfg configs/jingwei_p.yaml --data configs/fabric19.yaml --teacher dinov2_vits14 --iters 5000 --log-interval 100 --num-workers 4 --out runs/dino
+
+
+python tools/train_detector.py --cfg configs/jingwei_p.yaml --data configs/fabric19.yaml --resume runs/dino/dino_init.pt --num-workers 4 --amp bf16 --epochs 150 --batch 8 --log-interval 1 --val-interval 1 --val-max 300 --normal-max 300 --out runs/detector

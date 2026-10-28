@@ -1,0 +1,17 @@
+# JingWei (经纬) — fabric defect detection reference implementation
+# Python >= 3.9
+torch>=2.0
+torchvision>=0.15        # only needed for optional ROIAlign
+numpy>=1.23,<2          # torch 2.x CPU/GPU wheels still expect numpy 1.x
+opencv-python-headless>=4.7
+PyYAML>=6.0
+scipy>=1.10             # Hungarian matcher in the one-to-one assignment
+tqdm>=4.65
+
+# ---- Optional, only for the corresponding tooling ----
+# faiss-gpu / faiss-cpu   # exact k-NN memory bank (the deployable path uses centroids and needs none)
+# onnx, onnxsim           # tools/export.py
+# tensorrt                # INT8/FP16 engine build on target device
+# ultralytics>=8.3        # optional: YOLO26/YOLO27 backbone warm-start, see docs/DESIGN.md §12
+# torchvision + torch.hub (facebookresearch/dinov2 clone + backbone-only .pth)
+#                         # optional stage-0 DINOv2 teacher: tools/pretrain_dino.py
