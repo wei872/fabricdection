@@ -7,6 +7,7 @@ input_size: [1280, 1280]
 
 data:
   nc: 19
+  label_offset: 0             # 0=YOLO 0..18；1=若标签是 1..19；auto=发现 cls>=19 时自动按 1-based 处理
   dataset_yaml: configs/fabric19.yaml
   names: ['纬线杂质', '断纬', '多股线', '纬线不直', '包边不重叠', '捻接器接头',
           '小尾巴', '经线毛球', '包边不良', '手工接头', '纬斜', '短废纱线',

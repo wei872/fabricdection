@@ -15,6 +15,8 @@ normaltrain: dataset/normal/images/train
 normalval: dataset/normal/images/val
 
 nc: 19
+# 若 YOLO .txt 的类别号是 1..19 而不是 0..18，把下面改成 1，或训练时加 --label-offset 1
+label_offset: 0
 names: ['纬线杂质', '断纬', '多股线', '纬线不直', '包边不重叠', '捻接器接头',
         '小尾巴', '经线毛球', '包边不良', '手工接头', '纬斜', '短废纱线',
         '单根包不进', '棉团', '蚊虫小黑点', '小布头', '稀缝', '油点线', '飘絮']

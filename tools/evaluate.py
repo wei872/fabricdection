@@ -17,9 +17,10 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from _common import (ROOT, SyntheticNormalDataset, add_cache_args, data_paths,
-                     load_model, make_dataset, resolve)
+                     load_model, make_dataset, resolve, resolve_label_offset)
 from jingwei.data import collate
 from jingwei.image_io import ascii_safe, console_safe
+from jingwei.losses import sanitize_detection_targets
 from jingwei.utils import box_iou, count_parameters, profile_macs
 
 
@@ -33,7 +34,8 @@ def average_precision(recall, precision):
 
 
 @torch.no_grad()
-def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0):
+def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
+                 label_offset=0):
     """mAP50 + global precision/recall/F1 at ``conf_thresh``.
 
     Unknown-class boxes (label >= nc) are counted separately: they are the
@@ -46,10 +48,18 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0):
     unknown_boxes = 0
     n_det = 0
     for batch in loader:
-        dets = model(batch["image"].to(device))
+        images = batch["image"]
+        bsz = images.size(0)
+        raw_boxes = batch.get("boxes", [torch.zeros((0, 4))] * bsz)
+        raw_labels = batch.get("labels", [torch.zeros((0,), dtype=torch.long)] * bsz)
+        targets = sanitize_detection_targets(
+            [{"boxes": raw_boxes[b], "labels": raw_labels[b]}
+             for b in range(bsz)],
+            nc, (images.shape[-2], images.shape[-1]), device, label_offset)
+        dets = model(images.to(device))
         for b, d in enumerate(dets):
-            gt_boxes = batch["boxes"][b].to(device)
-            gt_labels = batch["labels"][b].to(device)
+            gt_boxes = targets[b]["boxes"]
+            gt_labels = targets[b]["labels"]
             for c in range(nc):
                 n_gt[c] += int((gt_labels == c).sum())
             used = torch.zeros(len(gt_boxes), dtype=torch.bool, device=device)
@@ -103,12 +113,20 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0):
 
 
 @torch.no_grad()
-def large_defect_recall(model, loader, device, ratio):
+def large_defect_recall(model, loader, device, ratio, nc=19, label_offset=0):
     hit, total = 0, 0
     for batch in loader:
-        dets = model(batch["image"].to(device))
+        images = batch["image"]
+        bsz = images.size(0)
+        raw_boxes = batch.get("boxes", [torch.zeros((0, 4))] * bsz)
+        raw_labels = batch.get("labels", [torch.zeros((0,), dtype=torch.long)] * bsz)
+        targets = sanitize_detection_targets(
+            [{"boxes": raw_boxes[b], "labels": raw_labels[b]}
+             for b in range(bsz)],
+            nc, (images.shape[-2], images.shape[-1]), device, label_offset)
+        dets = model(images.to(device))
         for b, d in enumerate(dets):
-            g = batch["boxes"][b].to(device)
+            g = targets[b]["boxes"]
             if g.numel() == 0:
                 continue
             area = ((g[:, 2] - g[:, 0]) * (g[:, 3] - g[:, 1])) / (1280 * 1280)
@@ -135,15 +153,16 @@ def normal_fpr(model, loader, device):
 
 @torch.no_grad()
 def validate_detector(model, val_loader, norm_loader, device, cfg,
-                      conf_thresh=None, iou_thr=0.5):
+                      conf_thresh=None, iou_thr=0.5, label_offset=0):
     """One validation pass returning all acceptance metrics as a plain dict."""
     conf = float(conf_thresh if conf_thresh is not None
                  else cfg.fusion.final_score_thresh)
     map50, aps, pr = evaluate_map(model, val_loader, device,
                                   int(cfg.data.nc), iou_thr=iou_thr,
-                                  conf_thresh=conf)
+                                  conf_thresh=conf, label_offset=label_offset)
     rec = large_defect_recall(model, val_loader, device,
-                              float(cfg.fusion.large_area_ratio))
+                              float(cfg.fusion.large_area_ratio),
+                              nc=int(cfg.data.nc), label_offset=label_offset)
     if norm_loader is not None:
         fpr, nfp, nn = normal_fpr(model, norm_loader, device)
     else:
@@ -191,6 +210,8 @@ def main():
                     help="score threshold for precision/recall "
                          "(default: fusion.final_score_thresh)")
     ap.add_argument("--val-iou", type=float, default=0.5)
+    ap.add_argument("--label-offset", choices=["0", "1", "auto"], default=None,
+                    help="YOLO class-id offset: 0=0..18, 1=1..19, auto=infer")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--names", default=None)
     ap.add_argument("--emit-unknown", action="store_true",
@@ -201,11 +222,20 @@ def main():
     args = ap.parse_args()
 
     model, cfg = load_model(args.cfg, args.ckpt, args.device)
+    label_offset = (args.label_offset if args.label_offset is not None
+                    else cfg.data.get("label_offset", 0))
+    # make_dataset() normalises cached labels with the same offset.
+    args.nc = int(cfg.data.nc)
     if args.emit_unknown:
         cfg.fusion.emit_unknown_boxes = True
     if args.no_unknown:
         cfg.fusion.emit_unknown_boxes = False
     paths = data_paths(cfg, args.data)
+    # Resolve 'auto' once for the whole split (never per batch).
+    if not args.smoke:
+        label_offset = resolve_label_offset(label_offset, cfg.data.nc,
+                                            [resolve(paths["val"])])
+    args.label_offset = label_offset
     model.eval()
     size = int(cfg.input_size[0])
     names = list(cfg.data.names) if not args.names else args.names.split(",")
@@ -238,7 +268,8 @@ def main():
                                  collate_fn=collate)
 
     m = validate_detector(model, val_loader, norm_loader, args.device, cfg,
-                          conf_thresh=args.val_conf, iou_thr=args.val_iou)
+                          conf_thresh=args.val_conf, iou_thr=args.val_iou,
+                          label_offset=label_offset)
     macs = profile_macs(model, [torch.zeros(1, 3, size, size)])
 
     print("\n================ JingWei evaluation ================")

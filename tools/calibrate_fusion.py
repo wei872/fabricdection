@@ -19,21 +19,34 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
-from _common import ROOT, data_paths, load_model, resolve
-from jingwei.data import NormalImageDataset, YOLODefectDataset, collate
+from _common import (ROOT, data_paths, load_model, resolve,
+                     resolve_label_offset)
+from jingwei.data import (NormalImageDataset, YOLODefectDataset, collate,
+                          infer_labels_dir)
 from jingwei.fusion import fuse_detections
+from jingwei.losses import sanitize_detection_targets
 from jingwei.utils import box_iou
 from jingwei.image_io import console_safe
 
 
 @torch.no_grad()
-def precompute(model, loader, device):
+def precompute(model, loader, device, nc=19, label_offset=0):
     """Cache (feats, gated anomaly, context, preds, batch) per image."""
     cache = []
     for batch in loader:
-        x = batch["image"].to(device)
+        x = batch["image"]
+        if "boxes" in batch:
+            # Filter invalid class ids / boxes BEFORE any CUDA indexing.
+            targets = sanitize_detection_targets(
+                [{"boxes": batch["boxes"][b], "labels": batch["labels"][b]}
+                 for b in range(x.size(0))],
+                nc, (x.shape[-2], x.shape[-1]), device, label_offset)
+            batch = dict(batch)
+            batch["boxes"] = [t["boxes"] for t in targets]
+            batch["labels"] = [t["labels"] for t in targets]
+        x = x.to(device)
         feats = model.neck(model.backbone(x))
         raw = model.normality(feats, 0)["anomaly"] if model.normality is not None else None
         anomaly, context = raw, None
@@ -98,11 +111,21 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", default="configs/fusion_calibrated.yaml")
     ap.add_argument("--max-val", type=int, default=200)
+    ap.add_argument("--label-offset", choices=["0", "1", "auto"], default=None,
+                    help="YOLO class-id offset: 0=0..18, 1=1..19, auto=infer")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
 
     model, cfg = load_model(args.cfg, args.ckpt, args.device)
+    label_offset = (args.label_offset if args.label_offset is not None
+                    else cfg.data.get("label_offset", 0))
+    args.nc = int(cfg.data.nc)
     paths = data_paths(cfg, args.data)
+    # Resolve 'auto' once for the whole split (never per batch).
+    if not args.smoke:
+        label_offset = resolve_label_offset(label_offset, cfg.data.nc,
+                                            [resolve(paths["val"])])
+    args.label_offset = label_offset
     model.eval()
     size = int(cfg.input_size[0])
 
@@ -122,18 +145,20 @@ def main():
                                  batch_size=1, collate_fn=collate)
     else:
         vdir = resolve(paths["val"])
-        ldir = str(vdir).replace("/images/", "/labels/")
+        ldir = infer_labels_dir(vdir)
         val_ds = YOLODefectDataset(vdir, ldir, img_size=size, augment=False)
         idx = list(range(min(args.max_val, len(val_ds))))
-        val_loader = DataLoader(val_ds, batch_size=1, shuffle=False,
-                                collate_fn=collate, sampler=idx)
+        val_loader = DataLoader(Subset(val_ds, idx), batch_size=1,
+                                shuffle=False, collate_fn=collate)
         ndir = resolve(paths["normalval"])
         norm_loader = DataLoader(NormalImageDataset(ndir, img_size=size, augment=False),
                                  batch_size=1, shuffle=False, collate_fn=collate)
 
     print("precomputing network outputs ...")
-    val_cache = precompute(model, val_loader, args.device)
-    norm_cache = precompute(model, norm_loader, args.device)
+    val_cache = precompute(model, val_loader, args.device,
+                           nc=int(cfg.data.nc), label_offset=label_offset)
+    norm_cache = precompute(model, norm_loader, args.device,
+                            nc=int(cfg.data.nc), label_offset=label_offset)
 
     target_fpr = float(cfg.normality.target_fpr)
     best = None

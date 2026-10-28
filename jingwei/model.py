@@ -32,7 +32,8 @@ from .config import Cfg, load_config
 from .foreground import FabricContext, build_foreground_target
 from .fusion import ROIRefiner, fuse_detections
 from .head import NMSFreeDetect
-from .losses import DetectionLoss, HardMiningCosineLoss
+from .losses import (DetectionLoss, HardMiningCosineLoss,
+                     sanitize_detection_targets)
 from .neck import DualScalePAN
 from .normality import NormalityBranch
 
@@ -78,6 +79,13 @@ class JingWei(nn.Module):
         if self.training:
             preds = self.head(feats, training=True)
             out = {"preds": preds, "feats": feats}
+            if targets is not None:
+                # Drop malformed boxes / class ids (and apply a 1-based label
+                # offset if configured) BEFORE both the detection loss and the
+                # foreground pseudo-target builder touch them on CUDA.
+                targets = sanitize_detection_targets(
+                    targets, self.unknown_label, self.img_size, x.device,
+                    self.det_loss.label_offset)
             losses = self.det_loss(preds, targets, self.img_size) if targets is not None else None
             if self.normality is not None and self._normality_active:
                 nrm = self.normality(feats, proto_id, return_parts=True)

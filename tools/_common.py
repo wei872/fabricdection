@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from jingwei import build_model, load_config
 from jingwei.cache import (build_dataset_cache, cache_prefix,
+                           infer_label_offset_from_label_files,
                            load_cached_dataset)
 from jingwei.data import (NormalImageDataset, YOLODefectDataset, collate,
                           infer_labels_dir, list_images)
@@ -114,7 +115,9 @@ def make_dataset(split, images_dir, labels_dir, img_size, args, *,
     build_dataset_cache(images_dir, labels_dir if has_labels else None,
                         img_size, prefix, mode, has_labels,
                         rebuild=bool(getattr(args, "rebuild_cache", False)),
-                        log_fn=log_fn)
+                        log_fn=log_fn,
+                        label_offset=getattr(args, "label_offset", 0),
+                        nc=getattr(args, "nc", None))
     return load_cached_dataset(prefix, mode, augment, seed,
                                with_descriptor=with_descriptor)
 
@@ -123,6 +126,35 @@ def cache_dir_for(cfg, args) -> Path:
     """Resolve --cache-dir against the repo root (Unicode-safe)."""
     p = Path(getattr(args, "cache_dir", "runs/cache"))
     return p if p.is_absolute() else ROOT / p
+
+
+def resolve_label_offset(mode, nc, images_dirs, max_files=4000, log_fn=log):
+    """Turn ``--label-offset auto`` into a concrete 0/1 ONCE per training run.
+
+    A per-batch ``auto`` decision is unsafe: a batch whose labels happen to top
+    out at ``nc-1`` would not be shifted while other batches are, silently
+    mixing two id conventions in one model.  Here the decision is made from the
+    dataset itself (all label files, sampled), so every batch is consistent.
+    """
+    mode = str(mode).strip().lower()
+    if mode != "auto":
+        return mode
+    files = []
+    for images_dir in images_dirs:
+        labels_dir = Path(infer_labels_dir(images_dir))
+        if not labels_dir.is_dir():
+            continue
+        files.extend(sorted(str(p) for p in labels_dir.glob("*.txt"))[:max_files])
+    if not files:
+        # Do NOT silently pick 0: with 1-based labels that would make the
+        # runtime sanitizer drop every cls>=nc row (silent data loss).
+        log_fn("label_offset=auto: no label files found to inspect; keeping "
+               "'auto' (cache build / runtime sanitizer decide per split)")
+        return mode
+    shift = infer_label_offset_from_label_files(files, int(nc))
+    log_fn(f"label_offset=auto -> {shift} "
+           f"(inspected {len(files)} label files, nc={int(nc)})")
+    return shift
 
 
 def data_paths(cfg, override: str | None = None) -> dict:

@@ -25,7 +25,7 @@
 
 **已验证**（见 §13）：参考实现在 1280×1280 下 n 变体 **6.36 M 参数 / 16.62 G MACs**，
 无 Tensor Core 卡专用的 pico 变体 **2.93 M / 8.09 G MACs**，
-32 项单元测试全过（含中文 / Unicode 路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态局部+全局注意力前景 / 每 epoch 验证指标 / YOLO 式图像缓存 / 未知缺陷框回归），ONNX 导出成功且输出全为静态形状。
+36 项单元测试全过（含中文 / Unicode 路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态局部+全局注意力前景 / 每 epoch 验证指标 / YOLO 式图像缓存 / 未知缺陷框 / 标签校验与 CUDA 越界保护），ONNX 导出成功且输出全为静态形状。
 
 > ⚠️ **诚实声明**：仓库里目前只有 `dataset/dataset.yaml`（路径指向你本机的
 > `D:/tyhn/yolo/...`），**没有真实图片**。因此本文所有的精度数字都是**设计目标 / 验收指标**，
@@ -755,11 +755,11 @@ jingwei/
   dino.py       阶段 0 DINOv2 离线 teacher 工具
   model.py       JingWei 顶层（训练 / 推理 / 导出）
 tools/           阶段 0 + A–E 的 CLI（pretrain_dino / train / cache_dataset /
-                 build / calibrate / evaluate / predict / export / benchmark /
-                 bench_device）
+                 validate_labels / build / calibrate / evaluate / predict /
+                 export / benchmark / bench_device）
 tools/_common.py 共享数据/模型加载 + log()/format_eta() 进度日志 +
                  save_checkpoint()/resume_checkpoint()/RNG 断点续训工具
-tests/test_model.py  32 项单元测试（含验证指标 / 图像缓存 / 未知缺陷框）
+tests/test_model.py  36 项单元测试（含验证指标 / 图像缓存 / 未知缺陷框 / 标签校验）
 docs/DESIGN.md   本文
 docs/TRAINING.md 训练与数据准备手册
 docs/DEPLOYMENT.md 实时部署手册
@@ -935,7 +935,7 @@ python tools/train_normality.py --cfg configs/jingwei_p.yaml \
 执行 `python -m unittest discover -s tests -v`（CPU 即可，无需数据/GPU）：
 
 ```
-Ran 32 tests in ~140 s — OK
+Ran 36 tests in ~158 s — OK
 
   params = 6.36 M        MACs @1280 = 16.62 G   (jingwei_n)
   pico   = 2.93 M        MACs @1280 =  8.09 G   (jingwei_p)
@@ -948,6 +948,7 @@ Ran 32 tests in ~140 s — OK
   per-epoch val precision/recall/F1/mAP50/large recall = OK
   YOLO-style train.cache (disk/ram/bytes, Unicode paths) = OK
   unknown defect type boxes (label 19) = OK
+  invalid-label sanitize + 1-based offset + dense-target fallback = OK
 ```
 
 覆盖内容：
@@ -986,6 +987,10 @@ Ran 32 tests in ~140 s — OK
 | 30 | 阶段 A 每 epoch 输出 val 精确率 / 召回率 / F1 / mAP50 / 大缺陷召回 / FPR，并保存 `best.pt` |
 | 31 | YOLO 式 `train.cache`：`disk/ram/bytes` 三种缓存与中文路径 CLI 预生成，缓存数据与原数据集一致 |
 | 32 | 未知疵点类型（含小于 `large_area_ratio` 的异常连通域）也生成 `未知异常` 预测框，大缺陷兜底不被 `max_unknown_boxes` 丢弃 |
+| 33 | `sanitize_detection_targets` 在 CPU 侧丢弃非法类别 / 非法框；`--label-offset 1/auto` 只生效一次（幂等），混杂 `cls=99` 不影响整体 1-based 判定 |
+| 34 | 极小 / 贴边目标没有任何 centre-sampling 正样本时，兜底分支不再用网格索引去索引 `arange(G)`（CUDA `IndexKernel.cu:93` 越界回归） |
+| 35 | `tools/validate_labels.py` 报出 1-based 标签与脏缓存 → `--fix-one-based --rebuild-cache` 后 `.txt` 与缓存全部变成 `0..nc-1`，退出码由 2 变 0 |
+| 36 | `--label-offset auto` 按**整个 split** 解析（不是逐图）：某文件没出现 `cls==nc` 也会一起平移；缓存元数据记录已解析的偏移与丢弃行数 |
 
 **布种描述符实测**（合成织纹，周期 5/9/13/19 px、亮度 100/170、反光 0/0.9）：
 
@@ -1003,7 +1008,8 @@ Ran 32 tests in ~140 s — OK
 `NormalImageDataset` / `YOLODefectDataset` 写 / 恢复 numpy RNG state
 （见 §12.8 / 测试 28）。`train_detector` 另验证每 epoch val 指标 /
 `best.pt`（测试 30），`cache_dataset` / `jingwei/cache.py` 验证三种
-`train.cache` 模式与中文路径（测试 31），`fusion` 验证未知缺陷框（测试 32）。
+`train.cache` 模式与中文路径（测试 31），`fusion` 验证未知缺陷框（测试 32），
+标签 / CUDA 越界保护验证测试 33–36（见 [CACHE_AND_VALIDATION.md §6](CACHE_AND_VALIDATION.md)）。
 
 **ONNX 导出**：`tools/export.py` 成功导出 1280² 静态图，
 `onnx.checker` 通过；`roi_head=false`（pico）为 8 个输出（+context），

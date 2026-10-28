@@ -36,6 +36,11 @@ def main():
     add_cache_args(ap)
     ap.add_argument("--mode", choices=["ram", "disk", "bytes"], default=None,
                     help="alias for --cache")
+    ap.add_argument("--label-offset", choices=["0", "1", "auto"], default=None,
+                    help="YOLO class-id offset stored in cache: 0=0..18, "
+                         "1=1..19 labels, auto=infer; cached labels are always 0-based")
+    ap.add_argument("--nc", type=int, default=None,
+                    help="number of classes (default: cfg.data.nc)")
     ap.add_argument("--rebuild", action="store_true",
                     help="alias for --rebuild-cache")
     args = ap.parse_args()
@@ -47,6 +52,10 @@ def main():
         args.rebuild_cache = True
 
     cfg = load_config(args.cfg)
+    label_offset = (args.label_offset if args.label_offset is not None
+                    else cfg.data.get("label_offset", 0))
+    nc = int(args.nc if args.nc is not None else cfg.data.nc)
+    args.label_offset, args.nc = label_offset, nc
     paths = data_paths(cfg, args.data)
     size = int(args.img_size or cfg.input_size[0])
     cache_dir = Path(args.cache_dir)
@@ -57,7 +66,8 @@ def main():
     log("=" * 72)
     log("JingWei dataset cache builder")
     log(f"cfg={args.cfg}  data={args.data or cfg.data.dataset_yaml}  "
-        f"img_size={size}  mode={args.cache}  dir={cache_dir}")
+        f"img_size={size}  mode={args.cache}  dir={cache_dir}  "
+        f"nc={nc}  label_offset={label_offset}")
     log("=" * 72)
 
     for split in [s.strip() for s in args.splits.split(",") if s.strip()]:
@@ -73,7 +83,8 @@ def main():
         try:
             meta = build_dataset_cache(
                 img_dir, labels_dir, size, prefix, args.cache, has_labels,
-                rebuild=bool(args.rebuild_cache), log_fn=log)
+                rebuild=bool(args.rebuild_cache), log_fn=log,
+                label_offset=label_offset, nc=nc)
             log(f"[{split}] done: {meta['n']} images, "
                 f"labels={'yes' if has_labels else 'no'}")
         except FileNotFoundError as e:

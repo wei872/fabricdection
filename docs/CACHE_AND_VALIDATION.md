@@ -1,9 +1,10 @@
 # 训练缓存、每 epoch 验证指标与 1660S 实时预测
 
-> 针对真实训练中的三个问题：
+> 针对真实训练中的四个问题：
 > 1. “为什么日志只有 loss，没有验证集精确率 / 召回率？”
 > 2. “图片读取太慢，能不能像 YOLO 一样先生成 `train.cache`？”
 > 3. “未知疵点类型也要生成预测框，同时必须保证 GTX 1660 SUPER 实时。”
+> 4. “CUDA device-side assert / `IndexKernel.cu:93` 怎么定位并修复？”（见第 6 节）
 
 ---
 
@@ -176,7 +177,11 @@ trtexec --onnx=runs/export/jingwei_p.onnx --saveEngine=jingwei_p.engine --worksp
 ## 5. 建议的完整训练命令
 
 ```bash
-# 0) 生成缓存（只做一次）
+# 0) 先校验 YOLO 标签 / 1-based 类别号，再生成缓存（只做一次）
+python tools/validate_labels.py --cfg configs/jingwei_p.yaml \
+    --data configs/fabric19.yaml --cache disk \
+    --cache-dir runs/cache --splits train,val
+# 若报告 1-based：加 --fix-one-based --rebuild-cache，或训练时加 --label-offset 1
 python tools/cache_dataset.py --cfg configs/jingwei_p.yaml \
     --splits train,val,normaltrain,normalval --mode disk
 
@@ -199,3 +204,121 @@ python tools/evaluate.py --cfg configs/jingwei_p.yaml \
 python tools/predict.py --cfg configs/jingwei_p.yaml --realtime-1660 \
     --ckpt runs/detector/best.pt --source D:/产线图片/ --out runs/predict
 ```
+
+---
+
+## 6. CUDA `device-side assert triggered` / `IndexKernel.cu:93` 排查
+
+你贴的 Windows / RTX 4070 Laptop 日志：
+
+```
+set CUDA_LAUNCH_BLOCKING=1
+python tools/train_detector.py ... --cache disk --cache-dir D:/tyhn/yolo/dataset/runs/cache ...
+cache hit  -> train_1280_disk_*.json  (29533 images, mode=disk)
+...
+CUDA error: device-side assert triggered
+  File "...\jingwei\losses.py", line 101, in build_dense_targets
+    g = gi[idx]
+IndexKernel.cu:93: index out of bounds
+```
+
+`CUDA_LAUNCH_BLOCKING=1` 只是把异步错误定位到第一条出错的 kernel，**不是修复方法**。
+这个位置有两类真实根因，当前版本都已修复：
+
+1. **旧代码的兜底分支索引错误。** 极小 / 贴边目标没有任何 centre-sampling
+   正样本时，旧代码把「网格展平索引」`nearest` 当成「GT 索引」去索引
+   `torch.arange(G)`（长度只有目标数 G），在 CUDA 上直接越界。现在改为
+   `g = arange(G)`、`idx = nearest.clamp(0, H*W-1)`；CPU 单元测试
+   `test_34_dense_target_fallback_never_indexes_oob` 用 2×2 网格 + 两个贴边
+   小框复现这个越界并验证不再发生。
+2. **YOLO 标签类别号越界。** `nc=19` 时合法类别号必须是 `0..18`。如果 `.txt`
+   实际是 `1..19`（1-based），或某个文件混入 `19 / 99 / -1`，CUDA 的
+   `labels[g]` / `cls_all[:, labels]` 会触发 device-side assert。现在
+   `sanitize_detection_targets()` 在 CPU 侧先丢弃非法类别 / 非法框并只警告一次；
+   `build_dense_targets()` / `hungarian_match()` 还有明确 CPU-side
+   `ValueError`，不再把问题藏进 CUDA kernel。
+
+### 6.1 先用校验器看原始标签和缓存
+
+```bat
+python tools/validate_labels.py ^
+    --cfg configs/jingwei_p.yaml ^
+    --data D:/tyhn/yolo/dataset/dataset.yaml ^
+    --nc 19 --splits train,val ^
+    --cache disk --cache-dir D:/tyhn/yolo/dataset/runs/cache
+```
+
+它会检查：类别范围、1-based 证据、非有限 / 非正 / 越界框、格式错误行，
+以及 `*.json` 缓存里是否还残留旧的非法类别号。输出示例：
+
+```
+raw class ids: count=...  min=1  max=19  inferred_shift=1
+errors: bad_class=...  bad_box=...  malformed_line=...
+cache: records=...  errors=...
+RESULT: INVALID. Fix the reported labels / cache before CUDA training.
+```
+
+`--labels-dir "D:/.../labels/{split}"` 可在标签目录不符合
+`images/ -> labels/` 约定时覆盖；`{images_dir}` 也可作为占位符。
+
+### 6.2 两种修复方式（任选其一）
+
+**A. 永久改成 YOLO 标准 `0..18`，并重建缓存（推荐）：**
+
+```bat
+python tools/validate_labels.py ^
+    --cfg configs/jingwei_p.yaml ^
+    --data D:/tyhn/yolo/dataset/dataset.yaml ^
+    --nc 19 --splits train,val ^
+    --fix-one-based --label-offset auto ^
+    --cache disk --cache-dir D:/tyhn/yolo/dataset/runs/cache ^
+    --rebuild-cache
+```
+
+默认会为每个被改写的 `.txt` 生成 `*.txt.bak`；`--no-backup` 可关闭。
+`--rebuild-cache` 会重新生成 JSON/BIN/NPY，保证缓存里也是 0-based 标签。
+报告里可能仍会列出 `stale_cache`（描述的是**修复前**的旧缓存），带
+`[now rebuilt]` 标记且最终 `RESULT: OK` 即表示已修好。
+缓存中的标签**始终是 0-based**，所以校验器不会对缓存再减一次偏移；
+`label_offset` 只描述原始 `.txt` 的解释方式。
+另外，缓存格式版本已升到 `CACHE_VERSION = 3`，旧缓存即使不使用校验器，
+第一次训练也会自动重建一次，避免继续读到旧的非法标签。
+
+**B. 不改 `.txt`，训练和建缓存时统一偏移：**
+
+```bat
+python tools/cache_dataset.py --cfg configs/jingwei_p.yaml --mode disk ^
+    --data D:/tyhn/yolo/dataset/dataset.yaml --label-offset 1 ^
+    --cache-dir D:/tyhn/yolo/dataset/runs/cache --rebuild
+
+python tools/train_detector.py --cfg configs/jingwei_p.yaml --cache disk ^
+    --cache-dir D:/tyhn/yolo/dataset/runs/cache --label-offset 1 ^
+    --resume runs/dino/dino_init.pt --epochs 200 --batch 4 --out runs/detector
+```
+
+`--label-offset auto` 也可以：只有出现 `cls >= nc` 且所有类别都在 `1..nc`
+时才自动减 1，不会误伤正常的 `0..18` 数据。
+
+> **auto 是按整个 split 解析一次的**，不是逐图 / 逐 batch。否则某个 `.txt`
+> 恰好只含 `1..nc-1` 时不会被平移，同一个数据集里 0-based 与 1-based 混用，
+> 比直接报错更糟。训练启动时会打印 `label_offset=auto -> 1 (inspected N label
+> files, nc=19)`；缓存元数据里 `label_offset` 记录的是**已解析**的值，
+> `label_offset_requested` 保留原始请求。
+
+相同参数也适用于 `tools/evaluate.py`、`tools/calibrate_fusion.py` 和
+`tools/validate_labels.py`。训练 checkpoint 会记录 `label_offset`，
+断点续训时若当前参数不一致会打印 WARN。
+
+### 6.3 修复后的行为
+
+- 训练启动日志会打印 `label_offset=...`；
+- 非法 `.txt` / 缓存行会在 CPU 侧被丢弃并给出一次
+  `RuntimeWarning` + `tools/validate_labels.py` 提示；
+- 极小 / 贴边目标不再触发 CUDA 越界，仍会得到兜底正样本；
+- 每 epoch 验证指标、`best.pt`、断点续训、未知疵点框、1660S 实时路径均不变；
+- 可以把 `CUDA_LAUNCH_BLOCKING=1` 去掉再跑，正常训练速度更快。
+
+相关单元测试：`test_33_sanitize_detection_targets_and_label_offset`、
+`test_34_dense_target_fallback_never_indexes_oob`、
+`test_35_validate_labels_cli_fix_and_rebuild_cache`、
+`test_36_cache_builder_normalises_one_based_labels`。

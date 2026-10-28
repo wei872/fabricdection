@@ -15,7 +15,7 @@ pip install onnx tensorrt ultralytics
 
 最低验证环境（本仓库实测）：Python 3.11 + torch 2.2.2 (CPU 即可) +
 numpy 1.26 + opencv-python-headless + PyYAML + scipy + tqdm。
-跑 `python -m unittest discover -s tests -v` 应输出 `OK`（32 项）。
+跑 `python -m unittest discover -s tests -v` 应输出 `OK`（36 项）。
 阶段 0 的 `--smoke` 模式用 synthetic teacher，不需要下载 DINOv2 权重。
 
 ## 2. 数据准备
@@ -244,7 +244,7 @@ python tools/train_normality.py --cfg configs/jingwei_n.yaml \
 ## 4. 快速自检（无真实数据）
 
 ```bash
-python -m unittest discover -s tests -v                 # 32 项，约 140 s（含验证指标 / 图像缓存 / 未知缺陷框）
+python -m unittest discover -s tests -v                 # 36 项，约 158 s（含验证指标 / 图像缓存 / 未知缺陷框 / 标签校验）
 python tools/benchmark.py --all                         # p/n/s 参数量 / MACs / 延迟估算
 python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both  # 在你的 GPU 上实测
 python tools/train_detector.py   --smoke 2 --epochs 1 --batch 1 --device cpu --log-interval 1
@@ -276,7 +276,8 @@ python tools/export.py --check --out runs/export/jingwei_n.onnx
 | `--resume dino_init.pt` 显示 `weights-only` | `dino_init.pt` 是阶段 0 交给阶段 A 的权重文件，不含训练状态 | 这是正常的 weight-only 热启动；若要继续阶段 0 训练，应 `--resume runs/dino/last.pt` |
 | `AttributeError: 'dict' object has no attribute 'tolist'`（在 `_generator_state` / `collect_rng_state` 保存 checkpoint 时） | `np.random.Generator.bit_generator.state` 的 `state` 字段在不同 numpy / BitGenerator 下可能是 dict 或 ndarray；旧代码假设 ndarray 并调用 `.tolist()` | 已修复为递归 `_to_plain` / `_from_plain` 转换，纯 Python 容器保存且 `weights_only=True` 友好；`test_28` 覆盖 PCG64/PCG64DXSM/Philox/SFC64/MT19937 与真实 `NormalImageDataset`。若崩溃发生在写 `last.pt` 之前，则没有生成新 checkpoint，拉最新代码后重新运行即可；建议加 `--save-interval 100` 缩短中断损失。见 [DESIGN.md §12.8](DESIGN.md) |
 | xFormers is not available (SwiGLU / Attention / Block) UserWarning | DINOv2 hub 代码检测到未安装 xFormers，自动回退到标准 PyTorch attention | 仅警告，不影响 teacher 加载或蒸馏正确性；可忽略，或安装与 torch/CUDA 匹配的 xFormers |
-| 标签全空 | `labels` 目录推断失败 | 显式传 `--labels`（工具会自动把 `/images/` 换成 `/labels/`）；中文标签文件名同样支持 |
+| 标签全空 | `labels` 目录推断失败 | 用 `jingwei.data.infer_labels_dir()`（已在训练 / 评估 / 标定 / 缓存工具内统一调用）；非标准目录可用 `validate_labels.py --labels-dir ".../labels/{split}"`，中文标签文件名同样支持 |
+| `CUDA error: device-side assert triggered` / `IndexKernel.cu:93 ... index out of bounds` / `losses.py: g = gi[idx]` | 旧兜底分支把网格索引当 GT 索引；或 `.txt` 类别号是 `1..19` / 混入 `>=19`，在 CUDA 索引时越界 | 拉最新代码（兜底索引已修）；先跑 `python tools/validate_labels.py --cfg ... --cache ...`，再按报告用 `--fix-one-based --rebuild-cache`，或训练 / 建缓存统一加 `--label-offset 1` / `auto`。详见 [CACHE_AND_VALIDATION.md §6](CACHE_AND_VALIDATION.md) |
 | `rec_loss` → 0 | 主干没冻结，出现塌缩解 | 检查阶段 B 只把 `normality_parameters()` 加入优化器 |
 | 全图误报 | 记忆库没标定 / 用了未训练权重 | 必须先跑阶段 C；`tau` 由 `normalval` 标定 |
 | 大缺陷仍漏 | `anomaly_thresh` 太高 / `large_area_ratio` 太大 | 跑阶段 D；降低 `large_area_ratio` |

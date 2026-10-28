@@ -36,7 +36,8 @@ from torch.utils.data import DataLoader, Subset
 from _common import (ROOT, SyntheticNormalDataset, add_cache_args,
                      collect_rng_state, data_paths, format_eta, iter_speed,
                      load_checkpoint, load_model, log, make_dataset, resolve,
-                     resume_checkpoint, save_checkpoint, set_global_seed)
+                     resolve_label_offset, resume_checkpoint,
+                     save_checkpoint, set_global_seed)
 from evaluate import validate_detector
 from jingwei.data import collate
 from jingwei.utils import count_parameters
@@ -72,13 +73,27 @@ def main():
                          "(default: fusion.final_score_thresh)")
     ap.add_argument("--val-iou", type=float, default=0.5,
                     help="IoU threshold for val TP matching")
+    ap.add_argument("--label-offset", choices=["0", "1", "auto"], default=None,
+                    help="YOLO class-id offset: 0=0..18 (standard), "
+                         "1=1..19 labels, auto=infer 1-based when cls>=nc")
     args = ap.parse_args()
 
     set_global_seed(args.seed)
     # Weights are loaded by resume_checkpoint() below so a full checkpoint can
     # restore model + optimizer + scheduler + RNG in one place.
     model, cfg = load_model(args.cfg, None, args.device)
+    if args.label_offset is not None:
+        cfg.data.label_offset = args.label_offset
     paths = data_paths(cfg, args.data)
+    # Resolve 'auto' ONCE for the whole run (see tools/_common.resolve_label_offset);
+    # a per-batch decision would mix 0-based and 1-based ids in one model.
+    if not args.smoke:
+        cfg.data.label_offset = resolve_label_offset(
+            cfg.data.label_offset, cfg.data.nc, [resolve(paths["train"])])
+    model.det_loss.label_offset = cfg.data.label_offset
+    # make_dataset() reads these to normalise labels while building a cache.
+    args.label_offset = cfg.data.label_offset
+    args.nc = int(cfg.data.nc)
     epochs = args.epochs or int(cfg.train.detector_epochs)
     batch = args.batch or int(cfg.train.detector_batch)
     lr = args.lr or float(cfg.train.detector_lr)
@@ -159,6 +174,11 @@ def main():
     start_epoch = min(info["epoch"], epochs) if info and info["full"] else 0
     it = info["iter"] if info and info["full"] else 0
     meta = info["meta"] if info else {}
+    ckpt_offset = meta.get("label_offset") if info and info["full"] else None
+    if ckpt_offset is not None and str(ckpt_offset) != str(cfg.data.label_offset):
+        log(f"WARN: checkpoint label_offset={ckpt_offset}, current="
+            f"{cfg.data.label_offset}; pass --label-offset {ckpt_offset} "
+            f"to keep class ids identical to the resumed run")
     best_score = float(meta.get("best_score", -1.0)) if info and info["full"] else -1.0
     resume_mode = ("full" if info and info["full"] else
                    "weights-only" if info else "none")
@@ -179,7 +199,7 @@ def main():
         f"save_interval={args.save_interval}  log_interval={args.log_interval}")
     log(f"cache={args.cache}  cache_dir={args.cache_dir}  "
         f"val_interval={args.val_interval}  val_max={args.val_max}  "
-        f"normal_max={args.normal_max}")
+        f"normal_max={args.normal_max}  label_offset={cfg.data.label_offset}")
     log("(use --log-interval 0 to disable iter logs; --val-interval 0 disables val; "
         "python -u disables buffering)")
     log("=" * 72)
@@ -259,7 +279,8 @@ def main():
             try:
                 val_metrics = validate_detector(
                     model, val_loader, norm_loader, args.device, cfg,
-                    conf_thresh=args.val_conf, iou_thr=args.val_iou)
+                    conf_thresh=args.val_conf, iou_thr=args.val_iou,
+                    label_offset=cfg.data.label_offset)
             finally:
                 model.train()
                 model.set_stage("detector")
@@ -302,6 +323,7 @@ def main():
                 "cfg": args.cfg,
                 "data": args.data or cfg.data.dataset_yaml,
                 "seed": args.seed,
+                "label_offset": str(cfg.data.label_offset),
                 "best_score": best_score,
                 "args": vars(args),
             },

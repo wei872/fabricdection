@@ -30,11 +30,11 @@
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | ONNX/TensorRT 导出、延迟预算、流水线、上线清单 |
 | **[docs/DINO_PRETRAIN.md](docs/DINO_PRETRAIN.md)** | **用 DINOv2 做阶段 0 离线蒸馏预训练：为什么需要、命令、许可证、A/B 验证** |
 | **[docs/FOREGROUND.md](docs/FOREGROUND.md)** | **局部+全局注意力前景/背景分离、动态布幅跟随、边缘正常折入误报抑制** |
-| **[docs/CACHE_AND_VALIDATION.md](docs/CACHE_AND_VALIDATION.md)** | **YOLO 式 `train.cache` 训练加速、每 epoch 精确率/召回率/mAP、未知疵点框、1660S 实时预测命令** |
+| **[docs/CACHE_AND_VALIDATION.md](docs/CACHE_AND_VALIDATION.md)** | **YOLO 式 `train.cache` 训练加速、每 epoch 精确率/召回率/mAP、未知疵点框、标签校验 / CUDA assert 排查、1660S 实时预测命令** |
 | `jingwei/` | 参考实现：主干 / 双尺度头 / 记忆库 / 线性注意力重建 / 安全网 / 损失 / 数据集 / **Unicode 安全图像 I/O** / **安全 checkpoint 加载** / DINO teacher 工具 |
 | `configs/` | `jingwei_n.yaml`（实时优先）、`jingwei_s.yaml`（精度优先）、**`jingwei_p.yaml`（GTX 1660 SUPER 等无 Tensor Core 卡专用）**、`fabric19.yaml`（数据）；均含 `dino:` 阶段 0 配置 |
-| `tools/` | **DINOv2 蒸馏预训练**、训练（启动 / batch 级日志 + **完整断点续训** + **每 epoch 验证指标**）、**YOLO 式缓存预生成**、建库、标定、评估、推理、导出、算力剖析、**真实设备延迟实测** CLI |
-| `tests/test_model.py` | 32 项单元测试（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态注意力前景 / 验证指标 / 图像缓存 / 未知框） |
+| `tools/` | **DINOv2 蒸馏预训练**、训练（启动 / batch 级日志 + **完整断点续训** + **每 epoch 验证指标**）、**YOLO 式缓存预生成 + 标签/缓存校验**、建库、标定、评估、推理、导出、算力剖析、**真实设备延迟实测** CLI |
+| `tests/test_model.py` | 36 项单元测试（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态注意力前景 / 验证指标 / 图像缓存 / 未知框 / CUDA 标签与索引保护） |
 
 > `dataset/dataset.yaml` 保持原样，作为 19 个类别名的真源。
 
@@ -45,7 +45,7 @@
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m unittest discover -s tests -v     # 应输出 OK (32 tests，含验证指标 / 图像缓存 / 未知缺陷框)
+python -m unittest discover -s tests -v     # 应输出 OK (36 tests，含验证指标 / 图像缓存 / 未知缺陷框 / 标签校验)
 python tools/benchmark.py --both            # 参数量 / MACs / 延迟估算
 ```
 
@@ -56,6 +56,10 @@ python tools/benchmark.py --both            # 参数量 / MACs / 延迟估算
 详见 [docs/DINO_PRETRAIN.md](docs/DINO_PRETRAIN.md)。
 
 ```bash
+# 训练前先检查 YOLO 标签 / 缓存，避免 CUDA device-side assert（中文路径可用）
+python tools/validate_labels.py    --cfg configs/jingwei_n.yaml --data configs/fabric19.yaml --cache disk
+# 若类别号是 1..19 而不是 0..18：加 --fix-one-based --rebuild-cache，
+# 或者保持原标签并在训练命令加 --label-offset 1 / --label-offset auto
 # 先生成 YOLO 式 train.cache（只需一次；中文路径可用）
 python tools/cache_dataset.py      --cfg configs/jingwei_n.yaml --mode disk
 python tools/pretrain_dino.py     --cfg configs/jingwei_n.yaml --cache disk --teacher dinov2_vits14 --log-interval 100
@@ -103,7 +107,7 @@ python tools/train_normality.py  --cfg configs/jingwei_n.yaml --resume runs/norm
 
 ```
 python -m unittest discover -s tests -v
-Ran 32 tests in ~140 s — OK
+Ran 36 tests in ~158 s — OK
   jingwei_n = 6.36 M / 16.62 G MACs @1280
   jingwei_p = 2.93 M /  8.09 G MACs @1280
   stage 0 DINOv2 distillation + local+global attention fg context = smoke OK
@@ -116,6 +120,7 @@ Ran 32 tests in ~140 s — OK
   per-epoch val precision/recall/F1/mAP50/large recall = OK
   YOLO-style train.cache (disk/ram/bytes, Unicode paths) = OK
   unknown defect type boxes (label 19) = OK
+  invalid-label sanitize + 1-based offset + dense-target fallback = OK
 ```
 
 | 变体 | 参数 | 1280² MACs | 640² MACs | RTX 4090 估算 | Jetson AGX Orin 估算 | **GTX 1660 SUPER 估算** |

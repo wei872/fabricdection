@@ -10,7 +10,7 @@ invariance, memory-bank algebra, the dataset readers, Chinese / Unicode
 file paths, non-square fabric augmentation, training progress logs,
 full checkpoint resume, numpy RNG state checkpointing, dynamic
 local+global attention foreground context, validation metrics, YOLO-style
-image cache, and unknown-defect boxes (32 tests).
+image cache, unknown-defect boxes, and CUDA label / index guards (36 tests).
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 import cv2
@@ -39,7 +40,9 @@ from jingwei.image_io import (VideoCaptureUnicode, ascii_safe,     # noqa: E402
                               console_safe, imread_unicode,
                               imwrite_unicode)
 from jingwei.layers import LocalContrastNorm                     # noqa: E402
-from jingwei.losses import hungarian_match                       # noqa: E402
+from jingwei.losses import (build_dense_targets, hungarian_match,  # noqa: E402
+                            resolve_label_offset,
+                            sanitize_detection_targets)
 from jingwei.utils import (count_parameters, profile_macs,         # noqa: E402
                            torch_load)
 
@@ -1056,6 +1059,214 @@ class TestModel(unittest.TestCase):
         self.assertEqual(big["n_safety_boxes"], 1)
         self.assertEqual(big["n_unknown_boxes"], 0)
         self.assertIn(19, big["labels"].tolist())
+
+    # --------------------------------------------------- CUDA device-side assert guards
+    def test_33_sanitize_detection_targets_and_label_offset(self):
+        """Invalid ids / boxes are dropped on CPU; 1..nc ids shift exactly once."""
+        nc, size = 3, (16, 16)
+        raw = [dict(
+            boxes=torch.tensor([[1., 1., 5., 5.],
+                                [6., 6., 10., 10.],
+                                [20., 20., 30., 30.],     # out of bounds
+                                [1., 1., -2., 5.]]),      # x1 <= x0
+            labels=torch.tensor([1, 3, 2, 2]))]           # 1-based, one is cls=3
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            clean = sanitize_detection_targets(raw, nc, size, "cpu", "auto")
+        self.assertEqual(clean[0]["labels"].tolist(), [0, 2])
+        self.assertEqual(clean[0]["boxes"].shape, (2, 4))
+        self.assertTrue(bool((clean[0]["boxes"] >= 0).all()))
+
+        # already-0-based data is not shifted by an explicit 1-based request
+        zero = [dict(boxes=torch.tensor([[1., 1., 5., 5.]]),
+                     labels=torch.tensor([0]))]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            again = sanitize_detection_targets(zero, nc, size, "cpu", "1")
+        self.assertEqual(again[0]["labels"].tolist(), [0])
+
+        # mode='auto' only shifts when an out-of-range id proves 1-based labels
+        self.assertEqual(resolve_label_offset(torch.tensor([1, 2, 3]), "auto", nc), 1)
+        self.assertEqual(resolve_label_offset(torch.tensor([0, 2]), "auto", nc), 0)
+        self.assertEqual(resolve_label_offset(torch.tensor([0, 2]), "1", nc), 0)
+        # a stray 99 must not stop auto from shifting the valid 1-based rows
+        mixed = [dict(boxes=torch.tensor([[1., 1., 5., 5.],
+                                          [6., 6., 10., 10.],
+                                          [11., 11., 13., 13.]]),
+                      labels=torch.tensor([1, 3, 99]))]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            shifted = sanitize_detection_targets(mixed, nc, size, "cpu", "auto")
+        self.assertEqual(shifted[0]["labels"].tolist(), [0, 2])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            bad = sanitize_detection_targets(
+                [dict(boxes=torch.tensor([[1., 1., 5., 5.],
+                                          [6., 6., 10., 10.]]),
+                      labels=torch.tensor([0, 3]))],
+                nc, size, "cpu", "0")
+        self.assertEqual(bad[0]["labels"].tolist(), [0])
+
+    def test_34_dense_target_fallback_never_indexes_oob(self):
+        """Tiny edge boxes with no centre-sampling cell used idx into arange(G)."""
+        B, nc, H, W, stride = 1, 3, 2, 2, 8
+        pred = {"cls": torch.zeros(B, nc, H, W),
+                "reg": torch.zeros(B, 4, H, W)}
+        targets = [dict(
+            boxes=torch.tensor([[0.0, 0.0, 0.2, 0.2],
+                                [15.8, 15.8, 16.0, 16.0]]),
+            labels=torch.tensor([0, 2]))]
+        # Before the fix: nearest grid id 3 indexed arange(G=2) -> IndexKernel.cu
+        # device-side assert on CUDA / IndexError on CPU.
+        t_cls, t_reg, t_qual, t_fg, pos, pts = build_dense_targets(
+            pred, targets, stride, nc, 1.0, radius=0.1)
+        self.assertEqual(tuple(t_cls.shape), (B, nc, H * W))
+        self.assertEqual(int(pos.sum()), 2)        # both boxes got a fallback cell
+        self.assertEqual(float(t_cls[0, 0, 0]), 1.0)
+        self.assertEqual(float(t_cls[0, 2, 3]), 1.0)
+        for t in (t_reg, t_qual, t_fg, pts):
+            self.assertTrue(torch.isfinite(t).all())
+
+    def test_35_validate_labels_cli_fix_and_rebuild_cache(self):
+        """1-based .txt + stale cache -> clear validator report, then clean fix."""
+        import hashlib
+        import yaml
+        from jingwei.cache import (build_dataset_cache, cache_paths,
+                                   cache_prefix)
+        size, nc = 32, 3
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_root = root / "布幅数据"
+            splits = {}
+            for split, cls in (("train", 3), ("val", 1)):
+                img_dir = data_root / "images" / split
+                lab_dir = data_root / "labels" / split
+                img_dir.mkdir(parents=True)
+                lab_dir.mkdir(parents=True)
+                imwrite_unicode(img_dir / f"布匹_{split}.jpg",
+                                np.full((24, 40, 3), 120, np.uint8))
+                (lab_dir / f"布匹_{split}.txt").write_text(
+                    f"{cls} 0.5 0.5 0.4 0.3\n", encoding="utf-8")
+                splits[split] = (img_dir, lab_dir)
+
+            data_yaml = root / "data.yaml"
+            data_yaml.write_text(yaml.safe_dump({
+                "train": str(splits["train"][0]),
+                "val": str(splits["val"][0]),
+                "nc": nc,
+                "names": ["a", "b", "c"],
+            }, allow_unicode=True), encoding="utf-8")
+            cfg_yaml = root / "tiny.yaml"
+            cfg_yaml.write_text(
+                "name: tiny\ninput_size: [32, 32]\n"
+                "data:\n  nc: 3\n  dataset_yaml: " +
+                str(data_yaml).replace("\\", "/") +
+                "\n  names: [a, b, c]\n", encoding="utf-8")
+
+            # Build a STALE cache with raw 1-based labels and no nc metadata.
+            cache_dir = root / "cache"
+            cache_dir.mkdir(parents=True)
+            for split, (img_dir, lab_dir) in splits.items():
+                tag = hashlib.sha1(str(img_dir).encode("utf-8", "replace")).hexdigest()[:8]
+                prefix = cache_prefix(cache_dir, tag, split, size, "bytes")
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    build_dataset_cache(img_dir, lab_dir, size, prefix,
+                                        "bytes", True, log_fn=lambda m: None)
+            self.assertTrue(any(cache_dir.glob("train_32_bytes_*.json")))
+
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "ascii:backslashreplace"
+
+            def run(*extra):
+                cmd = [sys.executable, "tools/validate_labels.py",
+                       "--cfg", str(cfg_yaml), "--data", str(data_yaml),
+                       "--nc", str(nc), "--img-size", str(size),
+                       "--cache", "bytes", "--cache-dir", str(cache_dir), *extra]
+                return subprocess.run(cmd, cwd=str(ROOT), env=env,
+                                      capture_output=True, text=True,
+                                      encoding="utf-8", errors="replace",
+                                      timeout=120)
+
+            bad = run("--label-offset", "0", "--max-examples", "3")
+            self.assertEqual(bad.returncode, 2, bad.stdout + bad.stderr)
+            self.assertIn("bad_class=", bad.stdout)
+            self.assertIn("cache_bad_class", bad.stdout)
+            self.assertIn("RESULT: INVALID", bad.stdout)
+
+            fixed = run("--fix-one-based", "--label-offset", "auto",
+                        "--rebuild-cache", "--no-backup")
+            self.assertEqual(fixed.returncode, 0, fixed.stdout + fixed.stderr)
+            self.assertIn("FIXED 1-based labels", fixed.stdout)
+            self.assertIn("RESULT: OK", fixed.stdout)
+
+            # .txt files are now 0-based; rebuilt cache JSON contains 0-based ids.
+            for split, (_img, lab_dir) in splits.items():
+                txt = (lab_dir / f"布匹_{split}.txt").read_text(encoding="utf-8")
+                self.assertLess(int(txt.split()[0]), nc)
+            with (next(cache_dir.glob("train_32_bytes_*.json"))).open(
+                    "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+            ids = [int(r[0]) for rows in meta["labels"] for r in rows]
+            self.assertTrue(ids)
+            self.assertTrue(all(0 <= i < nc for i in ids), ids)
+            self.assertEqual(meta["label_offset"], "0")
+            self.assertEqual(meta["nc"], nc)
+
+    def test_36_cache_builder_normalises_one_based_labels(self):
+        """Cache build with --label-offset auto stores only 0..nc-1 ids."""
+        from jingwei.cache import build_dataset_cache, cache_paths, cache_prefix
+        size, nc = 24, 3
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img_dir = root / "images" / "train"
+            lab_dir = root / "labels" / "train"
+            img_dir.mkdir(parents=True)
+            lab_dir.mkdir(parents=True)
+            imwrite_unicode(img_dir / "布_0.jpg",
+                            np.full((16, 24, 3), 100, np.uint8))
+            (lab_dir / "布_0.txt").write_text(
+                "1 0.5 0.5 0.3 0.3\n"
+                "3 0.4 0.4 0.2 0.2\n"
+                "99 0.5 0.5 0.1 0.1\n"       # invalid: must be dropped
+                "2 0.5 0.5 0.0 0.2\n",      # zero width: must be dropped
+                encoding="utf-8")
+            prefix = cache_prefix(root / "cache", "tag", "train", size, "bytes")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                meta = build_dataset_cache(
+                    img_dir, lab_dir, size, prefix, "bytes", True,
+                    log_fn=lambda m: None, label_offset="auto", nc=nc)
+            self.assertEqual(meta["n_bad_labels"], 2)
+            ids = [int(r[0]) for rows in meta["labels"] for r in rows]
+            self.assertEqual(ids, [0, 2])
+            self.assertEqual(meta["label_offset"], "1")   # resolved, not 'auto'
+            self.assertEqual(meta["label_offset_requested"], "auto")
+            mp, dp = cache_paths(prefix, "bytes")
+            self.assertTrue(mp.is_file() and dp.is_file())
+
+            # 'auto' must be resolved per SPLIT, not per image: a file whose
+            # ids never reach nc (here only 1..2) must still be shifted when
+            # another file proves the dataset is 1-based.
+            from jingwei.cache import infer_label_offset_from_label_files
+            second = lab_dir / "布_1.txt"
+            second.write_text("1 0.5 0.5 0.3 0.3\n2 0.4 0.4 0.2 0.2\n",
+                              encoding="utf-8")
+            imwrite_unicode(img_dir / "布_1.jpg",
+                            np.full((16, 24, 3), 140, np.uint8))
+            files = sorted(str(p) for p in lab_dir.glob("*.txt"))
+            self.assertEqual(infer_label_offset_from_label_files(files, nc), 1)
+            prefix2 = cache_prefix(root / "cache2", "tag", "train", size, "bytes")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                meta2 = build_dataset_cache(
+                    img_dir, lab_dir, size, prefix2, "bytes", True,
+                    log_fn=lambda m: None, label_offset="auto", nc=nc)
+            per_image = [[int(r[0]) for r in rows] for rows in meta2["labels"]]
+            for rows in per_image:
+                self.assertTrue(rows, per_image)
+                self.assertTrue(all(0 <= i < nc for i in rows), per_image)
+            self.assertIn([0, 1], per_image, per_image)
 
 
 if __name__ == "__main__":
