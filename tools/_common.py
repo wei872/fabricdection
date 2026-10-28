@@ -107,6 +107,14 @@ def make_dataset(split, images_dir, labels_dir, img_size, args, *,
                                   with_descriptor=with_descriptor)
 
     mode = args.cache
+    load_mode = mode
+    workers = int(getattr(args, "num_workers", 0) or 0)
+    if mode == "ram" and workers > 0:
+        # every worker would get its own full copy of the decoded dataset
+        log_fn("cache=ram with --num-workers>0 would copy the whole cache into "
+               "each worker; mapping it read-only instead (same speed, "
+               "OS page cache is shared)")
+        load_mode = "disk"
     cache_dir = Path(getattr(args, "cache_dir", "runs/cache"))
     if not cache_dir.is_absolute():
         cache_dir = ROOT / cache_dir
@@ -118,7 +126,7 @@ def make_dataset(split, images_dir, labels_dir, img_size, args, *,
                         log_fn=log_fn,
                         label_offset=getattr(args, "label_offset", 0),
                         nc=getattr(args, "nc", None))
-    return load_cached_dataset(prefix, mode, augment, seed,
+    return load_cached_dataset(prefix, load_mode, augment, seed,
                                with_descriptor=with_descriptor)
 
 

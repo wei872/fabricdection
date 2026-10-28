@@ -26,6 +26,7 @@ the final weight-only ``dino_init.pt`` remains the hand-off to stage A.
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from pathlib import Path
 
@@ -37,7 +38,7 @@ from _common import (ROOT, SyntheticNormalDataset, add_cache_args,
                      format_eta, is_resumable, iter_speed, load_checkpoint,
                      load_model, log, make_dataset, resolve, resume_checkpoint,
                      save_checkpoint, set_global_seed)
-from jingwei.data import collate
+from jingwei.data import collate, to_model_input, worker_init
 from jingwei.dino import (DINODistillLoss, DINOStudentAdaptor, load_teacher,
                           make_views)
 from jingwei.utils import count_parameters
@@ -66,7 +67,12 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", default="runs/dino")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--num-workers", type=int, default=0)
+    ap.add_argument("--num-workers", type=int, default=None,
+                    help="DataLoader workers (default 2 on Windows, 4 elsewhere; "
+                         "0 disables). Workers use the 'spawn' start method, "
+                         "which is what Windows does anyway.")
+    ap.add_argument("--mp-start", default="spawn",
+                    choices=["spawn", "fork", "forkserver", "default"])
     ap.add_argument("--smoke", type=int, default=0,
                     help="synthetic images + synthetic teacher; no data / no download")
     ap.add_argument("--save-interval", type=int, default=500,
@@ -157,10 +163,20 @@ def main():
         ds = make_dataset("normaltrain", resolve(paths["normaltrain"]), None,
                           size, args, has_labels=False, augment=False,
                           seed=args.seed, with_descriptor=False)
+    if args.num_workers is None:
+        args.num_workers = 2 if os.name == "nt" else 4
+    if args.smoke:
+        args.num_workers = 0
+    kw = {}
+    if args.num_workers > 0:
+        kw.update(worker_init_fn=worker_init, persistent_workers=True,
+                  prefetch_factor=2)
+        if args.mp_start != "default":
+            kw.update(multiprocessing_context=args.mp_start)
     loader = DataLoader(ds, batch_size=batch, shuffle=True,
-                        num_workers=0 if args.smoke else args.num_workers,
+                        num_workers=args.num_workers,
                         collate_fn=collate, drop_last=not args.smoke,
-                        pin_memory=args.device.startswith("cuda"))
+                        pin_memory=args.device.startswith("cuda"), **kw)
 
     # ---- freeze everything, then unfreeze ONLY the student feature pathway ----
     for p in model.parameters():
@@ -292,7 +308,7 @@ def main():
         for data in loader:
             if it >= iters:
                 break
-            x = data["image"].to(args.device, non_blocking=True)
+            x = to_model_input(data["image"], args.device)
             tv, sv = make_views(x, crop, strong=True)
             with torch.no_grad():
                 tmap = teacher.patch_map(tv)

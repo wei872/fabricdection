@@ -292,7 +292,10 @@ def hungarian_match(preds, targets, strides, nc, reg_scale, max_candidates=1600)
 
         cls_gt = cls_all[:, labels].t()                # (G, C)
         iou = box_iou(box_all, boxes_gt).t()           # (G, C)
-        cost = (-cls_gt - 0.5 * obj_all[None, :] - 2.0 * iou).detach().cpu().numpy()
+        # float() before .numpy(): under autocast (bf16/fp16 AMP) numpy cannot
+        # consume the tensor, and scipy's solver wants float64 anyway.
+        cost = (-cls_gt - 0.5 * obj_all[None, :] - 2.0 * iou).detach() \
+            .float().cpu().numpy()
 
         rows, cols = linear_sum_assignment(cost)
         for g, c in zip(rows, cols):

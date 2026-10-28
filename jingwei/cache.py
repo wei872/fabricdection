@@ -31,7 +31,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .data import (fabric_photometric, geometric_augment, infer_labels_dir,
-                   list_images, read_image, to_chw_float)
+                   list_images, read_image, to_image_tensor)
 from .fabric import fabric_descriptor
 from .losses import resolve_label_offset
 
@@ -310,24 +310,28 @@ def build_dataset_cache(images_dir, labels_dir, img_size, prefix, mode,
 # --------------------------------------------------------------------------------------
 # Load / datasets
 # --------------------------------------------------------------------------------------
+def open_cache_array(data_path, mode):
+    """Open the cached pixels.  ``disk`` = read-only memmap, ``ram`` = in RAM."""
+    if mode in ("disk", "ram"):
+        return np.load(str(data_path), mmap_mode="r" if mode == "disk" else None)
+    return np.memmap(str(data_path), dtype=np.uint8, mode="r")
+
+
 def load_cached_dataset(prefix, mode, augment, seed, with_descriptor=False):
     prefix = Path(prefix)
     meta_path, data_path = cache_paths(prefix, mode)
     with meta_path.open("r", encoding="utf-8") as fh:
         meta = json.load(fh)
-    if mode in ("disk", "ram"):
-        images = np.load(str(data_path),
-                         mmap_mode="r" if mode == "disk" else None)
-    else:
-        images = np.memmap(str(data_path), dtype=np.uint8, mode="r")
+    images = open_cache_array(data_path, mode)
     if meta.get("has_labels"):
-        return CachedYOLODefectDataset(meta, images, mode, augment, seed)
+        return CachedYOLODefectDataset(meta, images, mode, augment, seed,
+                                       data_path=data_path)
     return CachedNormalImageDataset(meta, images, mode, augment, seed,
-                                    with_descriptor)
+                                    with_descriptor, data_path=data_path)
 
 
 class _CachedBase(Dataset):
-    def __init__(self, meta, images, mode, augment, seed):
+    def __init__(self, meta, images, mode, augment, seed, data_path=None):
         self.meta = meta
         self.images = images
         self.mode = mode
@@ -335,9 +339,30 @@ class _CachedBase(Dataset):
         self.augment = bool(augment)
         self.paths = list(meta["paths"])
         self.rng = np.random.default_rng(seed)
+        self.data_path = str(data_path) if data_path is not None else None
 
     def __len__(self):
         return int(self.meta["n"])
+
+    # ---- multiprocessing (Windows spawn) ---------------------------------
+    # Pickling a np.memmap serialises its *contents*: with a 1280x1280x3 cache
+    # of 29533 images that is ~145 GB and the DataLoader worker start-up died
+    # with MemoryError ("start() -> reduction.dump -> MemoryError"), which is
+    # why --num-workers had to be 0.  Workers now get the file path and map the
+    # same file read-only themselves (the OS page cache makes this cheap).
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["images"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if self.images is None:
+            if self.data_path is None:
+                raise RuntimeError("cached dataset has no data_path; rebuild it")
+            mode = "disk" if self.mode == "ram" else self.mode
+            self.images = open_cache_array(self.data_path, mode)
+            self.mode = mode
 
     def _get_image(self, idx):
         if self.mode == "bytes":
@@ -351,15 +376,17 @@ class _CachedBase(Dataset):
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             return cv2.resize(rgb, (self.img_size, self.img_size),
                               interpolation=cv2.INTER_LINEAR)
-        # writable copy: augmentation uses in-place flips / negative strides
-        return np.array(self.images[idx], copy=True)
+        # No copy: every augmentation returns a fresh array, and the disk cache
+        # is a read-only memmap, so an accidental in-place op fails loudly
+        # instead of silently corrupting the cache.
+        return self.images[idx]
 
 
 class CachedYOLODefectDataset(_CachedBase):
     """Cached YOLO labels/images; same output dict as ``YOLODefectDataset``."""
 
-    def __init__(self, meta, images, mode, augment, seed):
-        super().__init__(meta, images, mode, augment, seed)
+    def __init__(self, meta, images, mode, augment, seed, data_path=None):
+        super().__init__(meta, images, mode, augment, seed, data_path=data_path)
         self.labels = list(meta.get("labels", []))
 
     def __getitem__(self, idx):
@@ -382,9 +409,9 @@ class CachedYOLODefectDataset(_CachedBase):
                 boxes[:, [1, 3]] *= self.img_size / h
             img = cv2.resize(img, (self.img_size, self.img_size),
                              interpolation=cv2.INTER_LINEAR)
-        return dict(image=to_chw_float(img),
-                    boxes=torch.from_numpy(boxes).float(),
-                    labels=torch.from_numpy(labels).long(),
+        return dict(image=to_image_tensor(img),
+                    boxes=torch.from_numpy(np.ascontiguousarray(boxes)).float(),
+                    labels=torch.from_numpy(np.ascontiguousarray(labels)).long(),
                     path=self.paths[idx])
 
 
@@ -392,8 +419,9 @@ class CachedNormalImageDataset(_CachedBase):
     """Cached normal-only images; same output dict as ``NormalImageDataset``."""
 
     def __init__(self, meta, images, mode, augment, seed,
-                 with_descriptor=False, resize_for_descriptor=512):
-        super().__init__(meta, images, mode, augment, seed)
+                 with_descriptor=False, resize_for_descriptor=512,
+                 data_path=None):
+        super().__init__(meta, images, mode, augment, seed, data_path=data_path)
         self.with_descriptor = bool(with_descriptor)
         self.resize_for_descriptor = int(resize_for_descriptor)
 
@@ -413,5 +441,5 @@ class CachedNormalImageDataset(_CachedBase):
         else:
             img = cv2.resize(img, (self.img_size, self.img_size),
                              interpolation=cv2.INTER_LINEAR)
-        out["image"] = to_chw_float(img)
+        out["image"] = to_image_tensor(img)
         return out

@@ -22,7 +22,7 @@ import torch
 from _common import (ROOT, SyntheticNormalDataset, data_paths,
                      descriptors_for_folder, extract_patch_features,
                      load_model, resolve, save_checkpoint)
-from jingwei.data import list_images
+from jingwei.data import list_images, to_model_input
 from jingwei.fabric import (fabric_descriptor, fit_fabric_prototypes,
                             greedy_coreset, spherical_kmeans)
 from jingwei.image_io import console_safe, imread_unicode
@@ -59,7 +59,7 @@ def main():
         model.eval()
         with torch.no_grad():
             for i in range(len(ds)):
-                x = ds[i]["image"][None].to(args.device)
+                x = to_model_input(ds[i]["image"], args.device)
                 q = model.normality.patch(model.neck(model.backbone(x)))
                 q = q.permute(0, 2, 3, 1).reshape(-1, q.shape[1]).cpu().numpy()
                 feats_by_k.setdefault(int(labels[i]), []).append(q)
@@ -117,7 +117,8 @@ def main():
 
     if args.smoke:
         for i in range(len(val_ds)):
-            collect(val_ds[i]["image"][None].to(args.device), int(val_labels[i]))
+            collect(to_model_input(val_ds[i]["image"], args.device),
+                    int(val_labels[i]))
     else:
         for f, k in val_ds:
             im = imread_unicode(f, cv2.IMREAD_COLOR)

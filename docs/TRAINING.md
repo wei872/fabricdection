@@ -114,11 +114,17 @@ python tools/cache_dataset.py --cfg configs/jingwei_n.yaml --mode disk
 
 # 阶段 A：有监督检测（train + labels），从阶段 0 权重热启动
 # --cache disk 加速图片读取；--val-interval 1 每 epoch 输出精确率/召回率/mAP
+# --num-workers 4 + --amp auto 是 29k 张 1280² 数据的推荐训练配置
 python tools/train_detector.py \
     --cfg configs/jingwei_n.yaml --data configs/fabric19.yaml \
     --resume runs/dino/dino_init.pt --cache disk \
-    --epochs 150 --batch 8 --log-interval 20 --val-interval 1 \
+    --epochs 150 --batch 8 --num-workers 4 --amp auto \
+    --log-interval 20 --val-interval 1 \
     --val-max 300 --normal-max 300 --out runs/detector
+
+# 训练慢 / 只能 --num-workers 0？先看 docs/SPEED.md，并测一次数据侧吞吐：
+python tools/bench_dataloader.py --cfg configs/jingwei_n.yaml --cache disk \
+    --batch 8 --num-workers 4 --batches 20
 
 # 阶段 A 同时训练局部+全局注意力的 defect_fg / fabric_mask / fold_band
 # （YOLO 框级弱监督 + 逐帧动态布幅伪目标）；data.py 也会以 25% 概率合成

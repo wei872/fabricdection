@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader, Subset
 from _common import (ROOT, data_paths, load_model, resolve,
                      resolve_label_offset)
 from jingwei.data import (NormalImageDataset, YOLODefectDataset, collate,
+                          image_hw, to_model_input,
                           infer_labels_dir)
 from jingwei.fusion import fuse_detections
 from jingwei.losses import sanitize_detection_targets
@@ -46,7 +47,7 @@ def precompute(model, loader, device, nc=19, label_offset=0):
             batch = dict(batch)
             batch["boxes"] = [t["boxes"] for t in targets]
             batch["labels"] = [t["labels"] for t in targets]
-        x = x.to(device)
+        x = to_model_input(x, device)
         feats = model.neck(model.backbone(x))
         raw = model.normality(feats, 0)["anomaly"] if model.normality is not None else None
         anomaly, context = raw, None

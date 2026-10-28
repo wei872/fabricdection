@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader, Subset
 
 from _common import (ROOT, SyntheticNormalDataset, add_cache_args, data_paths,
                      load_model, make_dataset, resolve, resolve_label_offset)
-from jingwei.data import collate
+from jingwei.data import collate, image_hw, to_model_input
 from jingwei.image_io import ascii_safe, console_safe
 from jingwei.losses import sanitize_detection_targets
 from jingwei.utils import box_iou, count_parameters, profile_macs
@@ -55,8 +55,8 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
         targets = sanitize_detection_targets(
             [{"boxes": raw_boxes[b], "labels": raw_labels[b]}
              for b in range(bsz)],
-            nc, (images.shape[-2], images.shape[-1]), device, label_offset)
-        dets = model(images.to(device))
+            nc, image_hw(images), device, label_offset)
+        dets = model(to_model_input(images, device))
         for b, d in enumerate(dets):
             gt_boxes = targets[b]["boxes"]
             gt_labels = targets[b]["labels"]
@@ -123,8 +123,8 @@ def large_defect_recall(model, loader, device, ratio, nc=19, label_offset=0):
         targets = sanitize_detection_targets(
             [{"boxes": raw_boxes[b], "labels": raw_labels[b]}
              for b in range(bsz)],
-            nc, (images.shape[-2], images.shape[-1]), device, label_offset)
-        dets = model(images.to(device))
+            nc, image_hw(images), device, label_offset)
+        dets = model(to_model_input(images, device))
         for b, d in enumerate(dets):
             g = targets[b]["boxes"]
             if g.numel() == 0:
@@ -145,7 +145,7 @@ def large_defect_recall(model, loader, device, ratio, nc=19, label_offset=0):
 def normal_fpr(model, loader, device):
     n = fp = 0
     for batch in loader:
-        dets = model(batch["image"].to(device))
+        dets = model(to_model_input(batch["image"], device))
         n += len(dets)
         fp += sum(len(d["boxes"]) > 0 for d in dets)
     return fp / max(1, n), fp, n

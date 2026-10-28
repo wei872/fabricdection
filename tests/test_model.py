@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import warnings
 from pathlib import Path
@@ -33,6 +34,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))   # import tools/_common.py helpers
 
 from jingwei import build_model, load_config                       # noqa: E402
+from jingwei.data import collate, to_model_input                    # noqa: E402
 from jingwei.fabric import (fabric_descriptor, fit_fabric_prototypes,  # noqa: E402
                             greedy_coreset, spherical_kmeans)
 from jingwei.fusion import safety_net_numpy                       # noqa: E402
@@ -242,7 +244,12 @@ class TestModel(unittest.TestCase):
             ds = YOLODefectDataset(imgs, labs, img_size=128, augment=False)
             self.assertEqual(len(ds), 3)
             item = ds[0]
-            self.assertEqual(tuple(item["image"].shape), (3, 128, 128))
+            # datasets hand uint8 HWC to the loader; the float CHW cast happens
+            # once per batch on the GPU (jingwei.data.to_model_input)
+            self.assertEqual(item["image"].dtype, torch.uint8)
+            self.assertEqual(tuple(item["image"].shape), (128, 128, 3))
+            self.assertEqual(tuple(to_model_input(item["image"]).shape),
+                             (1, 3, 128, 128))
             self.assertEqual(tuple(item["boxes"].shape), (2, 4))
             self.assertEqual(tuple(item["labels"].shape), (2,))
             nd = NormalImageDataset(normal, img_size=128, augment=False,
@@ -250,7 +257,12 @@ class TestModel(unittest.TestCase):
             self.assertEqual(len(nd), 4)
             self.assertEqual(tuple(nd[0]["descriptor"].shape), (8,))
             batch = collate([ds[0], ds[1]])
-            self.assertEqual(tuple(batch["image"].shape), (2, 3, 128, 128))
+            self.assertEqual(tuple(batch["image"].shape), (2, 128, 128, 3))
+            self.assertEqual(batch["image"].dtype, torch.uint8)
+            x = to_model_input(batch["image"])
+            self.assertEqual(tuple(x.shape), (2, 3, 128, 128))
+            self.assertEqual(x.dtype, torch.float32)
+            self.assertLessEqual(float(x.max()), 1.0)
             self.assertIsInstance(batch["boxes"], list)
 
     def test_15_tools_import_cleanly(self):
@@ -637,11 +649,11 @@ class TestModel(unittest.TestCase):
             ds = YOLODefectDataset(imgs, labs, img_size=64,
                                    augment=True, seed=2)
             item = ds[0]
-            self.assertEqual(tuple(item["image"].shape), (3, 64, 64))
+            self.assertEqual(tuple(item["image"].shape), (64, 64, 3))
             nd = NormalImageDataset(normal, img_size=64, augment=True, seed=2,
                                     with_descriptor=True)
             item2 = nd[0]
-            self.assertEqual(tuple(item2["image"].shape), (3, 64, 64))
+            self.assertEqual(tuple(item2["image"].shape), (64, 64, 3))
             self.assertEqual(tuple(item2["descriptor"].shape), (8,))
 
     # ---------------------------------------------------------- training logs
@@ -976,7 +988,9 @@ class TestModel(unittest.TestCase):
                 o, c = orig[1], ds[1]
                 self.assertEqual(tuple(c["image"].shape),
                                  tuple(o["image"].shape))
-                self.assertLess(float((c["image"] - o["image"]).abs().max()),
+                self.assertEqual(c["image"].dtype, torch.uint8)
+                self.assertLess(float((c["image"].float() -
+                                       o["image"].float()).abs().max()),
                                 1e-6, mode)
                 self.assertTrue(torch.allclose(c["boxes"], o["boxes"]), mode)
                 self.assertTrue(torch.equal(c["labels"], o["labels"]), mode)
@@ -1267,6 +1281,132 @@ class TestModel(unittest.TestCase):
                 self.assertTrue(rows, per_image)
                 self.assertTrue(all(0 <= i < nc for i in rows), per_image)
             self.assertIn([0, 1], per_image, per_image)
+
+
+    # ---------------------------------------------------------- dataloader speed
+    def test_37_augmentation_speed_budget(self):
+        """Augmentation must stay in the single-digit-millisecond range.
+
+        Regression guard: the old reflectance branch blurred a 1280x1280
+        *float32* field with sigmaX = w / 12 (~106 px), which costs ~0.5 s per
+        image on OpenCV, so ``--num-workers 0`` training crawled at <1 it/s and
+        a 29k-image dataset could never finish.  Budget here is deliberately
+        generous (60 ms) so slow CI machines still pass.
+        """
+        from jingwei.data import fabric_photometric, geometric_augment
+        img = (np.random.default_rng(0).random((1280, 1280, 3)) * 255).astype(np.uint8)
+        boxes = np.array([[100., 120., 600., 700.]], np.float32)
+        rng = np.random.default_rng(7)
+
+        t0 = time.perf_counter()
+        n = 5
+        for _ in range(n):
+            fabric_photometric(img, rng)
+        photo_ms = (time.perf_counter() - t0) / n * 1000
+        t0 = time.perf_counter()
+        for _ in range(n):
+            geometric_augment(img.copy(), boxes.copy(), rng, 1280)
+        geo_ms = (time.perf_counter() - t0) / n * 1000
+        self.assertLess(photo_ms, 60.0, f"fabric_photometric {photo_ms:.1f} ms")
+        self.assertLess(geo_ms, 60.0, f"geometric_augment {geo_ms:.1f} ms")
+        print(f"\n  aug speed: photometric {photo_ms:.1f} ms  "
+              f"geometric {geo_ms:.1f} ms per 1280x1280 image")
+
+    def test_38_cached_dataset_pickles_without_pixels(self):
+        """DataLoader workers must not be sent the memmap contents.
+
+        Pickling ``np.memmap`` serialises the whole array: 29533 x 1280 x 1280
+        x 3 uint8 is ~145 GB, which made ``--num-workers 4`` die with
+        ``MemoryError`` at worker start-up on Windows.  The dataset now ships the
+        cache path only and re-opens the memmap inside each worker.
+        """
+        import pickle
+        from jingwei.cache import (build_dataset_cache, cache_prefix,
+                                   load_cached_dataset)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img_dir, lab_dir = root / "images", root / "labels"
+            img_dir.mkdir()
+            lab_dir.mkdir()
+            for i in range(4):
+                imwrite_unicode(img_dir / f"im{i}.jpg",
+                                np.full((32, 40, 3), 90 + i * 20, np.uint8))
+                (lab_dir / f"im{i}.txt").write_text("0 0.5 0.5 0.2 0.2\n",
+                                                    encoding="utf-8")
+            prefix = cache_prefix(root / "cache", "tag", "train", 32, "disk")
+            build_dataset_cache(img_dir, lab_dir, 32, prefix, "disk", True,
+                                log_fn=lambda m: None, label_offset=0, nc=19)
+            ds = load_cached_dataset(prefix, "disk", True, 0)
+            blob = pickle.dumps(ds)              # what DataLoader workers get
+            self.assertLess(len(blob), 200_000, len(blob))
+            clone = pickle.loads(blob)
+            self.assertEqual(len(clone), 4)
+            a, b = ds[2]["image"], clone[2]["image"]
+            self.assertTrue(torch.equal(a, b))
+            self.assertEqual(tuple(clone[0]["boxes"].shape), (1, 4))
+
+    def test_39_geometric_augment_box_alignment(self):
+        """Boxes must follow flips / rot90 / resize exactly (pixel check)."""
+        from jingwei.data import geometric_augment
+        src = np.zeros((256, 256, 3), np.uint8)
+        src[40:100, 120:200] = 255                     # y0,y1 / x0,x1
+        box = np.array([[120., 40., 200., 100.]], np.float32)
+        for seed in range(60):
+            rng = np.random.default_rng(seed)
+            img, boxes = geometric_augment(src.copy(), box.copy(), rng, 128)
+            if not len(boxes):
+                continue
+            x0, y0, x1, y1 = [float(v) for v in boxes[0]]
+            bright = img[:, :, 0]
+            ys = np.where(bright.mean(1) > 200)[0]
+            xs = np.where(bright.mean(0) > 200)[0]
+            if len(ys) == 0 or len(xs) == 0:
+                continue
+            self.assertLess(abs(xs[0] - x0), 3, (seed, boxes[0], xs[0]))
+            self.assertLess(abs(xs[-1] + 1 - x1), 3, (seed, boxes[0], xs[-1]))
+            self.assertLess(abs(ys[0] - y0), 3, (seed, boxes[0], ys[0]))
+            self.assertLess(abs(ys[-1] + 1 - y1), 3, (seed, boxes[0], ys[-1]))
+
+    def test_40_uint8_batch_pipeline_matches_float_reference(self):
+        """collate -> to_model_input must equal the old per-sample float cast."""
+        from jingwei.data import (collate, image_hw, to_chw_float,
+                                  to_model_input)
+        a = (np.random.default_rng(1).random((16, 24, 3)) * 255).astype(np.uint8)
+        b = (np.random.default_rng(2).random((16, 24, 3)) * 255).astype(np.uint8)
+        batch = collate([dict(image=torch.from_numpy(a)),
+                         dict(image=torch.from_numpy(b))])
+        self.assertEqual(batch["image"].dtype, torch.uint8)
+        x = to_model_input(batch["image"])
+        ref = torch.stack([to_chw_float(a), to_chw_float(b)], 0)
+        self.assertTrue(torch.allclose(x, ref, atol=1e-6))
+        self.assertEqual(image_hw(batch["image"]), (16, 24))
+        self.assertEqual(image_hw(ref), (16, 24))
+
+    def test_41_amp_and_loader_flags(self):
+        """--amp resolves sanely and bf16 autocast keeps the loss finite."""
+        from train_detector import pick_amp_dtype
+        self.assertIsNone(pick_amp_dtype("off", "cpu"))
+        self.assertIsNone(pick_amp_dtype("auto", "cpu"))
+        self.assertIs(pick_amp_dtype("bf16", "cuda"), torch.bfloat16)
+        self.assertIs(pick_amp_dtype("fp16", "cuda"), torch.float16)
+
+        # bf16 autocast forward+backward on CPU exercises the same kernels the
+        # GPU mixed-precision run uses; the detection loss must stay finite.
+        model = build_model(CFG_P)
+        model.set_stage("detector")
+        model.train()
+        x = torch.rand(1, 3, 128, 128)
+        targets = [dict(boxes=torch.tensor([[10., 10., 60., 60.]]),
+                        labels=torch.tensor([2]))]
+        tg = sanitize_detection_targets(targets, 19, (128, 128), "cpu", 0)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            out = model(x, targets=tg)
+        loss = out["losses"]["total"]
+        self.assertTrue(torch.isfinite(loss), loss)
+        loss.float().backward()
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        self.assertTrue(grads)
+        self.assertTrue(all(torch.isfinite(g).all() for g in grads))
 
 
 if __name__ == "__main__":

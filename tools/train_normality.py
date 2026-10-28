@@ -26,7 +26,7 @@ from _common import (ROOT, SyntheticNormalDataset, add_cache_args,
                      collect_rng_state, data_paths, format_eta, iter_speed,
                      load_checkpoint, load_model, log, make_dataset, resolve,
                      resume_checkpoint, save_checkpoint, set_global_seed)
-from jingwei.data import collate
+from jingwei.data import collate, to_model_input
 from jingwei.losses import HardMiningCosineLoss
 from jingwei.utils import count_parameters
 
@@ -161,7 +161,7 @@ def main():
         for data in loader:
             if it >= iters:
                 break
-            x = data["image"].to(args.device, non_blocking=True)
+            x = to_model_input(data["image"], args.device)
             feats = model.neck(model.backbone(x))
             nrm = model.normality(feats, 0, return_parts=True)
             loss = criterion(nrm["target"], nrm["reconstructed"], it)

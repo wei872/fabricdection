@@ -43,6 +43,11 @@ best   -> runs/detector/best.pt  (score=0.8542)
 
 ## 2. YOLO 式 `train.cache`
 
+> **注意**：如果“加了缓存训练反而更慢”或 `--num-workers` 只能为 0，
+> 那是数据增强和 worker 序列化的问题，不是缓存的问题，
+> 见 **[docs/SPEED.md](SPEED.md)**（本次已修复：反光增强 411 ms → 2.9 ms/张，
+> worker 不再 pickle 整个 memmap）。
+
 新增 `tools/cache_dataset.py` 与 `jingwei/cache.py`。支持三种模式：
 
 | 模式 | 数据文件 | 特点 | 适用 |
