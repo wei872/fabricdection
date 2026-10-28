@@ -16,6 +16,7 @@ the final weight-only ``normality.pt`` remains for stage C compatibility.
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from pathlib import Path
 
@@ -26,7 +27,7 @@ from _common import (ROOT, SyntheticNormalDataset, add_cache_args,
                      collect_rng_state, data_paths, format_eta, iter_speed,
                      load_checkpoint, load_model, log, make_dataset, resolve,
                      resume_checkpoint, save_checkpoint, set_global_seed)
-from jingwei.data import collate, to_model_input
+from jingwei.data import collate, to_model_input, worker_init
 from jingwei.losses import HardMiningCosineLoss
 from jingwei.utils import count_parameters
 
@@ -49,6 +50,11 @@ def main():
                     help="write last.pt / iter snapshots every N iterations (0 only final)")
     ap.add_argument("--log-interval", type=int, default=200,
                     help="print a progress line every N iterations (0 disables iter logs)")
+    ap.add_argument("--num-workers", type=int, default=None,
+                    help="DataLoader workers (default 2 on Windows, 4 elsewhere; "
+                         "0 disables). Uses the 'spawn' start method.")
+    ap.add_argument("--mp-start", default="spawn",
+                    choices=["spawn", "fork", "forkserver", "default"])
     add_cache_args(ap)
     args = ap.parse_args()
 
@@ -67,8 +73,19 @@ def main():
           make_dataset("normaltrain", resolve(paths["normaltrain"]), None,
                        size, args, has_labels=False, augment=True,
                        seed=args.seed, with_descriptor=False))
-    loader = DataLoader(ds, batch_size=batch, shuffle=True, num_workers=0,
-                        collate_fn=collate, drop_last=True)
+    if args.num_workers is None:
+        args.num_workers = 2 if os.name == "nt" else 4
+    if args.smoke:
+        args.num_workers = 0
+    kw = {}
+    if args.num_workers > 0:
+        kw.update(worker_init_fn=worker_init, persistent_workers=True,
+                  prefetch_factor=2)
+        if args.mp_start != "default":
+            kw.update(multiprocessing_context=args.mp_start)
+    loader = DataLoader(ds, batch_size=batch, shuffle=True,
+                        num_workers=args.num_workers,
+                        collate_fn=collate, drop_last=True, **kw)
 
     # freeze everything except the normality branch
     for p in model.parameters():

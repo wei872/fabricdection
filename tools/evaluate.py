@@ -206,6 +206,9 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--max-val", type=int, default=0)
     ap.add_argument("--normal-max", type=int, default=0)
+    ap.add_argument("--batch", type=int, default=4,
+                    help="evaluation batch size (default 4; batch 1 idles the GPU "
+                         "at 1280 and makes a full 7k-image eval needlessly slow)")
     ap.add_argument("--val-conf", type=float, default=None,
                     help="score threshold for precision/recall "
                          "(default: fusion.final_score_thresh)")
@@ -262,9 +265,10 @@ def main():
             vds = Subset(vds, range(min(args.max_val, len(vds))))
         if args.normal_max:
             nds = Subset(nds, range(min(args.normal_max, len(nds))))
-        val_loader = DataLoader(vds, batch_size=1, shuffle=False,
+        eb = max(1, int(args.batch))
+        val_loader = DataLoader(vds, batch_size=eb, shuffle=False,
                                 collate_fn=collate)
-        norm_loader = DataLoader(nds, batch_size=1, shuffle=False,
+        norm_loader = DataLoader(nds, batch_size=eb, shuffle=False,
                                  collate_fn=collate)
 
     m = validate_detector(model, val_loader, norm_loader, args.device, cfg,

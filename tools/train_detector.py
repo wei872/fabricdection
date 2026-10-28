@@ -143,6 +143,9 @@ def main():
                     help="limit val images for fast periodic validation (0 = all)")
     ap.add_argument("--normal-max", type=int, default=0,
                     help="limit normalval images for FPR (0 = all)")
+    ap.add_argument("--val-batch", type=int, default=4,
+                    help="validation batch size (default 4; at 1280 batch 1 "
+                         "leaves most of the GPU idle)")
     ap.add_argument("--val-conf", type=float, default=None,
                     help="score threshold for val precision/recall "
                          "(default: fusion.final_score_thresh)")
@@ -253,11 +256,13 @@ def main():
             vds = Subset(vds, range(min(args.val_max, len(vds))))
         if args.normal_max:
             nds = Subset(nds, range(min(args.normal_max, len(nds))))
-        # Validation runs in the main process (batch 1): creating a SECOND
-        # worker pool while the persistent train workers are alive deadlocks on
-        # some platforms, and per-image cost here is a cached memmap read.
-        vl = DataLoader(vds, batch_size=1, shuffle=False, collate_fn=collate)
-        nl = DataLoader(nds, batch_size=1, shuffle=False, collate_fn=collate)
+        # Validation runs in the main process: creating a SECOND worker pool
+        # while the persistent train workers are alive deadlocks on some
+        # platforms, and per-image cost here is a cached memmap read.  A batch
+        # of 4 keeps the GPU busy without needing more workers.
+        vb = max(1, int(args.val_batch))
+        vl = DataLoader(vds, batch_size=vb, shuffle=False, collate_fn=collate)
+        nl = DataLoader(nds, batch_size=vb, shuffle=False, collate_fn=collate)
         return vl, nl
 
     val_loader = norm_loader = None
@@ -308,7 +313,8 @@ def main():
         f"save_interval={args.save_interval}  log_interval={args.log_interval}")
     log(f"cache={args.cache}  cache_dir={args.cache_dir}  "
         f"val_interval={args.val_interval}  val_max={args.val_max}  "
-        f"normal_max={args.normal_max}  label_offset={cfg.data.label_offset}")
+        f"normal_max={args.normal_max}  val_batch={args.val_batch}  "
+        f"label_offset={cfg.data.label_offset}")
     log(f"data: workers={args.num_workers}  prefetch={args.prefetch_factor}  "
         f"amp={'off' if amp_dtype is None else str(amp_dtype).split('.')[-1]}  "
         f"epoch_iters={steps_per_epoch}  "
@@ -340,19 +346,23 @@ def main():
         log(f"workers ready in {time.time() - t_warm:.1f}s "
             f"({args.num_workers} processes, start={args.mp_start})")
 
-    use_scaler = amp_dtype == torch.float16
+    # AMP can be switched off at runtime: gpu-side dtype support differs per
+    # card / driver, and a bf16 kernel that is missing only shows up on the
+    # first real step.  Better to continue in fp32 than to crash an overnight run.
+    amp = {"enabled": amp_dtype is not None, "dtype": amp_dtype}
     try:                                   # torch >= 2.4
-        scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+        scaler = torch.amp.GradScaler("cuda", enabled=True)
     except (AttributeError, TypeError):
-        scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+        scaler = torch.cuda.amp.GradScaler(enabled=True)
 
     def step_model(batch_data, it):
+        use_scaler = amp["enabled"] and amp["dtype"] is torch.float16
         images = to_model_input(batch_data["image"], args.device)
         targets = [dict(boxes=b.to(args.device), labels=l.to(args.device))
                    for b, l in zip(batch_data["boxes"], batch_data["labels"])]
         opt.zero_grad(set_to_none=True)
-        with torch.autocast(device_type="cuda", dtype=amp_dtype,
-                            enabled=amp_dtype is not None):
+        with torch.autocast(device_type="cuda", dtype=amp["dtype"],
+                            enabled=amp["enabled"]):
             result = model(images, targets=targets, it=it)
             loss = result["losses"]["total"]
         if not torch.isfinite(loss):
@@ -370,6 +380,7 @@ def main():
         sched.step()
         return result
 
+    amp_guard_it = it                  # fall back to fp32 only on the first step
     batch_left = time.perf_counter()
     global_t0 = time.time()
     global_it0 = it
@@ -383,7 +394,17 @@ def main():
         for bi, batch_data in enumerate(loader):
             t_got = time.perf_counter()
             data_s += t_got - batch_left
-            result = step_model(batch_data, it)
+            try:
+                result = step_model(batch_data, it)
+            except (RuntimeError, FloatingPointError) as exc:
+                if not amp["enabled"] or it != amp_guard_it:
+                    raise
+                log(f"[!] --amp {str(amp['dtype']).split('.')[-1]} failed on the "
+                    f"first iteration of this run ({type(exc).__name__}: {exc}); "
+                    f"continuing in fp32 for the rest of this run")
+                amp["enabled"] = False
+                opt.zero_grad(set_to_none=True)
+                result = step_model(batch_data, it)
             batch_left = time.perf_counter()
             step_s += batch_left - t_got
             for k, v in result["losses"].items():

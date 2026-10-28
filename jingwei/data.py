@@ -92,9 +92,9 @@ def to_model_input(batch, device=None, dtype=torch.float32) -> torch.Tensor:
         if device is not None:
             # 3x less PCIe traffic than shipping float32
             x = x.to(device, non_blocking=True)
-        x = x.permute(0, 3, 1, 2).contiguous()
-        x = x.to(dtype).div_(255.0)
-        return x
+        # one kernel: permute HWC->CHW *and* the dtype cast (contiguous output)
+        x = x.permute(0, 3, 1, 2).to(dtype, memory_format=torch.contiguous_format)
+        return x.div_(255.0)
     x = x.to(device=device, dtype=dtype, non_blocking=True)
     if x.ndim == 3:
         x = x.unsqueeze(0)

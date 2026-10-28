@@ -104,12 +104,17 @@ python -u tools/train_detector.py ^
 - `--amp auto`：4070 支持 bf16，自动用 bf16（**不需要** loss scaling）；
   Turing/16 系（1660 SUPER）没有 bf16，会退回 fp16 + `GradScaler`；
   想完全 fp32 就 `--amp off`。
+  **1660 SUPER 上训练建议 `--amp off`**：TU116 没有 Tensor Core，
+  cuDNN 的 fp16 卷积可能退化到 `IMPLICIT_PRECOMP_GEMM`，实测往往并不更快
+  （见 docs/DEPLOYMENT.md 的 1660S 实测建议；那里的部署侧仍然走 FP32/TRT）。
 - `--num-workers`：Windows 默认 2，Linux 默认 4；**先用
   `--bench-data 20` 选最优值**，见下节。`--prefetch-factor` 默认 2
   （每个预取 batch 在 1280²/batch8 时约 39 MB，别调太大）。
   `--mp-start spawn` 是默认值，Windows 上没有选择（也无需改）。
 - `--val-max 1000`：7383 张验证集每 epoch 全跑一遍大约多花 1 分钟；
   训练期抽 1000 张看趋势，最终再用 `tools/evaluate.py` 全量评估。
+- `--val-batch 4`（默认）与 `tools/evaluate.py --batch 4`：验证/评估也批量跑，
+  batch 1 时 4070 每步只喂一张图，GPU 大部分时间空转。
 - `--epoch-iters 1000`：想看指标更快时，一个 epoch 只跑 1000 个 iter。
 
 先量数据侧，再决定 worker 数 / 缓存模式：
@@ -147,11 +152,16 @@ forward+backward+optimizer。**`step` 远大于 `data` 就是 GPU 受限**，
 | 修好增强 + 多 worker | **几十倍**（本次提交） | 之前 0.1 it/s，现在受 GPU 限制 |
 | `--amp auto`（bf16） | step 约 1.3–1.8× | 与 pico 模型、NMS-free head 兼容；bf16 无需 scaler |
 | `--batch 8/16` | 吞吐 +20–40% | 显存够就行；lr 可酌情 ×1.2 |
+| `--val-batch 4` | 每个 epoch 的验证快 2–4× | 默认 4；batch 1 会让 4070 大部分时间空转 |
+| 验证抽 subsample | `--val-max 1000 --normal-max 200` | 最终评估再用 `tools/evaluate.py` 全量 |
 | `--cache disk` | 去掉 JPEG 解码（20–40 ms/张） | 145 GB；机械盘随机读也可能 5–15 ms/张，此时 `bytes` 更省空间 |
 | 每 N 个 epoch 验证 | val 全量 7383 张 ≈ 1 min | `--val-interval 2/5` |
 | `--epoch-iters` | 灵活控制每 epoch 时长 | 适合先跑通再放大 |
 
-> AMP 的正确性：`jingwei/losses.py::hungarian_match` 里有
+- `--amp` 如果在这张卡/驱动上不可用（缺 bf16 kernel、显存不够等），
+  训练**不会直接崩**：第一次迭代报错或 loss 非有限时会打印警告并自动退回
+  fp32 跑完本次训练。所以 `--amp auto` 可以放心用。
+- `--amp` 的正确性：`jingwei/losses.py::hungarian_match` 里有
 > `.cpu().numpy()`，在 autocast（bf16/fp16）下 numpy 不接受 bf16，
 > 会抛 `TypeError: Got unsupported ScalarType BFloat16`。已在本次提交里
 > 改成 `.detach().float().cpu().numpy()`，并加了单元测试

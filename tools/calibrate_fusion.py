@@ -43,7 +43,7 @@ def precompute(model, loader, device, nc=19, label_offset=0):
             targets = sanitize_detection_targets(
                 [{"boxes": batch["boxes"][b], "labels": batch["labels"][b]}
                  for b in range(x.size(0))],
-                nc, (x.shape[-2], x.shape[-1]), device, label_offset)
+                nc, image_hw(x), device, label_offset)
             batch = dict(batch)
             batch["boxes"] = [t["boxes"] for t in targets]
             batch["labels"] = [t["labels"] for t in targets]
