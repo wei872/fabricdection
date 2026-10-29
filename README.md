@@ -98,6 +98,10 @@ python tools/evaluate.py --data configs/fabric19.yaml --ckpt runs/dinov2s/best.p
 它能区分过滤因素与错类／定位问题，不能单凭低阈值 mAP 提升声称模型更好。
 详细判断见训练手册第 8 节。
 
+定位误报的训练匹配已改为几何可行匹配，避免把目标分配到无法用非负距离表示它的框外网格。
+旧 ViT-S 权重仍可推理／warm start，但旧匹配目标的 `--resume` 不再默默复用优化器。
+继续训练请用 `--pretrained runs/dinov2s/best.pt` 并另开输出目录；见手册第 9 节。
+
 ## 恢复、文档与测试
 
 `--resume runs/dinov2s/last.pt` 恢复完整训练状态；`--pretrained` 是完整检测权重的显式 warm start。

@@ -190,14 +190,29 @@ def dinov2_vits14(pretrained=True):
             self.assertIn("FIXTURE pretrained=True", text)
             self.assertIn("best_metric=best_f1", text)
             self.assertIn("TP=", text)
+            self.assertIn("unmatched_gt=", text)
             state = torch_load(out / "last.pt", map_location="cpu")
             self.assertEqual(state["train"]["backbone"], "dinov2")
+            self.assertEqual(state["train"]["assignment_version"], "geometry_feasible_v1")
             self.assertLess(state["train"]["iter"], 2)
             text = run(root / "resume", "--resume", str(out / "last.pt"))
             self.assertIn("FIXTURE pretrained=False", text)
             self.assertIn("mode=full", text)
             self.assertIn("start_epoch=2/2", text)
-            text = run(root / "warm", "--pretrained", str(out / "last.pt"), "--lr", "0.0001")
+            # Old objective metadata must not silently reuse optimizer state.
+            legacy = dict(state)
+            legacy["train"] = dict(state["train"])
+            legacy["train"].pop("assignment_version")
+            legacy_path = root / "legacy.pt"
+            torch.save(legacy, legacy_path)
+            rejected = subprocess.run([sys.executable, "tools/train_detector.py", "--cfg", str(config),
+                                       "--smoke", "2", "--epochs", "2", "--batch", "2", "--device", "cpu",
+                                       "--val-interval", "0", "--resume", str(legacy_path), "--out", str(root / "reject")],
+                                      cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("older matching objective", rejected.stderr)
+            self.assertIn("--pretrained", rejected.stderr)
+            text = run(root / "warm", "--pretrained", str(legacy_path), "--lr", "0.0001")
             self.assertIn("mode=weights-only", text)
             self.assertIn("global_iter=0", text)
             fresh = torch_load(root / "warm" / "last.pt", map_location="cpu")

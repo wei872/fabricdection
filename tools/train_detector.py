@@ -202,6 +202,10 @@ def main():
 
     init_path = args.resume or args.pretrained
     resume_state = load_checkpoint(init_path) if init_path else None
+    if args.resume and (resume_state.get("train") or {}).get("assignment_version") != model.det_loss.assignment_version:
+        raise ValueError("Checkpoint uses an older matching objective. Use --pretrained CHECKPOINT "
+                         "with a new --out directory to start the geometry-feasible schedule; "
+                         "old weights remain compatible but optimizer state is not reused silently.")
     info = (resume_checkpoint(resume_state, model,
                               optimizer=opt if args.resume else None,
                               scheduler=sched, dataset=train_ds,
@@ -274,6 +278,7 @@ def main():
         t0 = time.time()
         interval_t0 = t0
         running = {}                     # loss name -> GPU scalar (no per-iter sync)
+        assignment_totals = dict(matched_gt=0, total_gt=0, unmatched_gt=0)
         interval_loss = None
         interval_n = 0
         for bi, batch_data in enumerate(loader):
@@ -288,6 +293,8 @@ def main():
                                if "is_normal" in batch_data else None)
                 result = model(images, targets=targets, normal_mask=normal_mask)
                 loss = result["losses"]["total"]
+            for key, value in result.get("assignment", {}).items():
+                assignment_totals[key] += value
             do_log = bool(args.log_interval and (it == 0 or
                                                  (bi + 1) % args.log_interval == 0 or
                                                  (bi + 1) == n_batches))
@@ -336,6 +343,13 @@ def main():
         log(f"epoch {ep + 1:3d}/{epochs}  {msg}  total={float(running.get('total', 0.0)) / n:.3f} "
             f"({time.time() - t0:.1f}s)  elapsed_total={format_eta(time.time() - global_t0)}")
 
+        log(f"assign epoch {ep + 1:3d}/{epochs}  "
+            f"matched_gt={assignment_totals['matched_gt']}/{assignment_totals['total_gt']}  "
+            f"unmatched_gt={assignment_totals['unmatched_gt']}")
+        if assignment_totals["unmatched_gt"]:
+            log("[!] Some GTs had no feasible unique grid match (small boxes / crowding / candidate constraints). "
+                "Run evaluate.py --score-stats to inspect GT grid-center coverage.")
+
         # ---- validation: precision / recall / F1 / mAP50 / large recall -----
         val_metrics = None
         if (args.val_interval and val_loader is not None and
@@ -371,6 +385,7 @@ def main():
                                  "train": {"stage": "detector",
                                            "backbone": "dinov2",
                                            "dino_name": cfg.model.dino_name,
+                                           "assignment_version": model.det_loss.assignment_version,
                                            "best_metric": metric,
                                            "epoch": ep + 1,
                                            "best_score": best_score}},
@@ -388,6 +403,7 @@ def main():
                 "stage": "detector",
                 "backbone": "dinov2",
                 "dino_name": cfg.model.dino_name,
+                "assignment_version": model.det_loss.assignment_version,
                 "best_metric": cfg.train.get("best_metric", "best_f1"),
                 "initialization_checkpoint": str(init_path) if init_path else None,
                 "format_version": 3,

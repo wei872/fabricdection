@@ -12,7 +12,7 @@ from _common import (configure_inference, data_paths, load_model,
                      make_dataset, resolve, subset_indices)
 from jingwei.data import collate, make_worker_init_fn
 from jingwei.image_io import ascii_safe, console_safe
-from jingwei.utils import box_iou, count_parameters
+from jingwei.utils import box_iou, count_parameters, grid_center_coverage
 
 PR_THRESHOLDS = (0.05, 0.10, 0.15, 0.25, 0.40)
 
@@ -88,7 +88,10 @@ def average_precision(recall, precision):
     for i in range(len(mpre) - 2, -1, -1):
         mpre[i] = max(mpre[i], mpre[i + 1])
     x = np.linspace(0, 1, 101)
-    return float(np.trapz(np.interp(x, mrec, mpre), x))
+    integrate = getattr(np, "trapezoid", None)
+    if integrate is None:  # NumPy 1.x, still supported
+        integrate = np.trapz
+    return float(integrate(np.interp(x, mrec, mpre), x))
 
 
 def _flatten_records(records):
@@ -141,7 +144,7 @@ def _pr_at_thresholds(records, n_gt, thresholds):
 
 @torch.no_grad()
 def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
-                 large_min_area=None, pr_thresholds=PR_THRESHOLDS):
+                 large_min_area=None, pr_thresholds=PR_THRESHOLDS, grid_size=None):
     """mAP50 + global precision/recall/F1 at ``conf_thresh``.
 
     When ``large_min_area`` is given, large-defect recall (a GT box counts as
@@ -153,6 +156,7 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
     tp = fp = 0
     n_det = 0
     large_hit = large_total = 0
+    covered_gt = 0
     fp_breakdown = {"duplicate_same_gt": 0, "wrong_class": 0,
                     "localization": 0, "background": 0}
     for batch in loader:
@@ -160,6 +164,8 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
         for b, d in enumerate(dets):
             gt_boxes = batch["boxes"][b].to(device)
             gt_labels = batch["labels"][b].to(device)
+            if grid_size is not None:
+                covered_gt += int(grid_center_coverage(gt_boxes, grid_size).sum())
             for c in range(nc):
                 n_gt[c] += int((gt_labels == c).sum())
             used = torch.zeros(len(gt_boxes), dtype=torch.bool, device=device)
@@ -234,6 +240,9 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
           "n_gt": total_gt, "n_det": int(n_det),
           "best_f1": best_f1, "best_f1_thr": best_f1_thr,
           "fp_breakdown": fp_breakdown, "pr_at": pr_at}
+    if grid_size is not None:
+        pr["gt_grid_coverage"] = {"covered": covered_gt, "total": total_gt,
+                                  "fraction": covered_gt / total_gt if total_gt else float("nan")}
     if large_min_area is not None:
         pr["large_recall"] = large_hit / max(1, large_total)
     valid_aps = [a for a in aps if np.isfinite(a)]
@@ -267,7 +276,8 @@ def validate_detector(model, val_loader, norm_loader, device, cfg,
     map50, aps, pr = evaluate_map(model, val_loader, device, int(cfg.data.nc),
                                   iou_thr=iou_thr, conf_thresh=conf,
                                   large_min_area=large_area,
-                                  pr_thresholds=pr_thresholds)
+                                  pr_thresholds=pr_thresholds,
+                                  grid_size=(h, w) if score_stats is not None else None)
     rec = pr.pop("large_recall", 0.0)
     if norm_loader is not None:
         if score_stats is not None:
@@ -390,6 +400,7 @@ def main():
     if args.score_stats:
         print("Raw scores BEFORE filters (class/objectness maxima need not occur at the same cell):")
         print(json.dumps(m["raw_score_stats"], indent=2))
+        print("GT grid-center coverage (not recall):", m["gt_grid_coverage"])
     print(f"mAP50     : {m['mAP50']:.4f}")
     print(f"precision : {m['precision']:.4f} (TP={m['tp']} FP={m['fp']})")
     print(f"recall    : {m['recall']:.4f} (FN={m['fn']} GT={m['n_gt']})")
@@ -401,6 +412,9 @@ def main():
     else:
         print(f"normal FPR: {m['normal_fpr']:.4f} ({m['normal_fp']}/{m['normal_n']})")
     print(f"normal known/unknown FPR: {m['normal_known_fpr']:.4f} / {m['normal_unknown_fpr']:.4f}")
+    if args.candidate_conf is not None and nl is not None:
+        print(f"Known normal alerts use final candidate filter={cfg.inference.final_score_thresh:g}, "
+              f"NOT the P/R cutoff={m['conf_thresh']:g}; unknown alerts use their calibrated distance threshold.")
     print(f"unknown active: {m['unknown_active']}")
     if paths.get("unknownval") and m["unknown_active"]:
         uv = loader("unknownval", True, args.max_val, args.subset_seed)

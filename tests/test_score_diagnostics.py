@@ -5,12 +5,13 @@ import unittest
 from unittest.mock import patch
 
 import torch
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "tools"), str(ROOT / "tests")]
 from helpers import FakeEncoder
 from jingwei import build_model, load_config
-from evaluate import RawScoreStats, set_candidate_conf, validate_detector
+from evaluate import RawScoreStats, average_precision, set_candidate_conf, validate_detector
 
 
 class TestScoreDiagnostics(unittest.TestCase):
@@ -41,6 +42,7 @@ class TestScoreDiagnostics(unittest.TestCase):
                 observed = validate_detector(self.model, [self.batch], [dict(image=self.batch["image"])],
                                              "cpu", self.cfg, score_stats=stats)
             self.assertEqual(observed["n_det"], baseline["n_det"])
+            self.assertEqual(observed["gt_grid_coverage"], dict(covered=1, total=1, fraction=1.))
             raw = observed["raw_score_stats"]
             self.assertEqual(raw["val"]["images"], 1)
             self.assertEqual(raw["normalval"]["images"], 1)
@@ -49,18 +51,26 @@ class TestScoreDiagnostics(unittest.TestCase):
             self.assertEqual(raw["val"]["raw_cells_before_topk"]["0.05"]["images_with_candidates"], 1)
             set_candidate_conf(self.model, .001)
             with RawScoreStats(self.model.head) as stats:
-                diagnostic = validate_detector(self.model, [self.batch], None, "cpu", self.cfg,
+                diagnostic = validate_detector(self.model, [self.batch], [dict(image=self.batch["image"])], "cpu", self.cfg,
                                                 conf_thresh=.15, score_stats=stats)
             self.assertEqual(diagnostic["n_det"], 1)
             # Primary P/R stays at .15, so it still reports 0 TP. The .05
             # diagnostic reveals an otherwise perfect low-confidence detection.
             self.assertEqual(diagnostic["conf_thresh"], .15)
             self.assertEqual(diagnostic["tp"], 0)
+            self.assertEqual(observed["normal_known_fpr"], 0.)
+            self.assertEqual(diagnostic["normal_known_fpr"], 1.)  # candidate .001, not P/R .15
             self.assertEqual(diagnostic["pr_at"][.05]["tp"], 1)
             self.assertGreater(diagnostic["mAP50"], .9)
         for k, v in state_before.items():
             torch.testing.assert_close(self.model.state_dict()[k], v, rtol=0, atol=0)
         self.assertEqual(len(self.model.head._forward_hooks), 0)
+
+    def test_numpy2_trapezoid_path_avoids_deprecated_trapz(self):
+        with patch("evaluate.np.trapezoid", create=True, return_value=.375) as integrate:
+            value = average_precision(np.array([0., 1.]), np.array([1., 1.]))
+        self.assertEqual(value, .375)
+        integrate.assert_called_once()
 
     def test_hook_removed_after_exception(self):
         with self.assertRaisesRegex(RuntimeError, "diagnostic failure"):

@@ -39,6 +39,25 @@ def boxes_to_distances(points: torch.Tensor, boxes: torch.Tensor) -> torch.Tenso
                       boxes[:, 2:3] - x, boxes[:, 3:4] - y], dim=-1)
 
 
+@torch.no_grad()
+def grid_center_coverage(boxes: torch.Tensor, img_size, strides=(8, 32)) -> torch.Tensor:
+    """Whether each GT contains a point of the nonnegative-distance grid.
+
+    This is geometry coverage, NOT detection recall. Boundary points are allowed
+    (zero distance is a softplus limit); index ranges are clipped to the visible grid.
+    """
+    covered = torch.zeros(len(boxes), dtype=torch.bool, device=boxes.device)
+    h, w = img_size
+    for stride in strides:
+        lower = (boxes[:, :2] / stride - .5).ceil()
+        upper = (boxes[:, 2:] / stride - .5).floor()
+        lower = lower.clamp(min=0)
+        maximum = boxes.new_tensor([w // stride - 1, h // stride - 1])
+        upper = torch.minimum(upper, maximum)
+        covered |= (lower <= upper).all(1)
+    return covered & (boxes[:, 2:] > boxes[:, :2]).all(1)
+
+
 def box_iou(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     """Pairwise IoU between two sets of xyxy boxes. Returns (N, M)."""
     inter = (torch.min(a[:, None, 2:], b[None, :, 2:]) -

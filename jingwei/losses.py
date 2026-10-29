@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .utils import box_ciou, box_iou, boxes_from_distances
+from .utils import box_ciou, box_iou, boxes_from_distances, boxes_to_distances
 
 
 def _grid_points(h, w, stride, device, dtype):
@@ -52,7 +52,7 @@ def build_dense_targets(pred, targets, stride, nc, reg_scale, radius=1.5):
         r = boxes[None, :, 2] - pts[:, 0:1]
         bo = boxes[None, :, 3] - pts[:, 1:2]
         d = torch.stack([l, t, r, bo], -1)                     # (HW, G, 4)
-        inside = d.min(-1).values > 0
+        inside = d.min(-1).values >= 0
         cx = (boxes[:, 0] + boxes[:, 2]) * 0.5
         cy = (boxes[:, 1] + boxes[:, 3]) * 0.5
         centre = ((pts[:, 0:1] - cx[None, :]).abs() <= radius * stride) & \
@@ -64,13 +64,10 @@ def build_dense_targets(pred, targets, stride, nc, reg_scale, radius=1.5):
         min_cost, gi = cost.min(1)
         idx = torch.nonzero(min_cost < float("inf")).flatten()
         if idx.numel() == 0:
-            # fallback: at least the cells containing a GT centre
-            cxy = torch.stack([cx, cy], -1)
-            nearest = ((pts[:, None, :] - cxy[None, :, :]).abs().sum(-1)).argmin(0)
-            idx = nearest
-            g = torch.arange(G, device=device)
-        else:
-            g = gi[idx]
+            # A nonnegative-distance head cannot exactly represent a box with
+            # no in-box grid point. Never manufacture negative l/t/r/b targets.
+            continue
+        g = gi[idx]
 
         t_cls[b, labels[g], idx] = 1.0
         t_reg[b, :, idx] = d[idx, g].t()
@@ -92,47 +89,85 @@ def build_dense_targets(pred, targets, stride, nc, reg_scale, radius=1.5):
 # --------------------------------------------------------------------------------------
 @torch.no_grad()
 def hungarian_match(preds, targets, strides, nc, reg_scale, max_candidates=1600):
-    """Return matches[si] = list of (batch, flat_index, gt_index)."""
+    """Geometry-feasible one-to-one matches: [(batch, flat_index, gt_index)].
+
+    Reserve in-box candidates per GT, independent of predicted confidence.
+    Invalid point/GT pairs are never positives for a nonnegative-distance head.
+    Dummy columns allow unrepresentable/crowded GTs to remain unmatched rather
+    than forcing an impossible pair or crashing scipy on an infeasible matrix.
+    """
+    import numpy as np
     from scipy.optimize import linear_sum_assignment
 
     B = preds[0]["cls"].shape[0]
     device = preds[0]["cls"].device
     per_scale: list[list] = [[] for _ in preds]
+    height = preds[0]["cls"].shape[-2] * strides[0]
+    width = preds[0]["cls"].shape[-1] * strides[0]
+    normalizer = torch.tensor([width, height, width, height], device=device, dtype=torch.float32)
 
     for b in range(B):
-        all_cls, all_obj, all_boxes, meta = [], [], [], []
+        boxes_gt = targets[b]["boxes"].to(device=device, dtype=torch.float32)
+        labels = targets[b]["labels"].to(device=device, dtype=torch.long)
+        if boxes_gt.numel() == 0:
+            continue  # no candidate sorting / CPU transfer on pure normal images
+        G = len(boxes_gt)
+        centers_gt = (boxes_gt[:, :2] + boxes_gt[:, 2:]) / 2
+        all_cls, all_obj, all_boxes, all_points, meta = [], [], [], [], []
         for si, p in enumerate(preds):
-            Bn, _, H, W = p["cls"].shape
+            _, _, H, W = p["cls"].shape
             stride = strides[si]
             pts = _grid_points(H, W, stride, device, torch.float32)
-            cls = p["cls"][b].float().reshape(nc, -1).t().sigmoid()    # (HW, nc)
+            cls = p["cls"][b].float().reshape(nc, -1).t().sigmoid()
             obj = p["obj_o2o"][b].float().reshape(-1).sigmoid()
             dist = p["reg"][b].float().reshape(4, -1).t() * reg_scale * stride
             boxes = boxes_from_distances(pts, dist)
             score = obj * cls.max(-1).values
             k = min(max(1, max_candidates // len(preds)), score.numel())
             top = torch.topk(score, k).indices
+
+            inside = ((pts[:, None] >= boxes_gt[None, :, :2]) &
+                      (pts[:, None] <= boxes_gt[None, :, 2:])).all(-1)
+            center_dist = ((pts[:, None] - centers_gt[None]) / stride).square().sum(-1)
+            center_dist = center_dist.masked_fill(~inside, float("inf"))
+            # The budget caps confidence-selected cells, not GT coverage. At
+            # least G local candidates also reduce conflicts between nearby GTs.
+            nearest = center_dist.topk(min(max(9, G), len(pts)), dim=0, largest=False).indices
+            reserved = nearest[torch.isfinite(center_dist.gather(0, nearest))]
+            top = torch.unique(torch.cat((top, reserved)))
             all_cls.append(cls[top])
             all_obj.append(obj[top])
             all_boxes.append(boxes[top])
-            meta.extend([(si, int(flat)) for flat in top.cpu().tolist()])
+            all_points.append(pts[top])
+            meta.extend((si, int(flat)) for flat in top.cpu().tolist())
 
-        boxes_gt = targets[b]["boxes"].to(device=device, dtype=torch.float32)
-        labels = targets[b]["labels"].to(device=device, dtype=torch.long)
-        if boxes_gt.numel() == 0:
+        cls_all = torch.cat(all_cls)
+        obj_all = torch.cat(all_obj)
+        box_all = torch.cat(all_boxes)  # same unclipped geometry as regression loss
+        points = torch.cat(all_points)
+        feasible = ((points[None] >= boxes_gt[:, None, :2]) &
+                    (points[None] <= boxes_gt[:, None, 2:])).all(-1)
+        cls_gt = cls_all[:, labels].t()
+        iou = box_iou(box_all, boxes_gt).t()
+        l1 = ((box_all[None] - boxes_gt[:, None]).abs() / normalizer).mean(-1)
+        cost = (-cls_gt - .5 * obj_all[None] - 2 * iou + 5 * l1).cpu().numpy()
+        valid = feasible.cpu().numpy()
+        if not np.isfinite(cost).all():
+            raise FloatingPointError("Non-finite Hungarian matching cost")
+        if not valid.any():
             continue
-        cls_all = torch.cat(all_cls, 0)                # (C, nc)
-        obj_all = torch.cat(all_obj, 0)
-        box_all = torch.cat(all_boxes, 0).clamp(min=0)
-
-        cls_gt = cls_all[:, labels].t()                # (G, C)
-        iou = box_iou(box_all, boxes_gt).t()           # (G, C)
-        cost = (-cls_gt - 0.5 * obj_all[None, :] - 2.0 * iou).detach().float().cpu().numpy()
-
-        rows, cols = linear_sum_assignment(cost)
+        # Scale all feasible costs together to [0,1] (same linear objective
+        # at fixed cardinality). A dummy costs G+1, so maximize the number of
+        # feasible matches BEFORE comparing classification/localization costs.
+        lo, hi = cost[valid].min(), cost[valid].max()
+        normalized = (cost.astype(np.float64) - lo) / max(float(hi) - float(lo), 1e-12)
+        real_cost = np.where(valid, normalized, (G + 1) * (G + 2))
+        padded = np.concatenate((real_cost, np.full((G, G), G + 1.)), axis=1)
+        rows, cols = linear_sum_assignment(padded)
         for g, c in zip(rows, cols):
-            si, flat = meta[c]
-            per_scale[si].append((b, flat, int(g)))
+            if c < len(meta) and valid[g, c]:
+                si, flat = meta[c]
+                per_scale[si].append((b, flat, int(g)))
     return per_scale
 
 
@@ -161,6 +196,8 @@ def o2o_negative_count(total_cells: int, n_pos: int, ratio: float,
 # Combined detection loss
 # --------------------------------------------------------------------------------------
 class DetectionLoss(nn.Module):
+    assignment_version = "geometry_feasible_v1"
+
     def __init__(self, cfg):
         super().__init__()
         self.nc = int(cfg.data.nc)
@@ -219,6 +256,10 @@ class DetectionLoss(nn.Module):
         # ---------- one-to-one deployed branch ----------
         matches = hungarian_match(preds, targets, self.strides, self.nc,
                                   self.reg_scale, self.o2o_candidates)
+        n_gt = sum(len(target["boxes"]) for target in targets)
+        n_assigned = sum(len(group) for group in matches)
+        self.last_assignment = {"matched_gt": n_assigned, "total_gt": n_gt,
+                                "unmatched_gt": n_gt - n_assigned}
         for si, p in enumerate(preds):
             stride = self.strides[si]
             B, _, H, W = p["cls"].shape
@@ -252,9 +293,7 @@ class DetectionLoss(nn.Module):
                 pb = boxes_from_distances(grid[flat:flat + 1], pd[None])
                 losses["box_o2o"] = losses["box_o2o"] + \
                     (1.0 - box_ciou(pb, gt_box[None])).mean() + \
-                    0.1 * F.l1_loss(pd, torch.stack([
-                        grid[flat, 0] - gt_box[0], grid[flat, 1] - gt_box[1],
-                        gt_box[2] - grid[flat, 0], gt_box[3] - grid[flat, 1]]).clamp(min=0))
+                    0.1 * F.l1_loss(pd, boxes_to_distances(grid[flat:flat + 1], gt_box[None])[0])
         n_match = max(1, sum(len(m) for m in matches))
         losses["cls_o2o"] = losses["cls_o2o"] / n_match
         losses["box_o2o"] = losses["box_o2o"] / n_match
