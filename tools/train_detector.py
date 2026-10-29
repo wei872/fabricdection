@@ -364,6 +364,19 @@ def main():
                 f"localization={fb.get('localization', 0)} "
                 f"background={fb.get('background', 0)}  "
                 f"(best operating point: conf>={val_metrics['best_f1_thr']:.2f})")
+            # Is the deployed gate open at all?  ``gate`` is the maximum
+            # ``sigmoid(obj)*sigmoid(cls)`` over every decoded peak *before* the
+            # threshold is applied, so it separates the two very different
+            # failure modes that both show up as "precision = 0":
+            #   gate < conf  -> the model emits nothing (objectness/classification
+            #                   cold-start problem, not a threshold problem);
+            #   gate >> conf -> the model emits boxes but they are wrong.
+            log(f"      gate: max_score={val_metrics.get('gate_max', 0.0):.4f} "
+                f"(conf={val_metrics['conf_thresh']:.2f})  "
+                f"obj_max={val_metrics.get('obj_max', 0.0):.3f}  "
+                f"cls_max={val_metrics.get('cls_max', 0.0):.3f}  "
+                f"cand>{val_metrics['conf_thresh']:.2f}={val_metrics.get('n_above', 0)} "
+                f"-> out={val_metrics.get('n_out', 0)}")
             # Model selection must be precision-aware.  The old objective
             # (0.5*mAP50 + 0.5*large_recall) ignored precision completely and
             # is maximised by flooding the frame with boxes: recall rises,
@@ -375,9 +388,18 @@ def main():
             score = float(val_metrics["best_f1"]) - 2.0 * fpr_over
             if (float(val_metrics["best_f1"]) <= 0.0 and
                     float(val_metrics["mAP50"]) <= 0.0):
-                log("[!] no usable detections this epoch (precision = recall = 0); "
-                    "best.pt only becomes meaningful once boxes clear the "
-                    "score threshold. Check --val-conf and model.peak_filter.")
+                gate = float(val_metrics.get("gate_max", 0.0))
+                if gate < float(val_metrics["conf_thresh"]):
+                    log(f"[!] the deployed gate is SHUT: max score {gate:.4f} < "
+                        f"conf {val_metrics['conf_thresh']:.2f}, so the model "
+                        "cannot emit a single box. This is a training-signal "
+                        "problem (objectness/classification cold start), not a "
+                        "threshold problem: see train.obj_quality_floor / "
+                        "model.obj_bias_init / train.obj_o2o_alpha.")
+                else:
+                    log("[!] no usable detections this epoch (precision = recall = 0); "
+                        "best.pt only becomes meaningful once boxes clear the "
+                        "score threshold. Check --val-conf and model.peak_filter.")
             if score > best_score:
                 best_score = score
                 save_checkpoint({"model": model.state_dict(),

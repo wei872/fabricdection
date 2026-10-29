@@ -37,6 +37,15 @@ model:
   # 即 1 TP + 143 FP —— 这是 precision 上不去的直接原因）。
   peak_filter: true             # 只保留 3x3 局部极大值（每个目标一个峰）
   peak_kernel: 3                # 1 = 关闭峰值过滤（退回旧行为，用于 A/B）
+  # 冷启动先验（logit）：obj/cls 的初始 bias，默认保持原值不动。
+  # 实测（table-stride 探针，400 步 Adam lr=2e-3）：bias=-4 时 score 在第 7 步
+  # 越过 0.05、第 20 步到 0.6 —— 1x1 conv 的权重会把 logit 拉起来，所以初始 bias
+  # **不是**冷启动的瓶颈，不要为了"快点出框"把它调高：-2 时第 0 步就会吐出 99 个
+  # 框（首轮 precision ≈0、normal_fpr 爆表），-4 / -2 才是稳的。
+  # 这两个键留作调试开关：若 val 里连续 >3 个 epoch 都是 gate: max_score < conf，
+  # 再把 obj_bias_init 调到 -2.0 试试。
+  obj_bias_init: -4.0
+  cls_bias_init: -2.0
 
 normality:
   enabled: true
@@ -84,7 +93,7 @@ fusion:
 
 train:
   loss_weights: {cls_o2m: 1.0, box_o2m: 2.0, obj_o2m: 1.0,
-                 cls_o2o: 1.5, box_o2o: 2.0, obj_o2o: 0.5, fg_align: 0.5}
+                 cls_o2o: 1.5, box_o2o: 2.0, obj_o2o: 1.5, fg_align: 0.5}
   class_weights: null
   o2o_candidates: 1600
   o2o_neg_ratio: 0.02       # per-scale hard negatives as a fraction of all cells
@@ -93,11 +102,18 @@ train:
   #   focal = 全网所有 cell 都参与 focal loss（默认，背景不会被漏掉）
   #   ohem  = 只对最难的 ~8% 负样本做 hard mining（旧行为；p=0 的
   #           简单背景 cell 拿不到梯度，会留下无法用阈值消除的误报）
-  # 注意：focal 的绝对量级约为 ohem 的 ~50 倍，所以上面 loss_weights 里
-  #      obj_o2o 已从 1.5 调成 0.5。
+  # 注意：focal 现在是"平衡"归一化（正样本均值 + 负样本均值），量级与
+  #      其它项可比，所以 obj_o2o 权重回到 1.5（曾误调到 0.5，导致唯一
+  #      决定出框的分支只占 loss 的 0.7%）。
   obj_o2o_mode: focal
   obj_o2o_gamma: 2.0
-  obj_o2o_alpha: 0.25
+  obj_o2o_alpha: 0.5          # 正样本比例 0.1%~1%，alpha=0.25 是在惩罚前景
+  obj_o2o_neg_weight: 1.0     # 负样本均值项的权重（>1 更抑制背景误报）
+  obj_quality_floor: 0.5      # 质量目标的归一化下限（避免冷启动时目标=0）
+  cls_quality_target: false   # 分类目标用 one-hot，而不是乘上 IoU 质量
+  obj_o2m_pos_weight: 1.0     # 平衡归一化已经给正样本 50% 份额；再乘 4 会让
+                              # 训练分支 objectness 占到总 loss 的 60%（实测）
+  cls_o2m_pos_weight: 1.0
   rec_p_final: 0.9
   rec_warmup: 1000
   rec_factor: 0.1

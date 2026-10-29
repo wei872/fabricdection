@@ -155,6 +155,22 @@ python tools/export.py    --cfg configs/jingwei_n.yaml --ckpt runs/bank/memory_b
   + 局部+全局注意力前景上下文损失（见 FOREGROUND.md）；
 - 优化器 AdamW + cosine，梯度裁剪 5.0；
 - 若某类 AP 特别低，在 `train.class_weights` 里填 19 个权重（如按 `1/sqrt(样本数)` 归一化）；
+- 冷启动（v0.2.1 起）：部署分数 `sigmoid(obj)·sigmoid(cls)` 必须越过
+  `model.score_thresh`（0.05）和 `fusion.final_score_thresh`（0.15）才会出框，
+  所以这几项不要随手改：
+
+  | 配置 | 默认 | 作用 |
+  |---|---|---|
+  | `model.obj_bias_init` / `cls_bias_init` | -4.0 / -2.0（σ≈0.018 / 0.119） | 初始分数 ≈0.002，前几十步不出框是正常的（实测第 7 步越过 0.05）。把它们调高到 -2.0 **不会**更快学会，只会让第 0 步就吐出上百个框（见 CODE_REVIEW §0.7） |
+  | `train.obj_quality_floor` | 0.5 | objectness/质量目标的下限；0 会让"预测 IoU≈0"的冷启动把正样本目标也压成 0 |
+  | `train.cls_quality_target` | false | true 时分类目标是 `one-hot × 质量`，冷启动会把缺陷的分类学成 ~0.02 |
+  | `train.obj_o2o_mode / gamma / alpha` | focal / 2.0 / 0.5 | 正样本只占 0.1%–1%，alpha=0.25 是在压前景 |
+  | `train.obj_o2o_neg_weight` | 1.0 | 背景项权重，>1 更抑制背景误报 |
+  | `loss_weights.obj_o2o` | 1.5 | 门控分支；低于 1.0 时它在总 loss 里的占比会掉到 1% 以下 |
+
+- 每个 epoch 的 val 块多一行 `gate: max_score=… obj_max=… cls_max=…`：
+  `max_score < conf` 表示**模型一个框都没出**（训练信号问题，不是阈值问题），
+  `max_score ≫ conf` 而 precision 低才是"框错了"，去跑 `tools/diagnose_precision.py`。
 - **建议**：先用 `normaltrain` 里的图做"纯负样本"加入训练（无框），可显著降低 FPR。
 
 ### 3.2 阶段 B 细节（最容易出错）
@@ -242,7 +258,7 @@ python tools/train_normality.py --cfg configs/jingwei_n.yaml \
 ## 4. 快速自检（无真实数据）
 
 ```bash
-python -m unittest discover -s tests -v                 # 51 项，约 119 s（含验证指标 / 未知缺陷框）
+python -m unittest discover -s tests -v                 # 56 项，约 129 s（含验证指标 / 未知缺陷框 / 冷启动门控）
 python tools/benchmark.py --all                         # p/n/s 参数量 / MACs / 延迟估算
 python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both  # 在你的 GPU 上实测
 python tools/train_detector.py   --smoke 2 --epochs 1 --batch 1 --device cpu --log-interval 1
@@ -260,6 +276,9 @@ python tools/export.py --check --out runs/export/jingwei_n.onnx
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
+| val 一直 `precision=0 recall=0 boxes/img=0.0`，且 `gate: max_score < conf` | 部署门没开：objectness/分类冷启动（质量目标塌陷 / bias 初值过低 / `obj_o2o` 权重过小） | v0.2.1 已修（见 [CODE_REVIEW.md §0.7](CODE_REVIEW.md)）；重训即可。自己改过 `model.obj_bias_init` / `train.obj_quality_floor` / `loss_weights.obj_o2o` 的话先恢复默认 |
+| val 一直 `precision=0` 但 `gate: max_score ≫ conf` | 框出来了但都是错框 | 跑 `tools/diagnose_precision.py` 看 FP 分解（duplicate / wrong_class / localization / background），再按 [CODE_REVIEW.md §0.5/§0.6](CODE_REVIEW.md) 的表格处理 |
+| `loss share` 里 `box_o2m` 长期 >60% | v0.2.1 之前像素 L1 没有归一化，量级随输入分辨率线性变化 | 已改成按图像边长归一化；若仍 >60%，说明 GT 框质量差或 `box_o2m` 权重过高 |
 | `no images under ...` | 路径没改 / 图片扩展名不在列表 | 检查 `configs/fabric19.yaml`；支持 jpg/jpeg/png/bmp/tif/tiff/webp（含大写） |
 | 中文图片名报错 / 读图返回 `None` / 无法保存中文结果 | Windows 下 `cv2.imread` / `cv2.imwrite` / `cv2.VideoCapture` 直接吃非 ASCII 路径失败 | 已统一改用 `jingwei/image_io.py` 的 `imread_unicode` / `imwrite_unicode` / `VideoCaptureUnicode`；升级代码后若仍报错，贴完整 traceback，不要回退到直接 `cv2.imread`；详见 [DESIGN.md §12.5](DESIGN.md) |
 | `ValueError: operands could not be broadcast together with shapes (H,W,3) (H,W)` | 旧版 `fabric_photometric` 反光场经 OpenCV 后变成 2D，未补通道维 | 已修复：`field[:, :, None]` 后再与 RGB 相乘；`test_25` 覆盖 1040×2448 类长条图，见 [DESIGN.md §12.6](DESIGN.md) |

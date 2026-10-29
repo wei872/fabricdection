@@ -255,6 +255,21 @@ def main():
     cfg.fusion.final_score_thresh = shipped_thresh
     n_img = max(1, len(frames))
 
+    # ------------------------------------------------ 0. gate liveness ------
+    # Straight from head.decode, measured BEFORE the threshold: if the best
+    # score on the whole set is below 1.0, the sweeps below are looking at a
+    # model that cannot emit boxes at all -- that is a training-signal problem
+    # (see CODE_REVIEW.md §0.7), not a threshold problem.
+    gate = max((float(fr["scores"].max()) for fr in frames if len(fr["scores"])),
+               default=0.0)
+    n_cand = sum(len(fr["scores"]) for fr in frames)
+    print(f"\n[0] gate: max decoded score over {n_img} val images = {gate:.4f} "
+          f"({n_cand} candidates total)")
+    if gate <= 0.0:
+        print("    [!] not a single candidate came out of decode: check "
+              "model.score_thresh and the training logs' `gate:` line before "
+              "reading anything below.")
+
     # ------------------------------------------------ 1. threshold sweep -----
     print("\n[1] score-threshold sweep  (class-aware TP/FP, IoU "
           f"{args.iou:.2f})")

@@ -1306,10 +1306,10 @@ class TestModel(unittest.TestCase):
         tgt = [dict(boxes=torch.tensor([[480., 480., 500., 500.]]),
                     labels=torch.tensor([3]))]
 
-        def run(mode):
+        def run(mode, base_logit=-4.0):
             cfg = load_config(CFG_N)
             cfg.train.obj_o2o_mode = mode
-            obj = torch.full((1, 1, 160, 160), -4.0)
+            obj = torch.full((1, 1, 160, 160), float(base_logit))
             obj[:, :, 60, 60] = 4.0        # the matched positive
             obj3 = obj.clone().requires_grad_(True)
             preds = [dict(cls=torch.full((1, 19, 160, 160), -3.0),
@@ -1337,7 +1337,20 @@ class TestModel(unittest.TestCase):
                          "far background cells get NO gradient under ohem")
         self.assertNotEqual(far_focal, 0.0,
                             "focal must supervise far background cells too")
-        self.assertGreater(float(out_focal["obj_o2o"]), float(out_ohem["obj_o2o"]))
+        # NOTE (v0.2.1): the old assertion here was
+        # ``focal_loss > ohem_loss``, i.e. a comparison of raw magnitudes.
+        # With the balanced normalisation that is not meaningful any more --
+        # focal legitimately collapses to ~3e-6/cell once the background is
+        # already right (that is the whole point of the (1-p_t)^gamma factor),
+        # while ohem's top-k mean always pays for its hardest cells.
+        # What must hold is the property that matters: *wrong* background is
+        # still punished hard, and it is punished because of the background
+        # term (the balanced normalisation keeps that term alive).
+        out_wrong, _, _ = run("focal", base_logit=0.0)     # p = 0.5 everywhere
+        self.assertGreater(float(out_wrong["obj_o2o"]), 0.05,
+                           "a background predicted at p=0.5 must still cost a lot")
+        self.assertGreater(float(out_wrong["obj_o2o"]),
+                           float(out_focal["obj_o2o"]))
 
     def test_51_precision_diagnosis_helpers(self):
         """The diagnosis tool must classify FPs the same way evaluate.py does."""
@@ -1388,6 +1401,196 @@ class TestModel(unittest.TestCase):
         out = fuse_detections(det, anomaly, (1280, 1280), cfg, 19)
         self.assertIn("scale_idx", out)
         self.assertEqual(out["scale_idx"].tolist(), [0, 1])
+
+    # ------------------------------------------------ precision round 3 (v0.2.1)
+    def test_53_quality_target_never_collapses_to_zero(self):
+        """Cold start: predicted IoU is ~0, so the quality target must not be 0.
+
+        The dense target used to be the *predicted* IoU of the matched cell.
+        On a fresh model every predicted box is a degenerate dot, that IoU is
+        0, and the branch was therefore trained towards ``target = 0`` on the
+        positive cells themselves (``obj_o2m`` ~0.025 for a whole run) -- the
+        objectness/classification heads could never wake up.
+        """
+        from jingwei.losses import build_dense_targets
+
+        cfg = load_config(CFG_N)
+        pred = dict(cls=torch.zeros(1, 19, 160, 160),
+                    reg=torch.zeros(1, 4, 160, 160),        # cold start
+                    obj=torch.zeros(1, 1, 160, 160))
+        tgt = [dict(boxes=torch.tensor([[480., 480., 560., 560.]]),
+                    labels=torch.tensor([3]))]
+        for floor in (0.5, 0.0):
+            _, _, t_qual, _, pos, _ = build_dense_targets(
+                pred, tgt, 8, 19, float(cfg.model.reg_scale), quality_floor=floor)
+            self.assertGreater(int(pos.sum()), 0)
+            vals = t_qual[pos.expand(-1, 1, -1)]
+            self.assertGreater(float(vals.min()), 0.0,
+                               "a positive cell must never be taught objectness=0")
+            self.assertLessEqual(float(vals.max()), 1.0)
+            if floor > 0:
+                self.assertGreaterEqual(float(vals.min()), floor - 1e-6)
+
+    def test_54_classification_is_trained_up_on_a_defect(self):
+        """The deployed cls head must be pushed UP on a positive cell.
+
+        With the quality-scaled target the gradient at a defect cell was
+        *positive* (i.e. push the class probability down towards the ~0.02
+        predicted IoU), which is the direct cause of the dead score gate.
+        """
+        from jingwei.losses import DetectionLoss
+
+        cfg = load_config(CFG_N)
+        B, HW = 1, 160 * 160
+        cls = torch.full((B, 19, 160, 160), -2.0, requires_grad=True)
+        preds = [dict(cls=cls,
+                      reg=torch.zeros(B, 4, 160, 160),
+                      obj=torch.zeros(B, 1, 160, 160),
+                      obj_o2o=torch.zeros(B, 1, 160, 160), fg=None),
+                 dict(cls=torch.full((B, 19, 40, 40), -2.0),
+                      reg=torch.zeros(B, 4, 40, 40),
+                      obj=torch.zeros(B, 1, 40, 40),
+                      obj_o2o=torch.zeros(B, 1, 40, 40), fg=None)]
+        tgt = [dict(boxes=torch.tensor([[480., 480., 560., 560.]]),
+                    labels=torch.tensor([3]))]
+        out = DetectionLoss(cfg)(preds, tgt, (1280, 1280))
+        out["cls_o2m"].backward()
+        from jingwei.losses import build_dense_targets
+        _, _, _, _, pos, _ = build_dense_targets(preds[0], tgt, 8, 19, 1.0)
+        flat_pos = pos.reshape(-1)
+        g = cls.grad.reshape(B, 19, HW)[0, 3]
+        self.assertLess(float(g[flat_pos].mean()), -0.05,
+                        "gradient wrt cls logit at a positive must be negative"
+                        " (increase the class probability)")
+        self.assertGreater(torch.isfinite(g).all().item(), 0)
+
+    def test_55_objectness_positives_own_their_loss_term(self):
+        """The positive cells must own a real share of `obj_o2o` (not 0.7%).
+
+        Measured by masking the matched cell: with a balanced normalisation the
+        loss drops to ~0 when the positive is already predicted, while the old
+        ``sum / n_pos`` form was dominated by the ~25k background cells and
+        barely noticed the positive at all.
+        """
+        from jingwei.losses import DetectionLoss, hungarian_match
+
+        cfg = load_config(CFG_N)
+        tgt = [dict(boxes=torch.tensor([[480., 480., 560., 560.]]),
+                    labels=torch.tensor([3]))]
+        loss_fn = DetectionLoss(cfg)
+
+        shapes = [(1, 1, 160, 160), (1, 1, 40, 40)]
+
+        def make(pos_logit=None, hit=None):
+            preds = []
+            for si, shp in enumerate(shapes):
+                obj = torch.full(shp, -2.0).reshape(-1).clone()
+                if hit is not None and hit[0] == si:
+                    obj[hit[1]] = pos_logit
+                obj = obj.reshape(shp)
+                preds.append(dict(cls=torch.full((1, 19, shp[2], shp[3]), -2.0),
+                                  reg=torch.full((1, 4, shp[2], shp[3]), 1.0),
+                                  obj=obj.clone(), obj_o2o=obj, fg=None))
+            return preds
+
+        mm = hungarian_match(make(), tgt, loss_fn.strides, loss_fn.nc,
+                             loss_fn.reg_scale, loss_fn.o2o_candidates)
+        hit = [(si, flat) for si, m in enumerate(mm) for _, flat, _ in m]
+        self.assertTrue(hit, "the fixture must produce an o2o match")
+        hit = hit[0]
+
+        def obj_loss(pos_logit):
+            out = loss_fn(make(pos_logit, hit), tgt, (1280, 1280))
+            return float(out["obj_o2o"])
+
+        low = obj_loss(-2.0)      # positive predicted ~0.12 -> big positive loss
+        high = obj_loss(12.0)     # positive predicted ~1.0 -> positive term ~0
+        self.assertGreater(low, 0.05)
+        self.assertLess(low, 20.0, "balanced normalisation keeps the term O(1)")
+        self.assertGreater(low - high, 0.3 * low,
+                           "the positive cell must own >=30% of obj_o2o;"
+                           " a sum/n_pos form is owned by background cells")
+
+    def test_56_head_opens_the_score_gate(self):
+        """Regression for `boxes/img = 0.0`: after N Adam steps the gate must open.
+
+        Head-only optimisation on a frozen feature map -- this is the exact
+        300-step budget of a 55-iter epoch set, so the logged run is reproduced
+        without a backbone, a dataset or a GPU.
+        """
+        from jingwei.head import NMSFreeDetect
+        from jingwei.losses import DetectionLoss
+
+        cfg = load_config(CFG_P)
+        torch.manual_seed(0)
+        head = NMSFreeDetect(cfg, [0, 96, 0, 384])
+        for hd in head.heads:
+            torch.nn.init.constant_(
+                hd.obj_o2o.bias, float(cfg.model.get("obj_bias_init", -2.0)))
+        head.train()
+        loss_fn = DetectionLoss(cfg)
+        g = torch.Generator().manual_seed(0)
+        feats = {"n3": torch.randn(1, 96, 40, 40, generator=g),
+                 "n5": torch.randn(1, 384, 10, 10, generator=g)}
+        tgt = [dict(boxes=torch.tensor([[110., 110., 210., 210.]]),
+                    labels=torch.tensor([3]))]
+        opt = torch.optim.AdamW([p for p in head.parameters() if p.requires_grad],
+                                lr=float(cfg.train.detector_lr))
+        thresh = float(cfg.model.score_thresh)
+        opened_at = None
+        for it in range(300):
+            opt.zero_grad(set_to_none=True)
+            preds = head(feats, training=True)
+            loss_fn(preds, tgt, (320, 320))["total"].backward()
+            opt.step()
+            if it % 25 == 24:
+                with torch.no_grad():
+                    p = head(feats, training=False)
+                    # ALL scales: P3 alone can stay at the init level while P5
+                    # has already learned the object (this masked a dead-gate
+                    # report in an earlier version of the probe).
+                    s = torch.cat([
+                        (q["obj_o2o"].sigmoid() *
+                         q["cls"].sigmoid().max(1, keepdim=True).values).reshape(1, -1)
+                        for q in p], 1)
+                    if float(s.max()) > thresh:
+                        opened_at = it + 1
+                        break
+        self.assertIsNotNone(
+            opened_at,
+            f"300 Adam steps at lr={float(cfg.train.detector_lr)} did not push "
+            f"the deployed score above {thresh} -- the objectness gate is dead")
+        dets = head.decode(head(feats, training=False), (320, 320))[0]
+        self.assertGreater(len(dets["boxes"]), 0)
+        self.assertGreater(head.last_stats["score_max"], 0.0)
+
+    def test_57_validation_reports_gate_liveness(self):
+        """`gate_max < conf` (nothing emitted) must be distinguishable from bad boxes."""
+        from evaluate import evaluate_map
+
+        class Stub(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head = torch.nn.Module()
+                self.head.last_stats = dict(score_max=0.004, obj_max=0.02,
+                                            cls_max=0.20, n_above=0, n_out=0)
+
+            def forward(self, x):
+                return [dict(boxes=torch.zeros(0, 4), scores=torch.zeros(0),
+                             labels=torch.zeros(0, dtype=torch.long))
+                        for _ in range(x.shape[0])]
+
+        batch = dict(image=torch.zeros(1, 3, 128, 128),
+                     boxes=[torch.tensor([[10., 10., 100., 100.]])],
+                     labels=[torch.tensor([0])])
+        map50, _, pr = evaluate_map(Stub(), [batch], "cpu", 2, conf_thresh=0.15)
+        self.assertEqual(map50, 0.0)
+        self.assertAlmostEqual(pr["gate_max"], 0.004, places=6)
+        self.assertAlmostEqual(pr["obj_max"], 0.02, places=6)
+        self.assertLess(pr["gate_max"], 0.15,
+                        "gate_max below conf == nothing emitted, not bad boxes")
+        self.assertEqual(pr["n_above"], 0)
+
 
 
 if __name__ == "__main__":

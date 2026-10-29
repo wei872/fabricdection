@@ -110,8 +110,21 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
     n_images = 0
     fp_breakdown = {"duplicate_same_gt": 0, "wrong_class": 0,
                     "localization": 0, "background": 0}
+    # Liveness of the deployed score gate (pre-threshold, straight from
+    # head.decode): ``gate_max`` below the confidence threshold means the model
+    # is not producing detections at all, which is a *different* failure from
+    # "detections are wrong" and must not be debugged as a precision problem.
+    liveness = {"gate_max": 0.0, "obj_max": 0.0, "cls_max": 0.0,
+                "n_above": 0, "n_out": 0}
     for batch in loader:
         dets = model(batch["image"].to(device))
+        st = getattr(getattr(model, "head", None), "last_stats", None) or {}
+        if st:
+            liveness["gate_max"] = max(liveness["gate_max"], float(st.get("score_max", 0.0)))
+            liveness["obj_max"] = max(liveness["obj_max"], float(st.get("obj_max", 0.0)))
+            liveness["cls_max"] = max(liveness["cls_max"], float(st.get("cls_max", 0.0)))
+            liveness["n_above"] += int(st.get("n_above", 0))
+            liveness["n_out"] += int(st.get("n_out", 0))
         n_images += len(dets)
         for b, d in enumerate(dets):
             gt_boxes = batch["boxes"][b].to(device)
@@ -195,6 +208,7 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
           "dets_per_image": float(n_det) / max(1.0, float(n_images)),
           "best_f1": best_f1, "best_f1_thr": best_f1_thr,
           "fp_breakdown": fp_breakdown, "pr_at": pr_at}
+    pr.update(liveness)
     if large_min_area is not None:
         pr["large_recall"] = large_hit / max(1, large_total)
     valid_aps = [a for a in aps if np.isfinite(a)]

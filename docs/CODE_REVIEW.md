@@ -1,4 +1,4 @@
-# 代码审查与优化建议（v0.2.0）
+# 代码审查与优化建议（v0.2.1）
 
 > 审查对象：`jingwei/`（推理库）+ `tools/`（训练/评估/部署 CLI）+ `tests/` + `configs/`。
 > 审查方式：逐文件静态审查 + 全部单元测试实跑 + 针对性探针脚本（下面每条结论都附复现方式或实测数字）。
@@ -205,7 +205,10 @@ python tools/diagnose_precision.py --cfg configs/jingwei_p.yaml \
     --ckpt runs/detector/best.pt --max-val 300
 ```
 
-对给定 checkpoint 直接回答五个问题（每一节末尾给出"下一步改什么"）：
+对给定 checkpoint 直接回答六个问题（每一节末尾给出"下一步改什么"）：
+
+0. **门控存活**：全 val 集上 decode 出来的最大分数与候选数 —— 若为 0，说明模型根本不会出框，
+   下面的阈值扫描没有意义（对应 `train_detector` 的 `gate:` 行，见 §0.7）；
 
 1. **阈值扫描**：conf 0.05→0.60 的 boxes/img、precision、recall、F1、normal_FPR，
    并给出 F1 最优阈值（这个值就该填进 `fusion.final_score_thresh`）；
@@ -228,7 +231,140 @@ normal 集只前向一次（缓存后逐阈值统计 FPR），所以 300 张 val
 
 ---
 
-## 1. 本轮已修复（按严重程度；0.5 节的三项 precision 修复也在此列）
+## 0.7 专题：precision 第三轮（v0.2.1）——objectness 门在冷启动时是关的
+
+第三轮来自一条真实训练日志（RTX 4070 laptop，440 张训练图，batch 8，bf16，
+`--resume runs/dino/dino_init.pt`，lr 2e-3）：
+
+```
+epoch   1/150  ... | val: mAP50=0.0000 precision=0.0000 recall=0.0000 best_f1=0.0000@0.00 normal_fpr=0.0000
+      boxes/img=  0.0  FP: duplicate=0 wrong_class=0 localization=0 background=0
+[!] no usable detections this epoch
+      loss  box_o2m=32.03 cls_o2m=46.91 box_o2o=20.24 obj_o2o=2.352 obj_o2m=0.028 total=154.3
+      loss share: box_o2m=42%  cls_o2m=30%  box_o2o=26%
+epoch   2/150  ... 同上（precision = recall = 0）
+      loss  box_o2m=28.75 cls_o2m= 4.11 box_o2o=12.03 obj_o2o=1.218 obj_o2m=0.025 total= 87.7
+      loss share: box_o2m=66%  box_o2o=27%  cls_o2m=5%
+```
+
+`boxes/img = 0.0` 意味着模型**一个框都没输出**。这不是"precision 低"，而是"precision 的分母是 0"——
+所以这一轮先修"门根本没开"，否则后面所有阈值/权重调参都是在真空里做。
+
+部署分数是 `score = sigmoid(obj_o2o) · sigmoid(cls)`，decode 门槛 `model.score_thresh=0.05`，
+融合后还有 `fusion.final_score_thresh=0.15`。初始时 `obj_o2o.bias=-4`（p=0.018）、
+`cls_pred.bias=-2`（p=0.119），初始分数 ≈ **0.002** —— 比两个门槛小 1~2 个数量级，
+所以**最初几十步不出框是正常的**。问题在于它一直不出，而且下面四条缺陷把"学会"这条路也堵住了。
+
+### 先排除一个错误猜想：bias 初值不是瓶颈
+
+一开始我把原因算成"Adam 单步最多挪 lr，从 -4 走到 0 要 ~1850 步 ≈ 34 个 epoch"。
+**这个推理是错的**：objectness 是 1×1 conv，它靠**权重**（96 个通道 × 特征幅值）就能把 logit
+拉起来，不需要 bias 走完全程。实测（head-only 冷启动，冻结的随机特征，Adam lr=2e-3）：
+
+| 探针 | 首次出框 | score 越过 0.15 | 第 0 步框数 |
+|---|---|---|---|
+| bias -4（旧代码 645041e） | it 5 | it 8 | 0 |
+| bias -4（本轮修复后） | it 3 | it 7 | 0 |
+| bias -2（本轮修复后） | it 0 | it 1 | **99**（`top_k` 拉满） |
+
+所以 `model.obj_bias_init` 保持 -4.0，只作为调试开关暴露出来；把它预置成 0.12 只会让第 0 步吐出
+99 个框、首轮 precision ≈0、`normal_fpr` 爆表。
+
+顺带说明为什么这个探针**复现不出**用户的现象：合成任务只有一个 GT、特征可以立刻背下来，
+回归几步就拟合好了，于是 `qmax > 0`、质量目标有意义。用户真实数据上回归远没有拟合，
+质量目标才塌陷成 0 —— 日志里 `obj_o2m` 恒为 0.025 就是它的指纹。
+
+### 缺陷 1（决定性）：objectness / 分类的**正样本目标本身是 0**
+
+`build_dense_targets` 里 objectness 目标取的是"当前预测框与 GT 的 IoU"：
+
+```python
+qual = box_ciou(pb, boxes[g]).clamp(0, 1)     # pb 来自 pred["reg"]
+t_qual[b, 0, idx] = qual                      # 冷启动时 ≈ 0
+...
+target = t_cls * t_qual                       # 分类目标也被乘上 ≈0
+```
+
+新模型的框是一团退化的点，CIoU ≤ 0 → `clamp` 后全是 0。于是：
+
+* `obj_o2m` 被训练成 **0**（日志里恒为 0.025 ≈ "全图预测 0，已经很准了"）；
+* 部署用的 `cls` 被训练成 **0.02**（一个真实缺陷的分类目标），而 `cls_pred` 是 o2m/o2o 共用的卷积；
+* 分数 = 0.018 × 0.02 = 3.6e-4，**永远**过不了门。
+
+**修复**：按该尺度内最大质量归一化并设下限（TAL/YOLOv8 的做法），冷启动时退化为全 1.0，
+回归学好之后再按质量排序；分类目标改回 one-hot（`train.cls_quality_target: false`）。
+
+### 缺陷 2：`obj_o2o` 用 `sum / n_pos` 归一化 → 正样本项是舍入误差
+
+160×160 的 P3 图上有 25600 个 cell，其中正样本 2–8 个。`foc.sum() / n_pos`
+把 25k 个背景 cell 的和除以 8，于是这项在总 loss 里只占 **0.7%**（日志：`obj_o2o=0.61/87.7`）。
+换句话说：唯一决定"要不要出框"的分支，梯度贡献不到 1%。
+
+**修复**：平衡归一化（`正样本均值 + 负样本均值`），正负各占该项 50%，与图大小无关。
+`obj_o2m` / `cls_o2m` 同样处理（`cls_o2m` 原来是 `sum/(n_pos)`，实测膨胀到 46.9，占 30%）。
+
+### 缺陷 3：回归的 L1 项没有归一化 → `box_o2m` 吞掉 66%
+
+```python
+losses["box_o2m"] += (1 - box_ciou(...)).mean() + 0.1 * F.l1_loss(pred_d, tgt_d)
+```
+
+`pred_d / tgt_d` 是**像素**距离（1280² 输入下可达 1280），而 `1 - CIoU ≤ 2`，
+两个尺度加起来最多 4 —— 日志里 `box_o2m = 28.75`，也就是**至少 25 来自这个像素 L1**（L1 ≈ 250 px）。
+于是"回归"这项的值 90% 以上来自一个未归一化的 L1，且它的量级**随输入尺寸线性变化**
+（320² 与 1280² 训练，梯度比例完全不同，同一份超参换个 `--size` 就变味）。
+这就是 `loss share: box_o2m=66%` 的来源，也间接造成缺陷 1：回归被这个巨项拖着走，
+`obj_o2m` 的正样本目标永远是 0。
+
+**修复**：以图像边长归一化（`pred_d / img_ref`），所有 loss 项都回到 O(1)，
+`loss share` 才能跨分辨率、跨 epoch 比较。
+
+### 缺陷 4：focal `alpha=0.25` + `obj_o2o` 权重 0.5（上一轮改错的方向）
+
+正样本比例是 0.1%–1%，`alpha=0.25` 是**在惩罚前景**（背景拿 0.75）。
+上一轮把 `loss_weights.obj_o2o` 从 1.5 降到 0.5，理由是"focal 绝对量级约为 ohem 的 50 倍"；
+但量级下降后 0.7% 的占比让这个分支实际上被关掉了。
+**修复**：`alpha=0.5`（平衡）、权重回到 1.5、新增 `obj_o2o_neg_weight` 单独控制背景项。
+
+### 现在怎么判断"门有没有开"
+
+val 块新增一行（数值来自 `head.decode` 的 `last_stats`，是**加阈值之前**的统计）：
+
+```
+      gate: max_score=0.0812 (conf=0.15)  obj_max=0.412  cls_max=0.204  cand>0.15=0 -> out=0
+```
+
+* `max_score < conf` ⇒ **模型根本没出框**（objectness/分类冷启动问题），
+  这时告警会直接写 "the deployed gate is SHUT"，并提示去看
+  `train.obj_quality_floor` / `model.obj_bias_init` / `train.obj_o2o_alpha`；
+* `max_score ≫ conf` 而 precision 仍低 ⇒ 才是"框错了"，去看 FP 分解（0.5/0.6 节）。
+
+同时 `model.obj_bias_init` / `model.cls_bias_init`（logit，默认 -2.0 = 12% 先验）
+让门只需挪 0.4 个 logit（≈200 步 ≈ 4 个 epoch，配合分类头学到 0.9）就能开。
+
+### 重训后应该看到的（同一条命令，不加任何新参数）
+
+| 指标 | 修复前 | 修复后（预期） |
+|---|---|---|
+| `epoch 1–2 boxes/img` | 0.0（且之后很久仍为 0） | 前若干个 epoch 可能仍为 0（分数 ≈0.02 < 门槛），但 `gate: max_score` 会逐 epoch 上升 |
+| `gate: max_score` | 未打印 | 可见；越过 `conf` 后开始出框 |
+| `loss share: obj_o2o` | 0.7% | 17%–24%（smoke 实测） |
+| `loss: box_o2m` | 32 / 28.8 | **~2.1**（smoke 实测；像素 L1 归一化，与输入尺寸无关） |
+| `loss: obj_o2m` | 0.025（恒定 = 死的） | 起始 ~6.9（目标=1，预测≈0.02），随训练下降 |
+| `loss: cls_o2m` | 46.9（`sum/n_pos` 膨胀） | 0.2 → 0.005 |
+
+smoke 实测（320²，4 张合成图，2 epoch）的 `loss share` 从
+`box_o2m=66% / obj_o2o=0.7%` 变成 `obj_o2m=26~28% obj_o2o=17~24% box_o2m=16~19% box_o2o=13~15% cls_o2m=12%`。
+
+回归测试（`test_53`–`test_57`）把四条缺陷都钉住了：质量目标不得为 0、
+分类在缺陷上必须被"推高"、平衡 focal 的量级必须是 O(1)、
+head 在 300 步 Adam 内必须把分数推过 `score_thresh`、验证集必须能区分"没出框"和"框错了"。
+
+---
+
+## 1. 本轮已修复（按严重程度；0.5 / 0.6 / 0.7 三节专列的 precision 修复也在此列）
+
+> v0.2.1 的四项冷启动修复（质量目标塌陷、平衡归一化、像素 L1 未归一化、objectness 分支权重）见 **§0.7**，改动落在 `jingwei/losses.py` / `jingwei/head.py` / `tools/evaluate.py` / `tools/train_detector.py` / 三个 config，回归测试 `test_53`–`test_57`。
 
 ### P0-1 `AnomalyFusion(mode="gate")` 对概率做了第二次 sigmoid → 标定阈值失效
 
@@ -461,7 +597,16 @@ AttributeError: module 'numpy' has no attribute 'trapz'. Did you mean: 'trace'?
 `anomaly=(1,1,128,128)`、`context=(1,3,128,128)` 全为静态形状，`onnx.checker` 通过）。
 建议把「`pip install -r requirements-dev.txt` + 全量测试 + `tools/export.py --check`」作为 CI 的最小门禁。
 
-### 2.13 P3 · 其它（低风险、可择机处理）
+### 2.13 P1 · 两个绝对阈值耦合在同一条分数上
+
+`decode` 用 `model.score_thresh`（0.05）截断候选，融合路径再用 `fusion.final_score_thresh`（0.15）
+截断最终框，两者都作用在 `sigmoid(obj)·sigmoid(cls)`（融合后只增不减）上。0.05 因此几乎不起作用，
+真正决定"有没有框"的是 0.15 —— 而它同时也是 `--val-conf` 的默认值。
+建议：把 decode 的阈值改成"融合阈值的下界 + 安全余量"（例如 `score_thresh = min(score_thresh, 0.5*final)`），
+或者干脆让 decode 只做 top-k + 峰值，把唯一的绝对阈值留给融合/标定链路，
+这样"调阈值"就只有一个旋钮，`calibrate_fusion.py` 的搜索结果也能直接用于部署。
+
+### 2.14 P3 · 其它（低风险、可择机处理）
 
 | 项 | 位置 | 说明 |
 |---|---|---|
@@ -503,10 +648,30 @@ tests/test_model.py    +16 项回归（37–52），test_24/34 适配新契约
 README.md / docs/*     测试数量与时长更正；新增本文件
 ```
 
+v0.2.1（第 3 轮，§0.7）增量：
+
+```
+jingwei/losses.py      新增 _balanced_bce（正/负样本均值，量级与图尺寸无关）
+                       quality 目标按尺度最大 IoU 归一化 + 下限 obj_quality_floor（冷启动不再塌成 0）
+                       分类目标改回 one-hot（cls_quality_target 可切回旧行为）
+                       cls_o2m / obj_o2m 改平衡归一化（曾膨胀到 46.9 / 恒为 0.025）
+                       box_o2m / box_o2o 的像素 L1 按图像边长归一化（曾占 66%）
+                       obj_o2o focal 改平衡形式 + obj_o2o_neg_weight
+jingwei/head.py        obj_bias_init / cls_bias_init 可配；decode 记录 last_stats
+                       （score_max / obj_max / cls_max / n_above / n_out，阈值之前）
+tools/evaluate.py      evaluate_map 汇总 gate_max / obj_max / cls_max / n_above / n_out
+tools/train_detector.py  val 块新增 `gate:` 行；门关时告警指向正确的旋钮
+tools/diagnose_precision.py  [0] 门控存活检查（max decoded score）
+configs/*.yaml         obj_bias_init / cls_bias_init / obj_quality_floor / cls_quality_target /
+                       obj_o2m_pos_weight / cls_o2m_pos_weight / obj_o2o_neg_weight；
+                       obj_o2o 权重 0.5 → 1.5，alpha 0.25 → 0.5
+tests/test_model.py    +5 项回归（53–57），test_50 的"focal > ohem"改成"错误背景必须被罚"
+```
+
 ## 4. 复现命令
 
 ```bash
-# 全量测试（本机 42 项 / 90 s，含 1 个 onnx skip）
+# 全量测试（本机 56 项 / 129 s；装 requirements-dev.txt 后 onnx 用例不再 skip）
 python -m unittest discover -s tests -v
 
 # P0-1：融合门控是否破坏 0.5 标定点

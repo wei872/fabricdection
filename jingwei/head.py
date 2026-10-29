@@ -27,7 +27,8 @@ from .utils import boxes_from_distances
 
 
 class DecoupledHead(nn.Module):
-    def __init__(self, c: int, nc: int, width: float, training_branch: bool = True):
+    def __init__(self, c: int, nc: int, width: float, training_branch: bool = True,
+                 obj_bias_init: float = -4.0, cls_bias_init: float = -2.0):
         super().__init__()
         h = max(16, int(c * width))
         stem = lambda: nn.Sequential(DWConv(c, h, 3), DWConv(h, h, 3))
@@ -39,9 +40,27 @@ class DecoupledHead(nn.Module):
         self.fg_pred = nn.Conv2d(h, 1, 1) if training_branch else None
         self.fg_stem = stem() if training_branch else None
 
-        nn.init.constant_(self.obj_pred.bias, -4.0)
-        nn.init.constant_(self.obj_o2o.bias, -4.0)
-        nn.init.constant_(self.cls_pred.bias, -2.0)
+        # Objectness / classification priors.
+        #
+        # ``-4.0`` (p = 0.018) keeps the initial score
+        # ``sigmoid(obj)*sigmoid(cls) ~ 0.02`` -- below both the decode gate
+        # (``model.score_thresh``) and the fusion gate
+        # (``fusion.final_score_thresh``), so the first iterations emit no
+        # boxes.  That is normal *if the branch then learns*: measured on a
+        # head-only cold start (400 Adam steps, lr 2e-3) the deployed score
+        # crosses 0.05 at step 7 and reaches 0.6 by step 20 -- the 1x1 conv
+        # moves its logits through the *weights*, so the bias is not the
+        # bottleneck and must not be pre-loaded to a high prior: with -2.0 the
+        # very first step already emits 99 boxes (top_k saturated), i.e.
+        # precision ~0 and a normal-image FPR spike in epoch 1.
+        #
+        # They stay configurable (``model.obj_bias_init`` /
+        # ``model.cls_bias_init``, logit space) purely as debugging knobs: if
+        # the val line keeps reporting ``gate: max_score < conf`` for more than
+        # a few epochs, drop obj_bias_init to -2.0 and compare.
+        nn.init.constant_(self.obj_pred.bias, -4.0)   # train-only branch
+        nn.init.constant_(self.obj_o2o.bias, float(obj_bias_init))
+        nn.init.constant_(self.cls_pred.bias, float(cls_bias_init))
 
     def forward(self, x, training: bool = False):
         f_cls, f_reg = self.cls_stem(x), self.reg_stem(x)
@@ -79,10 +98,19 @@ class NMSFreeDetect(nn.Module):
         self.dedup = bool(m.get("dedup", True))
         self.dedup_iou = float(m.get("dedup_iou", 0.70))
         self.dedup_contain = float(m.get("dedup_contain", 0.85))
+        obj_bias_init = float(m.get("obj_bias_init", -4.0))
+        cls_bias_init = float(m.get("cls_bias_init", -2.0))
+        self.obj_bias_init = obj_bias_init
+        self.cls_bias_init = cls_bias_init
         self.heads = nn.ModuleList([
-            DecoupledHead(channels[1], self.nc, m.head_width, m.fg_align),
-            DecoupledHead(channels[3], self.nc, m.head_width, m.fg_align),
+            DecoupledHead(channels[1], self.nc, m.head_width, m.fg_align,
+                          obj_bias_init=obj_bias_init, cls_bias_init=cls_bias_init),
+            DecoupledHead(channels[3], self.nc, m.head_width, m.fg_align,
+                          obj_bias_init=obj_bias_init, cls_bias_init=cls_bias_init),
         ])
+        # Diagnostics for "is the deployed gate open?" (see train_detector's
+        # val line).  decode() is graph-external, so bookkeeping here is free.
+        self.last_stats: dict = {}
         self._points_cache: dict = {}
 
     def _points(self, h, w, stride, device):
@@ -154,6 +182,8 @@ class NMSFreeDetect(nn.Module):
         B = preds[0]["cls"].shape[0]
         device = preds[0]["cls"].device
         results = []
+        stats = dict(score_max=0.0, obj_max=0.0, cls_max=0.0,
+                     n_peak=0, n_above=0, n_out=0, score_thresh=self.score_thresh)
 
         for b in range(B):
             cand_boxes, cand_scores, cand_labels, cand_obj, cand_pts, cand_si = [], [], [], [], [], []
@@ -191,12 +221,26 @@ class NMSFreeDetect(nn.Module):
 
                 cls_prob = cls.sigmoid()
                 cscore, clabel = cls_prob.max(dim=-1)
-                score = obj.sigmoid() * cscore
+                prob_obj = obj.sigmoid()
+                score = prob_obj * cscore
                 if peak_mask is not None:
                     score = score.masked_fill(~peak_mask, -1.0)
 
                 k = min(self.top_k, score.numel())
                 top = torch.topk(score, k)
+
+                # ---- liveness bookkeeping (measured BEFORE the gate) --------
+                # The whole "precision never rises" report reduces to these
+                # numbers being tiny: if ``score_max`` never exceeds the gate,
+                # every epoch reports 0 boxes and mAP/precision/F1 stay
+                # identically 0 whatever else is tuned.
+                stats["score_max"] = max(stats["score_max"],
+                                        float(top.values.max()) if top.values.numel() else 0.0)
+                stats["obj_max"] = max(stats["obj_max"], float(prob_obj.max()))
+                stats["cls_max"] = max(stats["cls_max"], float(cscore.max()))
+                stats["n_peak"] += int(peak_mask.sum()) if peak_mask is not None else score.numel()
+                stats["n_above"] += int((top.values > self.score_thresh).sum())
+
                 keep = top.values > self.score_thresh
                 if not keep.any():
                     continue
@@ -235,6 +279,8 @@ class NMSFreeDetect(nn.Module):
             results.append(dict(boxes=boxes[box_keep], scores=scores[box_keep],
                                 labels=labels[box_keep], obj=obj[box_keep],
                                 points=pts[box_keep], scale_idx=si[box_keep]))
+            stats["n_out"] += int(box_keep.sum())
+        self.last_stats = stats
         return results
 
     @property

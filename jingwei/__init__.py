@@ -23,4 +23,4 @@ __all__ = [
     "imread_unicode", "imwrite_unicode", "VideoCaptureUnicode",
     "ascii_safe", "console_safe", "torch_load",
 ]
-__version__ = "0.2.0"
+__version__ = "0.2.1"

@@ -52,8 +52,42 @@ def _grid_points(h, w, stride, device, dtype):
     return (pts + 0.5) * stride
 
 
+def _balanced_bce(bce: torch.Tensor, is_pos: torch.Tensor, pos_weight: float = 1.0,
+                  neg_weight: float = 1.0):
+    """Mean-over-positives + mean-over-negatives of an elementwise BC(E) map.
+
+    A dense detector has ~3 orders of magnitude more background cells than
+    positive cells (1700 vs 2-8 even at 320 px).  Summing the elementwise loss
+    and dividing by the *positive* count -- or taking a plain ``.mean()`` over
+    every cell -- makes the value (and the gradient) of the positive term an
+    arbitrary function of the map size:
+
+    * ``sum / n_pos``  blows the loss up (cls_o2m reached 46.9 in a real run
+      while the deployed objectness term sat at 1.2), so the share of the
+      *useful* term collapses and the log's ``loss share`` swings 5% -> 66%
+      between epochs for no modelling reason;
+    * ``.mean()`` over all cells (obj_o2m) drives positives towards 0 because
+      every positive cell is outvoted 100:1.
+
+    Balanced means give each class a fixed share of the term (50/50 by
+    default, tunable through ``pos_weight``/``neg_weight``) independently of
+    the map size, which is what makes the reported loss share comparable
+    across scales and epochs.
+    """
+    pos = is_pos.to(bce.dtype)
+    n_pos = pos.sum()
+    n_neg = (1.0 - pos).sum()
+    out = bce.new_zeros(())
+    if float(n_pos) > 0:
+        out = out + pos_weight * (bce * pos).sum() / n_pos
+    if float(n_neg) > 0:
+        out = out + neg_weight * (bce * (1.0 - pos)).sum() / n_neg
+    return out
+
+
 @torch.no_grad()
-def build_dense_targets(pred, targets, stride, nc, reg_scale, radius=1.5):
+def build_dense_targets(pred, targets, stride, nc, reg_scale, radius=1.5,
+                        quality_floor=0.5):
     """FCOS-style centre sampling with an IoU-aware quality target."""
     B, _, H, W = pred["cls"].shape
     device = pred["cls"].device
@@ -106,7 +140,25 @@ def build_dense_targets(pred, targets, stride, nc, reg_scale, radius=1.5):
         t_reg[b, :, idx] = d[idx, g].t()
         pd = pred_dist[b, :, idx].t()
         pb = boxes_from_distances(pts[idx], pd)
-        t_qual[b, 0, idx] = box_ciou(pb, boxes[g]).clamp(0, 1)
+        qual = box_ciou(pb, boxes[g]).clamp(0, 1)
+        # COLD-START FIX (round 3): the objectness/cls target used to be the
+        # *predicted* IoU of the matched cell.  On a fresh model every box is a
+        # degenerate dot, so that IoU is ~0 -- which means the branch was being
+        # trained towards ``target = 0`` **on the positive cells themselves**:
+        # ``obj_o2m`` sat at 0.025 (== "predict 0 everywhere, it is nearly
+        # right") for the whole run and ``cls`` was taught to predict 0.02 on a
+        # defect, so the deployed score ``sigmoid(obj) * sigmoid(cls)`` could
+        # never exceed the 0.05/0.15 gates -> 0 boxes per image in the log.
+        #
+        # Normalise by the best positive of the scale (TAL / YOLOv8 do this for
+        # the alignment metric) and clamp from below, so the branch always has a
+        # real positive signal -- at cold start it defaults to the uniform 1.0 --
+        # while still ranking positives by quality once the regression works.
+        qmax = float(qual.max()) if qual.numel() else 0.0
+        if qmax > 1e-6:
+            t_qual[b, 0, idx] = (qual / qmax).clamp(min=float(quality_floor))
+        else:
+            t_qual[b, 0, idx] = 1.0
         pos[b, 0, idx] = True
 
         # foreground-alignment auxiliary target: a disc around each GT centre
@@ -217,10 +269,25 @@ class DetectionLoss(nn.Module):
         #   treatment, still bounded and cheap (one extra elementwise pass).
         self.o2o_mode = str(cfg.train.get("obj_o2o_mode", "focal")).lower()
         self.o2o_gamma = float(cfg.train.get("obj_o2o_gamma", 2.0))
-        self.o2o_alpha = float(cfg.train.get("obj_o2o_alpha", 0.25))
+        self.o2o_alpha = float(cfg.train.get("obj_o2o_alpha", 0.5))
+        self.o2o_neg_weight = float(cfg.train.get("obj_o2o_neg_weight", 1.0))
+        # cold-start knobs (round 3): see build_dense_targets / _balanced_bce
+        self.quality_floor = float(cfg.train.get("obj_quality_floor", 0.5))
+        self.cls_quality_target = bool(cfg.train.get("cls_quality_target", False))
+        self.o2m_pos_weight = float(cfg.train.get("obj_o2m_pos_weight", 1.0))
+        self.cls_o2m_pos_weight = float(cfg.train.get("cls_o2m_pos_weight", 1.0))
 
     def forward(self, preds, targets, img_size):
         device = preds[0]["cls"].device
+        # The auxiliary L1 term below is computed on *pixel* distances.  Without
+        # a reference length its magnitude is proportional to the input
+        # resolution: a real run logged ``box_o2m = 28.75`` although
+        # ``1 - CIoU <= 2`` per scale (<= 4 for the two scales), i.e. ~25 of it
+        # was ``0.1 * L1`` with L1 ~ 250 px -- 66% of the whole loss while the
+        # deployed objectness branch sat at 0.7%.  Normalising by the image side
+        # makes every loss term O(1), resolution-independent, and makes the
+        # ``loss share`` line comparable across input sizes.
+        img_ref = float(max(float(img_size[0]), float(img_size[1])))
         losses = {k: torch.zeros((), device=device) for k in
                   ("cls_o2m", "box_o2m", "obj_o2m", "cls_o2o", "box_o2o", "obj_o2o", "fg_align")}
 
@@ -228,20 +295,32 @@ class DetectionLoss(nn.Module):
         for si, p in enumerate(preds):
             stride = self.strides[si]
             t_cls, t_reg, t_qual, t_fg, pos, pts = build_dense_targets(
-                p, targets, stride, self.nc, self.reg_scale)
+                p, targets, stride, self.nc, self.reg_scale,
+                quality_floor=self.quality_floor)
             B, _, H, W = p["cls"].shape
             HW = H * W
 
             cls = p["cls"].reshape(B, self.nc, HW)
-            target = t_cls * t_qual
+            # the classification target is the class label, NOT the (cold-start
+            # zero) regression quality -- multiplying them taught the deployed
+            # cls head to predict ~0.02 on a real defect.
+            target = t_cls * t_qual if self.cls_quality_target else t_cls
             ce = F.binary_cross_entropy_with_logits(cls, target, reduction="none")
             mod = (cls.sigmoid() - target).abs().pow(2)
             cw = self.class_weights[None, :, None]
-            losses["cls_o2m"] = losses["cls_o2m"] + (ce * mod * cw).sum() / (pos.sum() + 1.0)
+            # "positive" means "this (cell, class) entry carries a label".
+            # Using ``pos.expand(B, nc, HW)`` instead would count the 19 classes
+            # of every positive cell as positive and dilute the positive term
+            # 19x -- and it silently stays "balanced" while the positives are
+            # being outvoted again.
+            losses["cls_o2m"] = losses["cls_o2m"] + _balanced_bce(
+                ce * mod * cw, t_cls > 0.5,
+                pos_weight=self.cls_o2m_pos_weight)
 
             bce_obj = F.binary_cross_entropy_with_logits(p["obj"].reshape(B, 1, HW), t_qual,
                                                          reduction="none")
-            losses["obj_o2m"] = losses["obj_o2m"] + (bce_obj * (1.0 + 3.0 * pos.float())).mean()
+            losses["obj_o2m"] = losses["obj_o2m"] + _balanced_bce(
+                bce_obj, pos, pos_weight=self.o2m_pos_weight)
 
             pm = pos.expand(B, 4, HW)
             pred_d = (p["reg"].float() * self.reg_scale * stride).reshape(B, 4, HW)[pm].reshape(-1, 4)
@@ -251,7 +330,8 @@ class DetectionLoss(nn.Module):
                 pb = boxes_from_distances(p_sel, pred_d)
                 gb = boxes_from_distances(p_sel, tgt_d)
                 losses["box_o2m"] = losses["box_o2m"] + \
-                    (1.0 - box_ciou(pb, gb)).mean() + 0.1 * F.l1_loss(pred_d, tgt_d)
+                    (1.0 - box_ciou(pb, gb)).mean() + \
+                    0.1 * F.l1_loss(pred_d / img_ref, tgt_d / img_ref)
 
             if p["fg"] is not None:
                 losses["fg_align"] = losses["fg_align"] + \
@@ -272,15 +352,28 @@ class DetectionLoss(nn.Module):
             n_pos = len(matches[si])
             norm = float(max(1, n_pos))
             if self.o2o_mode == "focal":
-                # all-cell sigmoid focal loss; positives are up-weighted by
-                # alpha, hard negatives by (1 - p_t)^gamma.
+                # BALANCED focal: mean over positives + mean over negatives.
+                #
+                # The previous form (``foc.sum() / n_pos``) divides a sum that
+                # contains ~25k negative cells by ~8 positive cells, so the
+                # positive term is a rounding error of the objective: measured
+                # on a real run obj_o2o was 0.7% of the total loss.  Balanced
+                # means give the positives a fixed ~50% share regardless of
+                # how many cells the map has.
+                #
                 # NOTE: do not name this ``p`` -- ``p`` is the prediction dict
-                # of this scale (shadowing it broke the cls/reg losses below).
+                # of this scale (shadowing it broke the cls/reg losses).
                 prob = obj.sigmoid()
                 p_t = prob * t_obj + (1.0 - prob) * (1.0 - t_obj)
                 a_t = self.o2o_alpha * t_obj + (1.0 - self.o2o_alpha) * (1.0 - t_obj)
                 foc = a_t * (1.0 - p_t).pow(self.o2o_gamma) * bce
-                losses["obj_o2o"] = losses["obj_o2o"] + foc.sum() / norm
+                is_pos = t_obj > 0.5
+                if bool(is_pos.any()):
+                    losses["obj_o2o"] = losses["obj_o2o"] + foc[is_pos].mean()
+                is_neg = ~is_pos
+                if bool(is_neg.any()):
+                    losses["obj_o2o"] = losses["obj_o2o"] + \
+                        self.o2o_neg_weight * foc[is_neg].mean()
             else:
                 n_neg = o2o_negative_count(B * HW, n_pos, self.o2o_neg_ratio,
                                            self.o2o_min_neg)
@@ -303,11 +396,12 @@ class DetectionLoss(nn.Module):
                 gt_box = targets[b]["boxes"][g].to(device=device, dtype=torch.float32)
                 pd = reg[b, :, flat] * self.reg_scale * stride
                 pb = boxes_from_distances(grid[flat:flat + 1], pd[None])
+                tgt_d = torch.stack([
+                    grid[flat, 0] - gt_box[0], grid[flat, 1] - gt_box[1],
+                    gt_box[2] - grid[flat, 0], gt_box[3] - grid[flat, 1]]).clamp(min=0)
                 losses["box_o2o"] = losses["box_o2o"] + \
                     (1.0 - box_ciou(pb, gt_box[None])).mean() + \
-                    0.1 * F.l1_loss(pd, torch.stack([
-                        grid[flat, 0] - gt_box[0], grid[flat, 1] - gt_box[1],
-                        gt_box[2] - grid[flat, 0], gt_box[3] - grid[flat, 1]]).clamp(min=0))
+                    0.1 * F.l1_loss(pd / img_ref, tgt_d / img_ref)
         n_match = max(1, sum(len(m) for m in matches))
         losses["cls_o2o"] = losses["cls_o2o"] / n_match
         losses["box_o2o"] = losses["box_o2o"] / n_match
