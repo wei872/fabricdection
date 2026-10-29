@@ -146,3 +146,40 @@ python tools/export.py --ckpt runs/dinov2s/calibrated.pt --known-only --out runs
 ONNX 目前仅实验性导出已有类别六张量，外部解码／NMS；不包含正常原型、校准阈值或未知区域处理。
 真实模型的 ONNX/TensorRT/INT8 全流程没有验证。当前实现以 PyTorch/OpenCV 为准。
 回归测试不下载权重；另做过官方源码随机 ViT-S 前后向接口检查，但没有官方权重／真实数据／1660 实测结果。
+
+
+## 8. Loss 下降但召回低／部分轮次零出框
+
+不要仅凭前几轮 loss 下降认定已收敛，也不能凭早期低召回断定预训练没有加载。
+检测适配器／分类／定位头从随机权重开始，且分类、objectness、定位误差是不同因素。
+当前分数是 `sigmoid(objectness) × max(sigmoid(class_logits))`。
+模型先通过 `model.score_thresh` 和 `inference.final_score_thresh` 过滤后才进入指标计算；
+因此仅传 `--val-conf 0.01` 无法找回被 0.15 最终过滤的候选。
+
+使用已保存的 `best.pt` 运行独立诊断，不需要未知阈值校准：
+
+```bat
+python tools/evaluate.py --data configs/fabric19.yaml --ckpt runs/dinov2s/best.pt --known-only --candidate-conf 0.001 --val-conf 0.15 --score-stats --diag --batch 1 --workers 0
+```
+
+- `--candidate-conf`：只在本次评估中同时覆盖两层候选过滤，不写配置／checkpoint。
+- `--val-conf`：仍为主要 P/R 的报告阈值；不指定时保留覆盖之前的配置值。
+- `--score-stats`：按 val／normalval 分开报告**过滤前**的类别、objectness、联合分数的每图最大值分位数，
+  以及多个阈值下 top-k 前的原始网格候选数。两个分量的各自最大值不一定来自同一个网格，不能直接相乘。
+- 额外统计会同步／传输少量数据，不应用来测 FPS。
+
+判断路径：
+
+1. 若低阈值下出现 TP、`best_f1` 的阈值低于 0.15，说明置信过滤是因素之一，
+   但是否改部署阈值仍要看独立验证的误报／召回权衡。
+2. 若原始分数足够高、降低过滤仍没有 TP，先看 `FP breakdown`（错类、定位、背景、重复），
+   再检查标签、缩放后的框、类别顺序和目标尺度；不能把全部问题归因于阈值。
+3. 若各类诊断仍差，用 8–16 张真实已标注图＋少量正常图单独建立过拟合诊断集，关闭增广，
+   训练／验证用相同图片仅排查实现与数据一致性；这不是泛化评测，不能拿其指标作最终结果。
+4. 224 的 ViT 缩图可能损失细小纹理，但仅从汇总日志无法确定。增大输入需要独立速度／召回对比，
+   不建议在 30 FPS 约束下直接换大模型或盲目增大分辨率。
+
+`--candidate-conf` 会影响 mAP、PR 曲线和出框 FPR；诊断得到的提升不是训练收敛提升，
+也不能与原过滤设置的 mAP 当作同一实验直接比较。
+训练阶段未知模块尚未校准，`normal_fpr` 是当前已知检测路径的出框率；
+`unknown_active=False` 明确表示没有评估最终未知疵点能力。零误报也可能只是几乎不出框。

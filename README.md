@@ -86,6 +86,18 @@ python tools/bench_device.py --ckpt runs/dinov2s/calibrated.pt --source D:/fabri
 必须是真实 1660、真实帧、开启已校准未知分支；CPU／合成输入不能通过。
 这仍只是速度验收，必须另外确认已有类别召回、未知定位召回和正常误报率。
 
+## 低召回／零出框诊断
+
+若 loss 下降但 P/R 很差，先检查过滤前分数，避免直接改学习率或把低出框当成低误报优势：
+
+```bat
+python tools/evaluate.py --data configs/fabric19.yaml --ckpt runs/dinov2s/best.pt --known-only --candidate-conf 0.001 --val-conf 0.15 --score-stats --diag --batch 1 --workers 0
+```
+
+此命令只改变当次评估的候选过滤，主要 P/R 仍按 0.15 报告，不改变训练／部署配置。
+它能区分过滤因素与错类／定位问题，不能单凭低阈值 mAP 提升声称模型更好。
+详细判断见训练手册第 8 节。
+
 ## 恢复、文档与测试
 
 `--resume runs/dinov2s/last.pt` 恢复完整训练状态；`--pretrained` 是完整检测权重的显式 warm start。

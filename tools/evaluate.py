@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 
 import numpy as np
 import torch
@@ -14,6 +15,71 @@ from jingwei.image_io import ascii_safe, console_safe
 from jingwei.utils import box_iou, count_parameters
 
 PR_THRESHOLDS = (0.05, 0.10, 0.15, 0.25, 0.40)
+
+
+class RawScoreStats:
+    """Opt-in head hook: scores BEFORE top-k, thresholds, decoding and NMS.
+
+    Evaluation only; no extra ViT pass and no changes to head tensors. Host
+    transfers intentionally add diagnostic overhead, so never use for FPS.
+    """
+    thresholds = (.001, .005, .05, .15)
+
+    def __init__(self, head):
+        self.head = head
+        self.split = "val"
+        self.rows = {"val": [], "normalval": []}
+        self.handle = None
+
+    def __enter__(self):
+        self.handle = self.head.register_forward_hook(self._capture)
+        return self
+
+    def __exit__(self, *exc):
+        if self.handle is not None:
+            self.handle.remove()
+            self.handle = None
+
+    @torch.no_grad()
+    def _capture(self, module, inputs, predictions):
+        cls, obj = [], []
+        for p in predictions:
+            cls.append(p["cls"].detach().float().sigmoid().amax(1).flatten(1))
+            obj.append(p["obj_o2o"].detach().float().sigmoid().flatten(1))
+        cls, obj = torch.cat(cls, 1), torch.cat(obj, 1)
+        score = cls * obj
+        values = [cls.amax(1), obj.amax(1), score.amax(1)]
+        values += [(score >= threshold).sum(1) for threshold in self.thresholds]
+        self.rows[self.split].extend(torch.stack(values, 1).cpu().tolist())
+
+    def summary(self):
+        out = {}
+        for split, rows in self.rows.items():
+            if not rows:
+                continue
+            values = np.asarray(rows)
+            report = {"images": len(rows)}
+            for i, key in enumerate(("max_cls_prob", "max_obj_prob", "max_joint_score")):
+                report[key] = dict(zip(("min", "p50", "p95", "max"),
+                                      map(float, np.percentile(values[:, i], (0, 50, 95, 100)))))
+            report["raw_cells_before_topk"] = {
+                str(threshold): {"cells": int(values[:, i + 3].sum()),
+                                 "images_with_candidates": int((values[:, i + 3] > 0).sum())}
+                for i, threshold in enumerate(self.thresholds)}
+            out[split] = report
+        return out
+
+
+def set_candidate_conf(model, threshold):
+    """Evaluation-only override of both prefilters.
+
+    Callers must preserve/pass the reporting cutoff explicitly; the CLI does
+    this before changing cfg so --val-conf is independent of the override.
+    """
+    if not 0 <= float(threshold) <= 1:
+        raise ValueError("candidate confidence must be between 0 and 1")
+    model.head.score_thresh = float(threshold)
+    model.cfg.inference.final_score_thresh = float(threshold)
 
 
 def average_precision(recall, precision):
@@ -190,18 +256,22 @@ def normal_fpr(model, loader, device):
 @torch.no_grad()
 def validate_detector(model, val_loader, norm_loader, device, cfg,
                       conf_thresh=None, iou_thr=0.5,
-                      pr_thresholds=PR_THRESHOLDS):
+                      pr_thresholds=PR_THRESHOLDS, score_stats=None):
     """One validation pass returning all acceptance metrics as a plain dict."""
     conf = float(conf_thresh if conf_thresh is not None
                  else cfg.inference.final_score_thresh)
     h, w = (int(v) for v in cfg.input_size[:2])
     large_area = float(cfg.inference.large_area_ratio) * h * w
+    if score_stats is not None:
+        score_stats.split = "val"
     map50, aps, pr = evaluate_map(model, val_loader, device, int(cfg.data.nc),
                                   iou_thr=iou_thr, conf_thresh=conf,
                                   large_min_area=large_area,
                                   pr_thresholds=pr_thresholds)
     rec = pr.pop("large_recall", 0.0)
     if norm_loader is not None:
+        if score_stats is not None:
+            score_stats.split = "normalval"
         fpr, nfp, nn, known_fp, unknown_fp = normal_fpr(model, norm_loader, device)
     else:
         fpr, nfp, nn, known_fp, unknown_fp = float("nan"), 0, 0, 0, 0
@@ -221,6 +291,8 @@ def validate_detector(model, val_loader, norm_loader, device, cfg,
         "iou_thr": float(iou_thr),
     }
     out.update(pr)
+    if score_stats is not None:
+        out["raw_score_stats"] = score_stats.summary()
     return out
 
 
@@ -268,14 +340,25 @@ def main():
     ap.add_argument("--subset-seed", type=int, default=0)
     ap.add_argument("--known-only", action="store_true")
     ap.add_argument("--half", action="store_true", help="CUDA FP16, must match calibration")
+    ap.add_argument("--candidate-conf", type=float, default=None,
+                    help="diagnostic override of BOTH model score filters for this evaluation only; "
+                         "does not change the --val-conf P/R cutoff")
+    ap.add_argument("--score-stats", action="store_true",
+                    help="report raw class/objectness/product scores before filtering (not for FPS)")
     ap.add_argument("--diag", action="store_true")
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--val-conf", type=float, default=None)
     ap.add_argument("--val-iou", type=float, default=0.5)
     args = ap.parse_args()
+    if args.candidate_conf is not None and not 0 <= args.candidate_conf <= 1:
+        ap.error("--candidate-conf must be between 0 and 1")
     model, cfg = load_model(args.cfg, args.ckpt, args.device)
     configure_inference(model, args.known_only, args.half)
+    # Capture the original reporting cutoff BEFORE applying diagnostic filters.
+    report_conf = float(args.val_conf if args.val_conf is not None else cfg.inference.final_score_thresh)
+    if args.candidate_conf is not None:
+        set_candidate_conf(model, args.candidate_conf)
     paths = data_paths(cfg, args.data)
     size = int(cfg.input_size[0])
     kw = dict(num_workers=max(0, args.workers), collate_fn=collate, pin_memory=True)
@@ -290,11 +373,23 @@ def main():
     vl = loader("val", True, args.max_val, args.subset_seed)
     nl = (loader("normalval", False, args.normal_max, args.subset_seed + 1)
           if paths.get("normalval") else None)
-    m = validate_detector(model, vl, nl, args.device, cfg,
-                          conf_thresh=args.val_conf, iou_thr=args.val_iou)
+    def validate(stats=None):
+        return validate_detector(model, vl, nl, args.device, cfg,
+                                 conf_thresh=report_conf, iou_thr=args.val_iou, score_stats=stats)
+    if args.score_stats:
+        with RawScoreStats(model.head) as stats:
+            m = validate(stats)
+    else:
+        m = validate()
     print("\n================ DINOv2 detector evaluation ================")
     print(f"params    : {count_parameters(model) / 1e6:.2f} M")
     print(f"conf / IoU: {m['conf_thresh']:.3f} / {m['iou_thr']:.2f}")
+    print(f"candidate filters: head={model.head.score_thresh:g}, final={cfg.inference.final_score_thresh:g}")
+    if args.candidate_conf is not None:
+        print("Diagnostic candidate override: mAP/PR/FPR may change; do not treat this as a training improvement.")
+    if args.score_stats:
+        print("Raw scores BEFORE filters (class/objectness maxima need not occur at the same cell):")
+        print(json.dumps(m["raw_score_stats"], indent=2))
     print(f"mAP50     : {m['mAP50']:.4f}")
     print(f"precision : {m['precision']:.4f} (TP={m['tp']} FP={m['fp']})")
     print(f"recall    : {m['recall']:.4f} (FN={m['fn']} GT={m['n_gt']})")

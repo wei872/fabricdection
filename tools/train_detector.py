@@ -358,6 +358,7 @@ def main():
                 f"TP={val_metrics['tp']} FP={val_metrics['fp']} FN={val_metrics['fn']}  "
                 f"large_recall={val_metrics['large_recall']:.4f}  "
                 f"normal_fpr={val_metrics['normal_fpr']:.4f}  "
+                f"unknown_active={val_metrics['unknown_active']}  "
                 f"({val_metrics['seconds']:.1f}s)")
             metric = str(cfg.train.get("best_metric", "best_f1"))
             if metric not in ("mAP50", "precision", "f1", "best_f1"):
