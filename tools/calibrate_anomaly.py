@@ -67,8 +67,9 @@ def main():
     model.novelty.calibrated.fill_(True)
     model.novelty.precision_bits.fill_(16 if args.half else 32)
     # Inference/weight-only artifact: never confuse it with a full resume state.
-    save_checkpoint({"model": model.state_dict(), "calibration": {
+    save_checkpoint({"model": model.state_dict(), "architecture": model.architecture_signature, "calibration": {
         "normalcal": str(calibration_dir), "images": len(scores),
+        "source_checkpoint": str(args.ckpt), "source_epoch": getattr(model, "loaded_checkpoint_epoch", None),
         "target_unknown_image_fpr": args.target_fpr, "threshold": float(model.novelty.threshold),
         "precision": "fp16" if args.half else "fp32",
         "warning": "Exchangeability assumption only; not a guarantee under fabric/lighting domain shift"

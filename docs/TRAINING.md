@@ -323,3 +323,78 @@ python tools/train_detector.py --data configs/fabric19.yaml --pretrained runs/di
 **测试验证信息通路／梯度／迁移／导出一致性，不验证真实精确率。** 当前环境没有 CUDA，
 没有 GTX1660 实测；新增成本小不意味着完整已知＋未知链路已达到 30 FPS。
 验收仍必须包含原图处理、传输、模型、NMS、两个原型评分及未知区域后处理，不能只报 ViT 耗时。
+
+## 12. 1280 输入、受限语义金字塔：轻量高分辨率配置
+
+保留 `configs/jingwei_dinov2.yaml` 的 640 基线，不直接修改已有实验。新增
+`configs/jingwei_dinov2_1280lite.yaml`：
+
+| 路径 | 原 640 | 直接全网 1280 | 新 1280lite |
+|---|---:|---:|---:|
+| 数据／原图纹理输入 | 640² | 1280² | 1280² |
+| DINOv2-S 输入／次数 | 224²／1 | 224²／1 | 224²／1 |
+| PAN 对应输入尺寸 | 640² | 1280² | **640²** |
+| 细尺度检测网格 | 80² | 160² | **160²** |
+| 粗尺度检测网格 | 20² | 40² | **20²** |
+| 原图坐标中的预测步长 | 8,32 | 8,32 | **8,64** |
+| 非 ViT 卷积 MAC | 0.420 G | 1.580 G | **0.696 G** |
+
+这些 MAC 根据实际 CNN 层的执行形状统计，encoder 使用通道匹配的接口替身；
+**不包括** ViT 的线性层／注意力、插值、归一化、池化、CPU 后处理、未知评分或传输，
+不是完整模型 FLOPs、GPU 耗时或 FPS。新配置比直接全网 1280 减少约 **56% 非 ViT 卷积 MAC**，
+但比 640 基线的这一部分增加约 **66%**；不能声称升分辨率不增加成本。
+三个配置的未融合参数结构相同，官方 encoder 22,056,576 加非 encoder 529,407，合计约 22.586 M。
+这是计算／特征图预算优化，不是把官方 ViT 的参数量压小。
+
+### 实际信息通路，不只是放大语义特征
+
+原图细节 CNN 直接处理 1280 像素，得到 stride-8 的 160² 纹理图。
+低频池化到 80² 后先与 DINO P3 融合，交给保持小网格的 PAN；
+PAN 输出再上采样，并加回原图纹理图的高频残差，交给细尺度检测头。
+粗尺度头留在 20²，原图步长因此为 64。损失、Hungarian、解码、GT 网格覆盖诊断
+均使用同一配置步长，不把 stride-64 错当 32。Native 输入必须与配置尺寸一致。
+
+DINO 仍只看 224 的全局语义。这不是 YOLO26 全网 1280 的等价骨干，
+也不保证细小疵点／弱类别 AP 一定提高；需要用相同数据划分进行实验。
+未知的原图纹理评分网格也增到 160²，默认 32×65 原型的相似度约 53.2M MAC
+（原 640 时约 13.3M），内存／连通域处理都有额外成本。
+
+### 从效果已较好的 checkpoint 微调，不要重头训练
+
+```bat
+python tools/train_detector.py --cfg configs/jingwei_dinov2_1280lite.yaml --data configs/fabric19.yaml --pretrained runs/dinov2s/best.pt --epochs 30 --batch 2 --val-batch 1 --amp off --save-interval 5 --out runs/dinov2s_1280lite
+```
+
+显存不足时改 `--batch 1`，不要通过偷偷缩小输入来假称1280训练。
+不覆盖 640 的目录。不同几何不能 `--resume`；权重形状不变，可完整迁移已学习的 encoder／CNN／head。
+几何变化或缺少几何记录时，warm start 会清空正常原型和旧校准，在 normaltrain 重新学习正常分布。
+新配置训练的 `last.pt` 支持同配置完整续训。旧版默认 640 v2 的计算路径未改变，保留其 legacy 签名续训兼容；
+自行改过旧配置尺寸但没有保存几何记录的实验，应使用明确的 weight-only 新实验，而不是依赖 legacy 假设。
+
+所有新配置后续命令都必须显式传同一 `--cfg`：
+
+```bat
+python tools/evaluate.py --cfg configs/jingwei_dinov2_1280lite.yaml --data configs/fabric19.yaml --ckpt runs/dinov2s_1280lite/best.pt --known-only --candidate-conf 0.001 --val-conf 0.15 --score-stats --diag --batch 1 --workers 0
+python tools/calibrate_anomaly.py --cfg configs/jingwei_dinov2_1280lite.yaml --data configs/fabric19.yaml --ckpt runs/dinov2s_1280lite/best.pt --out runs/dinov2s_1280lite/calibrated.pt --target-fpr 0.01
+python tools/bench_device.py --cfg configs/jingwei_dinov2_1280lite.yaml --ckpt runs/dinov2s_1280lite/calibrated.pt --source D:/fabric_acceptance/ --device cuda --warmup 30 --iters 300 --target-fps 30 --require-target --out runs/dinov2s_1280lite/benchmark.json
+```
+
+校准前需填写独立 `normalcal`，目标 1% 至少99张；不得以 normalval 参与调参再当最终测试。
+几何记录错误、忘传配置、直接拿无几何记录的旧权重推理到 capped profile 会拒绝，避免默默错用解码尺度。
+校准产物也保存几何与来源 epoch；评估日志打印 checkpoint epoch／几何以方便固定实验对比。
+
+### 推理融合与部署
+
+`predict/evaluate/bench_device` 默认在 eval 模式折叠 Conv-BN 和 depthwise 模块末端的 pointwise-BN；
+DINO 的 LayerNorm／注意力不受影响。`--no-fuse` 用于未融合对照。融合仅在内存中生效，
+不改原 checkpoint；融合对象不能切回训练，续训必须重新加载未融合 checkpoint。
+未知 descriptor／DINO raw 距离不受这项 CNN 融合影响。实际速度仍以同硬件测量为准。
+
+六张量 ONNX 继续仅含已知检测。现在同时输出同名 `.json`，记录输入、实际步长、reg_scale、
+分数和阈值等后处理参数。**1280lite 的 `cls5/reg5/obj5` 实际步长是64，不能按名字硬编码32。**
+默认与 capped 路径均有本地假 encoder 的 ONNX Runtime 一致性测试，不代表官方 ViT 导出／TensorRT已验收。
+
+精度 A/B 应从固定同一份 checkpoint 开始，固定数据划分、seed、epoch预算、候选过滤和推理选项，
+分别微调640和1280lite；训练结束后在独立数据上检查弱类别 AP、定位误报、正常 FPR、未知召回。
+不要把此前75.72%的低候选过滤 mAP 与默认过滤值混作对比，也不能只比训练 loss。
+**没有真实1660／真实数据测试时，不保证新配置精度更高或完整链路 ≥30 FPS。**

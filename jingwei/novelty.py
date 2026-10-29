@@ -40,6 +40,18 @@ class NormalPrototypes(nn.Module):
         self.register_buffer("calibration_shape", torch.zeros(2, dtype=torch.long))
         self.register_buffer("precision_bits", torch.tensor(32, dtype=torch.uint8))
 
+    @torch.no_grad()
+    def reset(self):
+        """Discard resolution-dependent normal statistics before a new schedule."""
+        self.centers.zero_()
+        self.updates.zero_()
+        self.threshold.fill_(2.)
+        self.calibrated.fill_(False)
+        self.calibration_shape.zero_()
+        self.precision_bits.fill_(32)
+        if self.texture is not None:
+            self.texture.reset()
+
     def _apply(self, fn):
         # Keep cosine centers and calibrated thresholds in FP32 even when the
         # encoder/head use FP16. Preserve original values before Module.half().

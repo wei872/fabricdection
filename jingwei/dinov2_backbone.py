@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .config import pyramid_ratio
 from .detail import LocalDetail
 from .layers import ConvBNAct
 from .utils import torch_load
@@ -59,6 +60,8 @@ class DINOv2Backbone(nn.Module):
         self.out_channels = tuple(int(m[k] * m.width)
                                   for k in ("detail_ch", "p3_ch", "p4_ch", "p5_ch"))
         self.strides = (4, 8, 16, 32)
+        self.pyramid_ratio = pyramid_ratio(cfg)
+        self.native_size = int(cfg.input_size[0])
         self.local_detail = LocalDetail(self.out_channels[1]) if m.get("local_detail", True) else None
         self.adapters = nn.ModuleList(ConvBNAct(dim, c, 1) for c in self.out_channels)
         self.register_buffer("mean", torch.tensor([.485, .456, .406]).view(1, 3, 1, 1))
@@ -75,20 +78,34 @@ class DINOv2Backbone(nn.Module):
         h, w = x.shape[-2:]
         if h % 32 or w % 32:
             raise ValueError("Detector image dimensions must be multiples of 32")
+        if self.pyramid_ratio > 1 and (h != self.native_size or w != self.native_size):
+            raise ValueError("Capped profile expects its configured native input dimensions")
+        if h % (32 * self.pyramid_ratio) or w % (32 * self.pyramid_ratio):
+            raise ValueError("Native dimensions must be divisible by 32 * pyramid_ratio")
+        ph, pw = h // self.pyramid_ratio, w // self.pyramid_ratio
         z = F.interpolate(x, (self.encoder_size, self.encoder_size),
                           mode="bilinear", align_corners=False)
         z = (z - self.mean) / self.std
         # no_grad, NOT inference_mode: adapters need to save their input for backward.
         with torch.no_grad() if self.frozen else nullcontext():
             maps = self.encoder.get_intermediate_layers(z, n=self.layers, reshape=True)
-        output = {name: F.interpolate(adapter(feat), (h // stride, w // stride),
+        output = {name: F.interpolate(adapter(feat), (ph // stride, pw // stride),
                                       mode="bilinear", align_corners=False)
                   for i, (name, adapter, feat, stride) in enumerate(
                       zip(("d", "p3", "p4", "p5"), self.adapters, maps, self.strides))
                   if include_detail or i > 0}
         if self.local_detail is not None:
             # Real native pixels, not another interpolation of 16x16 ViT maps.
-            output["p3"] = output["p3"] + self.local_detail((x - self.mean) / self.std)
+            native = self.local_detail((x - self.mean) / self.std)
+            if self.pyramid_ratio > 1:
+                coarse = F.avg_pool2d(native, self.pyramid_ratio, self.pyramid_ratio)
+                # Low frequencies enter PAN as before; preserve native texture
+                # residuals for fusion AFTER PAN without enlarging PAN itself.
+                output["native_residual"] = native - F.interpolate(
+                    coarse, size=native.shape[-2:], mode="bilinear", align_corners=False)
+            else:
+                coarse = native
+            output["p3"] = output["p3"] + coarse
         if return_raw:
             output["raw"] = maps[1]  # intermediate texture features; same ViT pass
         return output

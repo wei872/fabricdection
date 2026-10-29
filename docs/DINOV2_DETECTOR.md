@@ -66,3 +66,17 @@ required again; the six-tensor ONNX artifact still excludes unknown processing.
 See TRAINING section 11 for migration, supervision changes and explicit limits.
 Interpolated DINO maps alone still cannot recover lost detail; these new routes
 supply additional original-pixel information, not a proof of recall or 1660 FPS.
+
+## 1280lite profile (optional; 640 default retained)
+
+Native input/detail CNN 1280; ViT224; PAN on a capped640-equivalent grid.
+Pool native detail for semantic PAN fusion, then restore its native high-frequency
+residual after PAN. The fine head is160² at stride8; the coarse head remains20²
+at stride64. Training, decoding, export metadata and geometry diagnostics all
+share these strides. No extra learned parameters or second ViT pass are added.
+Native unknown descriptors run on160² and require new normal statistics/calibration.
+
+CNN Conv-BN folding is eval-only and does not rewrite training checkpoints.
+The profile reduces CNN compute compared with naive full-pyramid1280, not with
+640, and does not reduce the official ViT parameter count. See TRAINING section12
+for measured Conv MAC scope, migration and the outstanding real GTX1660/quality acceptance.

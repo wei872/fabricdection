@@ -82,4 +82,23 @@ def load_config(path: str | Path) -> Cfg:
         raise ValueError("unknown.texture_detail must be a boolean")
     cfg = Cfg(raw)
     cfg["_config_path"] = str(path)
+    pyramid_ratio(cfg)
     return cfg
+
+
+def pyramid_ratio(cfg):
+    """Integer native-input to semantic-pyramid ratio (one means legacy)."""
+    native = int(cfg.input_size[0])
+    size = cfg.model.get("pyramid_size", None)
+    if size is None:
+        return 1
+    if (not isinstance(size, int) or isinstance(size, bool) or size <= 0 or
+            size % 32 or size > native or native % size):
+        raise ValueError("model.pyramid_size must divide input_size, be <= it, and be a positive multiple of 32")
+    if size < native and not cfg.model.get("local_detail", True):
+        raise ValueError("Capped semantic pyramids require model.local_detail=true for native details")
+    return native // size
+
+
+def detector_strides(cfg):
+    return (8, 32 * pyramid_ratio(cfg))

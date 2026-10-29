@@ -306,8 +306,16 @@ def resume_checkpoint(state_or_path, model, optimizer=None, scheduler=None,
                              f"Missing state: {missing or ['epoch/iter']}")
         if meta.get("backbone") != "dinov2":
             raise ValueError("--resume requires a direct DINOv2 detector checkpoint")
+        if hasattr(model, "architecture_compatible") and not model.architecture_compatible(meta.get("architecture")):
+            raise ValueError("--resume geometry differs from checkpoint; use --pretrained with a new --out")
 
     restore_detector_weights(model, state.get("model", state), allow_detail_upgrade=not full)
+    if not full and getattr(model, "novelty", None) is not None:
+        saved_arch = state.get("architecture") or meta.get("architecture")
+        if saved_arch != model.architecture_signature:
+            model.novelty.reset()
+            log("--pretrained: geometry/architecture changed or was unrecorded; reset normal prototypes "
+                "for normaltrain and independent recalibration")
     if full:
         optimizer.load_state_dict(state["optimizer"])
         for st in optimizer.state.values():
@@ -348,7 +356,18 @@ def load_model(cfg_path: str, ckpt: str | None = None, device="cpu",
         cfg.model.dino_pretrained = original
     if ckpt:
         state = load_checkpoint(ckpt)
+        saved_arch = state.get("architecture") or (state.get("train") or {}).get("architecture")
+        if model.backbone.pyramid_ratio > 1 and (not saved_arch or "detector_input" not in saved_arch):
+            raise ValueError("Capped high-resolution inference requires recorded checkpoint geometry. "
+                             "First train this profile with --pretrained and a new --out; "
+                             "do not silently evaluate legacy weights with different decoder strides.")
+        if saved_arch and "detector_input" in saved_arch and saved_arch != model.architecture_signature:
+            raise ValueError("Checkpoint geometry does not match --cfg (input/pyramid/strides/detail). "
+                             "Use the config that trained this checkpoint; for a new geometry use "
+                             "train_detector.py --pretrained with a new --out.")
         restore_detector_weights(model, state.get("model", state))
+        model.loaded_checkpoint_epoch = ((state.get("train") or {}).get("epoch") or
+                                         (state.get("calibration") or {}).get("source_epoch"))
     return model.to(device), cfg
 
 
@@ -375,7 +394,7 @@ class SyntheticFabricDataset(Dataset):
                     path=f"synthetic_{idx:05d}")
 
 
-def configure_inference(model, known_only=False, half=False):
+def configure_inference(model, known_only=False, half=False, fuse=True):
     """Fail loudly rather than benchmark/predict an uncalibrated unknown path."""
     model.eval()
     model.known_only = known_only
@@ -391,8 +410,10 @@ def configure_inference(model, known_only=False, half=False):
             raise ValueError("Input sizes differ from novelty calibration; recalibrate for this configuration")
         if int(novelty.precision_bits) != (16 if half else 32):
             raise ValueError("Inference precision differs from novelty calibration; recalibrate with matching --half")
+    if half and next(model.parameters()).device.type != "cuda":
+        raise ValueError("--half requires CUDA")
+    if fuse and hasattr(model, "fuse_for_inference"):
+        model.fuse_for_inference()
     if half:
-        if next(model.parameters()).device.type != "cuda":
-            raise ValueError("--half requires CUDA")
         model.half()
     return model

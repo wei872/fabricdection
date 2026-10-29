@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .config import detector_strides
 from .layers import DWConv
 from .utils import boxes_from_distances, classwise_nms
 
@@ -53,7 +54,7 @@ class DualScaleDetect(nn.Module):
         super().__init__()
         m = cfg.model
         self.nc = int(cfg.data.nc)
-        self.strides = (8, 32)
+        self.strides = detector_strides(cfg)
         self.top_k = int(m.top_k)
         self.score_thresh = float(m.score_thresh)
         self.reg_scale = float(m.reg_scale)

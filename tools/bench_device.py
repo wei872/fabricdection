@@ -65,11 +65,13 @@ def main():
     ap.add_argument("--target-fps", type=float, default=30.)
     ap.add_argument("--require-target", action="store_true", help="exit 2 unless full real-frame GTX1660 acceptance passes")
     ap.add_argument("--out", default="runs/benchmark.json")
+    ap.add_argument("--no-fuse", action="store_true",
+                    help="disable eval-only Conv-BN folding for an unfused baseline")
     args = ap.parse_args()
     if args.target_fps <= 0 or args.max_frames < 1:
         ap.error("target-fps and max-frames must be positive")
     model, cfg = load_model(args.cfg, args.ckpt, args.device)
-    configure_inference(model, args.known_only, args.half)
+    configure_inference(model, args.known_only, args.half, fuse=not args.no_fuse)
     frames = None
     if args.source:
         frames = []
@@ -82,6 +84,9 @@ def main():
     name = torch.cuda.get_device_name(args.device) if torch.device(args.device).type == "cuda" else "CPU"
     result = {"device": args.device, "hardware": name, "params": count_parameters(model),
               "encoder": model.backbone.name, "encoder_input": model.backbone.encoder_size,
+              "architecture": model.architecture_signature,
+              "fused_bn_layers": getattr(model, "fused_bn_count", 0),
+              "checkpoint_epoch": getattr(model, "loaded_checkpoint_epoch", None),
               "detector_input": list(cfg.input_size), "precision": "fp16" if args.half else "fp32",
               "scope": "real_frame_preprocess_h2d_model_postprocess_d2h" if frames else "synthetic_model_only",
               "unknown_enabled": model.novelty is not None and not args.known_only,

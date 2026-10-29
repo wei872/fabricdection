@@ -3,11 +3,13 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .config import Cfg, load_config
 from .dinov2_backbone import DINOv2Backbone
 from .head import DualScaleDetect
 from .losses import DetectionLoss
+from .layers import ConvBNAct, DWConv
 from .neck import DualScalePAN
 from .novelty import NormalPrototypes, texture_descriptor
 
@@ -37,7 +39,50 @@ class JingWei(nn.Module):
     @property
     def architecture_signature(self):
         return dict(local_detail=self.backbone.local_detail is not None,
-                    texture_detail=self.novelty is not None and self.novelty.texture is not None)
+                    texture_detail=self.novelty is not None and self.novelty.texture is not None,
+                    detector_input=int(self.img_size[0]),
+                    pyramid_size=int(self.img_size[0]) // self.backbone.pyramid_ratio,
+                    strides=list(self.head.strides))
+
+    def architecture_compatible(self, saved):
+        if saved == self.architecture_signature:
+            return True
+        # Old 640 v2 checkpoints predate explicit geometry metadata; their
+        # actual computation is unchanged. Never infer legacy high-res geometry.
+        legacy = {k: self.architecture_signature[k] for k in ("local_detail", "texture_detail")}
+        return (saved == legacy and self.img_size == (640, 640) and
+                self.backbone.pyramid_ratio == 1)
+
+    def _features(self, backbone):
+        feats = self.neck(backbone)
+        if "native_residual" in backbone:
+            residual = backbone["native_residual"]
+            feats["n3"] = F.interpolate(feats["n3"], size=residual.shape[-2:],
+                                         mode="bilinear", align_corners=False) + residual
+        return feats
+
+    def train(self, mode=True):
+        if mode and getattr(self, "_inference_fused", False):
+            raise RuntimeError("Fused model is inference-only; reload the unfused checkpoint for training")
+        return super().train(mode)
+
+    def fuse_for_inference(self):
+        """Fold Conv-BN / pointwise-BN in eval mode; no saved checkpoint rewrite."""
+        if self.training:
+            raise RuntimeError("Call eval() before inference fusion")
+        if getattr(self, "_inference_fused", False):
+            return self
+        from torch.nn.utils.fusion import fuse_conv_bn_eval
+        count = 0
+        for module in list(self.modules()):
+            if isinstance(module, (ConvBNAct, DWConv)) and isinstance(module.bn, nn.BatchNorm2d):
+                attribute = "conv" if isinstance(module, ConvBNAct) else "pw"
+                setattr(module, attribute, fuse_conv_bn_eval(getattr(module, attribute), module.bn))
+                module.bn = nn.Identity()
+                count += 1
+        self._inference_fused = True
+        self.fused_bn_count = count
+        return self
 
     def forward(self, x, targets=None, normal_mask=None):
         backbone = self.backbone(x, return_raw=self.novelty is not None and (self.training or not self.known_only), include_detail=False)
@@ -45,7 +90,7 @@ class JingWei(nn.Module):
             mask = normal_mask.to(x.device).bool()
             texture = texture_descriptor(x[mask]) if self.novelty.texture is not None else None
             self.novelty.update(backbone["raw"][mask], texture)
-        feats = self.neck(backbone)
+        feats = self._features(backbone)
         if self.training:
             preds = self.head(feats, training=True)
             out = {"preds": preds, "feats": feats}
@@ -72,7 +117,7 @@ class JingWei(nn.Module):
         """Six prediction tensors; thresholding and NMS run outside ONNX."""
         if self.training:
             raise RuntimeError("Call eval() before export_forward")
-        preds = self.head(self.neck(self.backbone(x, include_detail=False)), training=False)
+        preds = self.head(self._features(self.backbone(x, include_detail=False)), training=False)
         return tuple(p[key] for p in preds for key in ("cls", "reg", "obj_o2o"))
 
     @torch.no_grad()

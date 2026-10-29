@@ -229,9 +229,12 @@ class TestRuntime(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = local_config(root)
+            raw = yaml.safe_load(config.read_text())
+            raw["model"]["pyramid_size"] = 64  # native128 / semantic64 profile
+            config.write_text(yaml.safe_dump(raw), encoding="utf-8")
             model, cfg = load_model(str(config))
             checkpoint = root / "detector.pt"
-            save_checkpoint({"model": model.state_dict()}, checkpoint)
+            save_checkpoint({"model": model.state_dict(), "architecture": model.architecture_signature}, checkpoint)
             images, labels = root / "images/val", root / "labels/val"
             images.mkdir(parents=True)
             labels.mkdir(parents=True)
@@ -267,10 +270,13 @@ class TestRuntime(unittest.TestCase):
             self.assertRegex(text, r"normal FPR: [0-9.]+ \([01]/1\)")
             bench = root / "bench.json"
             run("bench_device", "--warmup", "0", "--iters", "1", "--out", str(bench))
-            self.assertGreater(json.loads(bench.read_text())["p50_ms"], 0.)
+            report = json.loads(bench.read_text())
+            self.assertGreater(report["p50_ms"], 0.)
+            self.assertEqual(report["architecture"]["strides"], [8, 64])
+            self.assertGreater(report["fused_bn_layers"], 0)
             # Strict loading prevents a partial/old backbone checkpoint from
             # silently becoming a random frozen feature extractor.
-            save_checkpoint({"model": {"unrelated": torch.ones(1)}}, checkpoint)
+            save_checkpoint({"model": {"unrelated": torch.ones(1)}, "architecture": model.architecture_signature}, checkpoint)
             with self.assertRaises(RuntimeError):
                 load_model(str(config), str(checkpoint))
 

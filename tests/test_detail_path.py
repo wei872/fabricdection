@@ -104,24 +104,27 @@ class TestNativeDetail(unittest.TestCase):
         import onnx
         import onnxruntime as ort
         from export import ExportWrapper
-        model = self.model(self.config()).eval()
-        image = torch.rand(1, 3, 128, 128)
-        wrapper = ExportWrapper(model)
-        with tempfile.TemporaryDirectory() as tmp:
-            output = Path(tmp) / 'known.onnx'
-            with torch.no_grad():
-                expected = wrapper(image)
-                torch.onnx.export(wrapper, image, str(output), opset_version=17,
-                                  input_names=['images'])
-            onnx.checker.check_model(onnx.load(str(output)))
-            options = ort.SessionOptions()
-            options.intra_op_num_threads = 2
-            options.inter_op_num_threads = 1
-            session = ort.InferenceSession(str(output), options, providers=['CPUExecutionProvider'])
-            actual = session.run(None, {'images': image.numpy()})
-            self.assertEqual(len(actual), 6)
-            for a, b in zip(actual, expected):
-                torch.testing.assert_close(torch.from_numpy(a), b, rtol=1e-4, atol=1e-5)
+        for cap in (None, 64):
+            cfg = self.config()
+            cfg.model.pyramid_size = cap
+            model = self.model(cfg).eval()
+            image = torch.rand(1, 3, 128, 128)
+            wrapper = ExportWrapper(model)
+            with tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / 'known.onnx'
+                with torch.no_grad():
+                    expected = wrapper(image)
+                    torch.onnx.export(wrapper, image, str(output), opset_version=17,
+                                      input_names=['images'])
+                onnx.checker.check_model(onnx.load(str(output)))
+                options = ort.SessionOptions()
+                options.intra_op_num_threads = 2
+                options.inter_op_num_threads = 1
+                session = ort.InferenceSession(str(output), options, providers=['CPUExecutionProvider'])
+                actual = session.run(None, {'images': image.numpy()})
+                self.assertEqual(len(actual), 6)
+                for a, b in zip(actual, expected):
+                    torch.testing.assert_close(torch.from_numpy(a), b, rtol=1e-4, atol=1e-5)
 
     def test_missing_native_features_are_not_silently_ignored(self):
         novelty = NormalPrototypes(12, k=2, texture_detail=True)

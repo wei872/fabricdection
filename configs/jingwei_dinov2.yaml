@@ -35,6 +35,8 @@ model:
   dino_pretrained: true
   dino_freeze: true
   dino_input_size: 224
+  # null preserves the full detector pyramid; see the separate 1280lite profile.
+  pyramid_size: null
   # Native 640-pixel texture route, fused into P3; no second ViT pass.
   local_detail: true
   dino_lr_mult: 0.1

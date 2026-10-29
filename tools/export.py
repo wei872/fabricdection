@@ -4,6 +4,7 @@ Decoding, thresholding and NMS are external. No TensorRT/INT8 support is claimed
 Actual DINOv2 ONNX operator compatibility must be verified in the target environment.
 """
 import argparse
+import json
 
 import torch
 from torch import nn
@@ -18,6 +19,18 @@ class ExportWrapper(nn.Module):
 
     def forward(self, x):
         return self.model.export_forward(x)
+
+
+def export_metadata(model, cfg):
+    return dict(input_shape=[1, 3, *cfg.input_size], architecture=model.architecture_signature,
+                prediction_strides=list(model.head.strides), reg_scale=model.head.reg_scale,
+                nc=model.head.nc, names=list(cfg.data.names),
+                score="sigmoid(obj_o2o) * max(sigmoid(cls))",
+                box_distances="reg * reg_scale * prediction_stride",
+                top_k=model.head.top_k, head_score_threshold=model.head.score_thresh,
+                final_score_threshold=float(cfg.inference.final_score_thresh),
+                nms_iou=model.head.nms_iou, known_only=True,
+                outputs=["cls3", "reg3", "obj3", "cls5", "reg5", "obj5"])
 
 
 def main():
@@ -46,7 +59,9 @@ def main():
                       dynamic_axes=None, do_constant_folding=True)
     if args.check:
         onnx.checker.check_model(onnx.load(str(path)))
-    print(f"exported -> {path}; six prediction tensors, NMS must run externally")
+    metadata_path = path.with_suffix(".json")
+    metadata_path.write_text(json.dumps(export_metadata(model, cfg), ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"exported -> {path}; decoder metadata -> {metadata_path}; NMS must run externally")
 
 
 if __name__ == "__main__":

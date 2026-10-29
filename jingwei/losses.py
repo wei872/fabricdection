@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .config import detector_strides
 from .utils import box_ciou, box_iou, boxes_from_distances, boxes_to_distances
 
 
@@ -265,7 +266,7 @@ class DetectionLoss(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.nc = int(cfg.data.nc)
-        self.strides = (8, 32)
+        self.strides = detector_strides(cfg)
         self.reg_scale = float(cfg.model.reg_scale)
         self.w = cfg.train.loss_weights
         cw = cfg.train.get("class_weights", None)

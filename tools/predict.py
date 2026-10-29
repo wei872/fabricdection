@@ -67,11 +67,13 @@ def main():
     ap.add_argument("--half", action="store_true", help="FP16 on CUDA only")
     ap.add_argument("--known-only", action="store_true", help="explicitly disable unknown alerts")
     ap.add_argument("--no-draw", action="store_true")
+    ap.add_argument("--no-fuse", action="store_true",
+                    help="disable eval-only Conv-BN folding for an unfused baseline")
     args = ap.parse_args()
     if args.half and not args.device.startswith("cuda"):
         ap.error("--half is supported on CUDA only")
     model, cfg = load_model(args.cfg, args.ckpt, args.device)
-    configure_inference(model, args.known_only, args.half)
+    configure_inference(model, args.known_only, args.half, fuse=not args.no_fuse)
     out = resolve(args.out)
     out.mkdir(parents=True, exist_ok=True)
     names = cfg.data.names

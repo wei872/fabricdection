@@ -144,7 +144,7 @@ def _pr_at_thresholds(records, n_gt, thresholds):
 
 @torch.no_grad()
 def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
-                 large_min_area=None, pr_thresholds=PR_THRESHOLDS, grid_size=None):
+                 large_min_area=None, pr_thresholds=PR_THRESHOLDS, grid_size=None, grid_strides=(8, 32)):
     """mAP50 + global precision/recall/F1 at ``conf_thresh``.
 
     When ``large_min_area`` is given, large-defect recall (a GT box counts as
@@ -165,7 +165,7 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
             gt_boxes = batch["boxes"][b].to(device)
             gt_labels = batch["labels"][b].to(device)
             if grid_size is not None:
-                covered_gt += int(grid_center_coverage(gt_boxes, grid_size).sum())
+                covered_gt += int(grid_center_coverage(gt_boxes, grid_size, grid_strides).sum())
             for c in range(nc):
                 n_gt[c] += int((gt_labels == c).sum())
             used = torch.zeros(len(gt_boxes), dtype=torch.bool, device=device)
@@ -277,7 +277,8 @@ def validate_detector(model, val_loader, norm_loader, device, cfg,
                                   iou_thr=iou_thr, conf_thresh=conf,
                                   large_min_area=large_area,
                                   pr_thresholds=pr_thresholds,
-                                  grid_size=(h, w) if score_stats is not None else None)
+                                  grid_size=(h, w) if score_stats is not None else None,
+                                  grid_strides=getattr(getattr(model, "head", None), "strides", (8, 32)))
     rec = pr.pop("large_recall", 0.0)
     if norm_loader is not None:
         if score_stats is not None:
@@ -360,11 +361,13 @@ def main():
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--val-conf", type=float, default=None)
     ap.add_argument("--val-iou", type=float, default=0.5)
+    ap.add_argument("--no-fuse", action="store_true",
+                    help="disable eval-only Conv-BN folding for an unfused baseline")
     args = ap.parse_args()
     if args.candidate_conf is not None and not 0 <= args.candidate_conf <= 1:
         ap.error("--candidate-conf must be between 0 and 1")
     model, cfg = load_model(args.cfg, args.ckpt, args.device)
-    configure_inference(model, args.known_only, args.half)
+    configure_inference(model, args.known_only, args.half, fuse=not args.no_fuse)
     # Capture the original reporting cutoff BEFORE applying diagnostic filters.
     report_conf = float(args.val_conf if args.val_conf is not None else cfg.inference.final_score_thresh)
     if args.candidate_conf is not None:
@@ -392,6 +395,8 @@ def main():
     else:
         m = validate()
     print("\n================ DINOv2 detector evaluation ================")
+    print(console_safe(f"checkpoint: {args.ckpt}  epoch={getattr(model, 'loaded_checkpoint_epoch', None)}"))
+    print(f"geometry  : {model.architecture_signature}  fused_bn={getattr(model, 'fused_bn_count', 0)}")
     print(f"params    : {count_parameters(model) / 1e6:.2f} M")
     print(f"conf / IoU: {m['conf_thresh']:.3f} / {m['iou_thr']:.2f}")
     print(f"candidate filters: head={model.head.score_thresh:g}, final={cfg.inference.final_score_thresh:g}")

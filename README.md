@@ -130,3 +130,19 @@ ONNX 目前只实验性导出已有类别的六张量；未知模块仍为 PyTor
 部署 objectness 的 IoU 目标一并修正。旧检测权重用 `--pretrained` 迁移到**新目录**，不能旧目标 full resume；
 新支路需训练，未知检测必须重新校准。迁移命令、严格兼容规则和限制见训练手册第 11 节。
 这提供了真实高分辨率信息，不保证所有小目标召回／跨布泛化，也未通过真实 GTX1660 的 30 FPS 验收。
+
+### 1280 分辨率、轻量金字塔配置
+
+新增 `configs/jingwei_dinov2_1280lite.yaml`：原图／纹理支路1280，细尺度160×160，
+DINO仍为224一次前向，PAN保持640网格，粗尺度20×20；实际预测步长为8、64。
+参数量不增加，相比直接全网1280减少约56%的**非ViT卷积MAC**，不是56%的整机加速保证。
+默认640配置保留。
+
+```bat
+python tools/train_detector.py --cfg configs/jingwei_dinov2_1280lite.yaml --data configs/fabric19.yaml --pretrained runs/dinov2s/best.pt --epochs 30 --batch 2 --val-batch 1 --amp off --save-interval 5 --out runs/dinov2s_1280lite
+```
+
+几何变化使用 `--pretrained` 新目录，不直接旧 `--resume`；正常原型重建、未知重新独立校准。
+评估／预测／校准／基准均须传同一 `--cfg`。推理默认仅在内存中做Conv-BN融合，可用 `--no-fuse` 对照；
+ONNX后处理读取导出的JSON实际步长，不硬编码8/32。完整方法、A/B与1660验收见训练手册第12节。
+这为细小疵点提供更多有效像素，不保证真实精度提升或30FPS已达标。

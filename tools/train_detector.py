@@ -213,7 +213,7 @@ def main():
         saved_train = resume_state.get("train") or {}
         if (saved_train.get("assignment_version") != model.det_loss.assignment_version or
                 saved_train.get("objective_version") != model.det_loss.objective_version or
-                saved_train.get("architecture") != model.architecture_signature):
+                not model.architecture_compatible(saved_train.get("architecture"))):
             raise ValueError("Checkpoint uses an older/different training objective. Use --pretrained CHECKPOINT "
                              "with a new --out directory for balanced classification and IoU objectness; "
                              "old weights remain compatible but optimizer state is not reused silently.")
@@ -250,6 +250,8 @@ def main():
     log(f"start_epoch={start_epoch + 1}/{epochs}  global_iter={it}  "
         f"save_interval={args.save_interval}  log_interval={args.log_interval}")
     log(f"detail_architecture={model.architecture_signature}")
+    log(f"native_input={size} semantic_pyramid={size // model.backbone.pyramid_ratio} "
+        f"prediction_strides={model.head.strides} (PAN stays on semantic grid)")
     log(f"objective={model.det_loss.objective_version}  cls_min_neg={model.det_loss.cls_min_neg}  "
         f"cls_neg_ratio={model.det_loss.cls_neg_ratio:g}  o2o_quality_floor={model.det_loss.o2o_quality_floor:g}")
     log(f"best_metric={cfg.train.get('best_metric', 'best_f1')}  "
