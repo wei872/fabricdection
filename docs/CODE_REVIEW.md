@@ -486,11 +486,21 @@ bias 高只会让**第 0 步就淹没在 0.5 的背景里**，而这正是用户
 
 代价（1280²，pico）：**8.086 → 8.257 G MACs（+2.1%）**，参数 2.928 → 2.979 M，仍低于 9 G 预算。
 
-### 兼容性：旧 checkpoint 不能 `--resume`
+### 兼容性：旧 checkpoint 怎么用
 
-`obj_pred` / `obj_o2o` 的输入通道从 `c`（neck）改成 `h`（reg stem），并新增 `obj_stem`，
-旧 `.pt` 会 `size mismatch`。**必须重训 stage A**（可以从 `runs/dino/dino_init.pt` 起——
-那里没有检测头）。若想 A/B，`model.obj_head_from: neck` 可回退到旧结构（但那样门就是关的）。
+`obj_pred` / `obj_o2o` 的输入通道从 `c`（neck）改成 `h`（reg stem），并新增 `obj_stem`
+（2 个尺度 × 2 个头 = **4 个张量**换了形状，另有 28 个 `obj_stem.*` 是新张量）。
+
+* `load_state_dict(strict=False)` **只容忍缺失/多余 key，不容忍形状变化**，所以
+  `--resume runs/dino/dino_init.pt` 一开始会直接 `RuntimeError: size mismatch ...` 退出。
+  已修（`tools/_common.py::split_shape_mismatch`）：形状不符的张量被**跳过并逐条打印**
+  （`[!] dino_init: 4 tensor(s) skipped because their shape changed ...`），
+  主干 / neck / cls / reg / 质量分支的权重照常加载 → **weight-only warm start 可用**。
+* **完整 checkpoint（`last.pt`，带 optimizer）不能跨架构续训**：AdamW 的 state 是按参数
+  *位置*索引的，多了一个 `obj_stem` 就会 `param group size mismatch`（或者更糟：静默错位）。
+  现在检测到形状变化 / param group 不匹配时会把 optimizer + scheduler 状态一起丢掉，降级成
+  weight-only warm start 并明确告知（epoch 计数与 LR schedule 从 0 重新开始）。
+* 想严格复现旧结构做 A/B：`model.obj_head_from: neck`（但那样门就是关的，见原因 1）。
 
 ### 重训后应该看到的
 
@@ -510,7 +520,9 @@ bias 高只会让**第 0 步就淹没在 0.5 的背景里**，而这正是用户
 `test_58`（`neg_weight` 真的能压低背景项）、`test_59`（objectness 读 reg stem；`neck` 可回退）、
 `test_60`（`score_p99`/`obj_mean` 语义：平坦场 p99 = score_max）、
 `test_61`（用**发布的 config** 端到端：120 步内门必须开，且两个阈值必须相等）、
-`test_62`（`_best_f1` 返回最优点 P/R；`normal_fpr` 返回 boxes/img 与 max_score）。
+`test_62`（`_best_f1` 返回最优点 P/R；`normal_fpr` 返回 boxes/img 与 max_score）、
+`test_63`（旧布局 checkpoint 的 warm start：4 个形状不符的张量被跳过并报告，
+完整 checkpoint 则自动降级为 weight-only，不崩）。
 
 ---
 
@@ -850,7 +862,7 @@ tests/test_model.py    +5 项回归（58–62）
 ## 4. 复现命令
 
 ```bash
-# 全量测试（本机 61 项；装 requirements-dev.txt 后 onnx 用例不再 skip）
+# 全量测试（本机 62 项；装 requirements-dev.txt 后 onnx 用例不再 skip）
 python -m unittest discover -s tests -v
 
 # P0-1：融合门控是否破坏 0.5 标定点

@@ -25,7 +25,7 @@
 
 **已验证**（见 §13）：参考实现在 1280×1280 下 n 变体 **6.36 M 参数 / 16.62 G MACs**，
 无 Tensor Core 卡专用的 pico 变体 **2.93 M / 8.09 G MACs**，
-56 项单元测试全过（含中文 / Unicode 路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态局部+全局注意力前景 / 每 epoch 验证指标 / 未知缺陷框回归），ONNX 导出成功且输出全为静态形状。
+62 项单元测试全过（含中文 / Unicode 路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态局部+全局注意力前景 / 每 epoch 验证指标 / 未知缺陷框回归），ONNX 导出成功且输出全为静态形状。
 
 > ⚠️ **诚实声明**：仓库里目前只有 `dataset/dataset.yaml`（路径指向你本机的
 > `D:/tyhn/yolo/...`），**没有真实图片**。因此本文所有的精度数字都是**设计目标 / 验收指标**，
@@ -759,7 +759,7 @@ tools/           阶段 0 + A–E 的 CLI（pretrain_dino / train /
                  bench_device）
 tools/_common.py 共享数据/模型加载 + log()/format_eta() 进度日志 +
                  save_checkpoint()/resume_checkpoint()/RNG 断点续训工具
-tests/test_model.py  56 项单元测试（含验证指标 / 未知缺陷框）
+tests/test_model.py  62 项单元测试（含验证指标 / 未知缺陷框）
 docs/DESIGN.md   本文
 docs/TRAINING.md 训练与数据准备手册
 docs/DEPLOYMENT.md 实时部署手册
@@ -935,7 +935,7 @@ python tools/train_normality.py --cfg configs/jingwei_p.yaml \
 执行 `python -m unittest discover -s tests -v`（CPU 即可，无需数据/GPU）：
 
 ```
-Ran 56 tests in ~130 s — OK
+Ran 62 tests in ~130 s — OK
 
   params = 6.36 M        MACs @1280 = 16.62 G   (jingwei_n)
   pico   = 2.93 M        MACs @1280 =  8.09 G   (jingwei_p)

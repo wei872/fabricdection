@@ -270,13 +270,32 @@ def resume_checkpoint(state_or_path, stage: str, model, optimizer=None,
                 meta.get("stage") == stage)
 
     sd = state.get("model", state)
+    _, reshaped = split_shape_mismatch(model, sd)
     load_state_dict_report(model, sd, tag=str(stage))
     if extra_modules:
         for key, module in extra_modules.items():
             if key in state:
                 load_state_dict_report(module, state[key], tag=f"{stage}/{key}")
 
-    if full:
+    # A checkpoint whose parameter *shapes* changed cannot carry its optimizer
+    # state either: ``AdamW.load_state_dict`` is indexed by parameter position,
+    # so an added module (v0.2.2's ``obj_stem``) makes it raise
+    # "loaded state dict contains a parameter group that doesn't match the size
+    # of the optimizer's group" -- or, worse, silently mis-assign momentum.
+    # Downgrade such a checkpoint to a weight-only warm start instead of dying
+    # 4 seconds into a 150-epoch run.
+    if full and (reshaped or not optimizer_state_compatible(optimizer,
+                                                            state["optimizer"])):
+        full = False
+        if reshaped:
+            log(f"[!] {len(reshaped)} tensor(s) changed shape vs. this model, so "
+                "the optimizer / scheduler state is NOT restored "
+                "(weight-only warm start; the epoch counter and LR schedule "
+                "restart at 0).")
+        else:
+            log("[!] the checkpoint's optimizer state does not match this "
+                "model's parameter groups -> weight-only warm start.")
+    elif full:
         optimizer.load_state_dict(state["optimizer"])
         for st in optimizer.state.values():
             if isinstance(st, dict):
@@ -305,14 +324,51 @@ def resume_checkpoint(state_or_path, stage: str, model, optimizer=None,
     }
 
 
+def split_shape_mismatch(model, sd) -> tuple[dict, list]:
+    """Split ``sd`` into (loadable tensors, tensors whose *shape* changed).
+
+    ``load_state_dict(strict=False)`` still raises ``RuntimeError`` on a shape
+    mismatch -- it only tolerates missing / unexpected *keys*.  That made
+    ``--resume runs/dino/dino_init.pt`` crash outright in v0.2.2, where the
+    objectness heads moved from the neck (``c`` channels) to the regression
+    stem (``h = c*head_width``): the backbone/nest weights are still perfectly
+    reusable, only 4 tensors are not.
+    """
+    own = model.state_dict()
+    keep, reshaped = {}, []
+    for key, value in sd.items():
+        target = own.get(key)
+        if (target is not None and torch.is_tensor(value)
+                and tuple(value.shape) != tuple(target.shape)):
+            reshaped.append((key, tuple(value.shape), tuple(target.shape)))
+        else:
+            keep[key] = value
+    return keep, reshaped
+
+
+def optimizer_state_compatible(optimizer, opt_state) -> bool:
+    """Do the checkpoint's param groups have the same layout as ``optimizer``?"""
+    if optimizer is None or not isinstance(opt_state, dict):
+        return False
+    groups = opt_state.get("param_groups") or []
+    if len(groups) != len(optimizer.param_groups):
+        return False
+    return all(len(g.get("params", ())) == len(og["params"])
+               for g, og in zip(groups, optimizer.param_groups))
+
+
 def load_state_dict_report(model, sd, tag: str = "checkpoint") -> list[str]:
     """``load_state_dict(strict=False)`` + a loud report of what did not match.
 
     Silently ignoring missing / unexpected keys is how a run that "loaded fine"
     ends up with randomly initialised layers (e.g. ``--ckpt`` from a different
-    width, or a detector checkpoint used for the pico config).  Returns the
-    collected warning lines so callers can also surface them in a JSON report.
+    width, or a detector checkpoint used for the pico config).  Shape-mismatched
+    tensors are *skipped* (they keep the model's own init) rather than raising,
+    because partial warm starts are the normal case across architecture
+    changes.  Returns the collected warning lines so callers can also surface
+    them in a JSON report.
     """
+    sd, reshaped = split_shape_mismatch(model, sd)
     result = model.load_state_dict(sd, strict=False)
     missing = list(getattr(result, "missing_keys", []) or [])
     unexpected = list(getattr(result, "unexpected_keys", []) or [])
@@ -323,6 +379,12 @@ def load_state_dict_report(model, sd, tag: str = "checkpoint") -> list[str]:
     if unexpected:
         msgs.append(f"[!] {tag}: {len(unexpected)} unexpected tensor(s) "
                     f"(ignored), e.g. {unexpected[:3]}")
+    if reshaped:
+        detail = ", ".join(f"{k} {list(a)}->{list(b)}" for k, a, b in reshaped[:3])
+        msgs.append(
+            f"[!] {tag}: {len(reshaped)} tensor(s) skipped because their shape "
+            f"changed in this model version (they keep their own init): {detail}"
+            + ("" if len(reshaped) <= 3 else f" ... (+{len(reshaped) - 3} more)"))
     for m in msgs:
         log(m)
     return msgs

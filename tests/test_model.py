@@ -10,7 +10,7 @@ invariance, memory-bank algebra, the dataset readers, Chinese / Unicode
 file paths, non-square fabric augmentation, training progress logs,
 full checkpoint resume, numpy RNG state checkpointing, dynamic
 local+global attention foreground context, validation metrics, and
-unknown-defect boxes / objectness gate cold start (61 tests).
+unknown-defect boxes / objectness gate cold start / warm start (62 tests).
 """
 from __future__ import annotations
 
@@ -1745,6 +1745,71 @@ class TestModel(unittest.TestCase):
         self.assertAlmostEqual(smax, 0.31, places=6)
         self.assertEqual((nfp, n), (1, 2))
         self.assertTrue(np.isfinite(bpi))
+
+    def test_63_warm_start_survives_a_changed_head_shape(self):
+        """`--resume runs/dino/dino_init.pt` must not crash after v0.2.2.
+
+        v0.2.2 moved the objectness heads from the neck (``c`` channels) to the
+        regression stem (``h = c*head_width``).  ``load_state_dict(strict=False)``
+        only tolerates missing / unexpected *keys*, so it still raised
+        ``RuntimeError: size mismatch for head.heads.0.obj_pred.weight ...``
+        before a single batch ran.  Only those tensors are incompatible: the
+        backbone/neck/other head weights are perfectly reusable, so the loader
+        now skips them, says so, and downgrades a full checkpoint to a
+        weight-only warm start (the optimizer state is indexed by parameter
+        position and cannot be carried over either).
+        """
+        from _common import (load_state_dict_report, optimizer_state_compatible,
+                             resume_checkpoint, split_shape_mismatch)
+        from jingwei.model import build_model
+
+        cfg = load_config(CFG_P)
+        old_cfg = cfg.copy()
+        old_cfg.model.obj_head_from = "neck"          # the pre-v0.2.2 layout
+        old_cfg.model.obj_bias_init = -4.0
+        torch.manual_seed(0)
+        old = build_model(old_cfg)
+        torch.manual_seed(0)
+        new = build_model(cfg)
+
+        old_sd = old.state_dict()
+        self.assertEqual(tuple(old_sd["head.heads.0.obj_o2o.weight"].shape), (1, 72, 1, 1))
+        self.assertEqual(tuple(old_sd["head.heads.1.obj_o2o.weight"].shape), (1, 288, 1, 1))
+
+        keep, reshaped = split_shape_mismatch(new, old_sd)
+        self.assertEqual(len(reshaped), 4, "2 scales x (obj_pred, obj_o2o)")
+        self.assertEqual(len(keep), len(old_sd) - 4)
+        # the biases (shape (1,)) are compatible and must survive
+        self.assertIn("head.heads.0.obj_pred.bias", keep)
+
+        msgs = load_state_dict_report(new, old_sd, tag="dino_init")
+        self.assertTrue(any("shape changed" in m for m in msgs),
+                        "a shape mismatch must be reported, not swallowed")
+        # ... and the rest of the weights really were loaded into ``new``.
+        loaded = new.state_dict()
+        for key in ("head.heads.0.cls_pred.weight", "head.heads.1.reg_pred.weight",
+                    "head.heads.0.obj_o2o.bias"):
+            self.assertTrue(torch.equal(old_sd[key], loaded[key]), key)
+        self.assertIn("head.heads.0.obj_stem.0.dw.weight", loaded,
+                      "the new objectness stem exists and keeps its own init")
+
+        # A *full* checkpoint of the old layout: weights load, optimizer state
+        # must be dropped instead of raising or silently mis-assigning momentum.
+        opt_old = torch.optim.AdamW(old.parameters(), lr=1e-3)
+        state = dict(model=old_sd, optimizer=opt_old.state_dict(), train=dict(stage="detector"))
+        opt_new = torch.optim.AdamW(new.parameters(), lr=1e-3)
+        self.assertFalse(optimizer_state_compatible(opt_new, opt_old.state_dict()))
+        info = resume_checkpoint(state, "detector", new, opt_new, None)
+        self.assertFalse(info["full"])
+        self.assertEqual(info["epoch"], 0)
+
+        # Same architecture: the optimizer state is still restored (full resume).
+        opt_same = torch.optim.AdamW(old.parameters(), lr=1e-3)
+        opt_same.zero_grad()
+        info2 = resume_checkpoint(dict(model=old_sd, optimizer=opt_same.state_dict(),
+                                       train=dict(stage="detector")),
+                                  "detector", old, torch.optim.AdamW(old.parameters(), lr=1e-3), None)
+        self.assertTrue(info2["full"])
 
 
 if __name__ == "__main__":
