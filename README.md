@@ -59,7 +59,7 @@ python tools/benchmark.py --both            # 参数量 / MACs / 延迟估算
 # 多 worker 读图 + uint8 增强（大数据集请务必保留 --num-workers > 0）
 python tools/pretrain_dino.py     --cfg configs/jingwei_n.yaml --num-workers 4 --teacher dinov2_vits14 --log-interval 100
 # 每 epoch 输出 val 精确率/召回率/mAP50/大缺陷召回，并保存 best.pt
-python tools/train_detector.py    --cfg configs/jingwei_n.yaml --resume runs/dino/dino_init.pt --num-workers 4 --amp bf16 --log-interval 20 --val-interval 1
+python tools/train_detector.py    --cfg configs/jingwei_n.yaml --pretrained runs/dino/dino_init.pt --num-workers 4 --amp bf16 --log-interval 20 --val-interval 1
 python tools/train_normality.py   --cfg configs/jingwei_n.yaml --num-workers 4 --ckpt runs/detector/best.pt --log-interval 100
 python tools/build_memory_bank.py --cfg configs/jingwei_n.yaml --ckpt runs/normality/normality.pt
 python tools/calibrate_fusion.py  --cfg configs/jingwei_n.yaml --ckpt runs/bank/memory_bank.pt

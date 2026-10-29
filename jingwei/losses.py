@@ -229,10 +229,14 @@ class DetectionLoss(nn.Module):
                                                          reduction="none")
             losses["obj_o2m"] = losses["obj_o2m"] + (bce_obj * (1.0 + 3.0 * pos.float())).mean()
 
-            pm = pos.expand(B, 4, HW)
-            pred_d = (p["reg"].float() * self.reg_scale * stride).reshape(B, 4, HW)[pm].reshape(-1, 4)
-            tgt_d = t_reg[pm].reshape(-1, 4)
-            p_sel = pts[None].expand(B, HW, 2)[pos.squeeze(1)].reshape(-1, 2)
+            # Select cells in (batch, cell, coordinate) order, matching p_sel.
+            # Masking (B, 4, HW) first flattens channel-major: reshape(-1, 4)
+            # would mix l/t/r/b values from DIFFERENT cells whenever >1 is positive.
+            cell_pos = pos.squeeze(1)
+            pred_d = (p["reg"].float() * self.reg_scale * stride).reshape(
+                B, 4, HW).transpose(1, 2)[cell_pos]
+            tgt_d = t_reg.transpose(1, 2)[cell_pos]
+            p_sel = pts[None].expand(B, HW, 2)[cell_pos]
             if pred_d.numel():
                 pb = boxes_from_distances(p_sel, pred_d)
                 gb = boxes_from_distances(p_sel, tgt_d)

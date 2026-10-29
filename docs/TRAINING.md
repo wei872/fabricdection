@@ -289,3 +289,78 @@ python tools/export.py --check --out runs/export/jingwei_n.onnx
 | 1660 SUPER 上 FP16 比 FP32 还慢 | TU116 能用 TensorRT，但没有 Tensor Core；TRT FP16 可能落到慢 kernel | 用 `--precision both` 实测，取快的；先构建 FP32 engine 再 A/B FP16，见 [DEPLOYMENT.md §4.1](DEPLOYMENT.md) |
 | 1660 SUPER 上不到 40 FPS | n/s 变体算力过大 | 换 `configs/jingwei_p.yaml`（8.09 G MACs） |
 | 后处理占了 3–4 ms | decode + 连通域在 CPU 上 | 用 uint8 输入、`top_k` 降到 100、`out_grid` 降到 96 |
+
+### 阶段 A：loss / 指标停滞与 DINOv2 的关系
+
+**阶段 A 不运行 DINOv2 teacher**，也不是直接用 ViT 做检测主干。
+`JingWei` 使用 `WeaveCSP + DualScalePAN`；DINOv2 只在阶段 0 作为冻结 teacher，
+把特征蒸馏到学生网络。仅在 YAML 写 `dino.teacher` 不会触发预训练。
+必须先跑 `pretrain_dino.py`，再向阶段 A 传入同一模型配置生成的
+`--resume runs/dino/dino_init.pt`。不传 checkpoint 就是随机初始化。
+`--smoke` 的 teacher 是 synthetic，不能作为真实 DINOv2 预训练使用。
+启动日志现会明确提示上述初始化状态；旧阶段 A checkpoint 若没记录 teacher
+来源，不能仅凭文件名或 `mode=full` 判定是否做过蒸馏。
+
+代码检查发现并修复了 dense box loss 的坐标排列错误：旧实现先对
+`(B, 4, HW)` 做布尔筛选，再 `reshape(-1, 4)`，多个正样本时会把不同网格的
+距离拼成一组 `l/t/r/b`，而网格点仍按逐点排列。现在先转成 `(B, HW, 4)`
+再筛选，保证预测距离、目标距离和网格点一一对应。旧实现中预测完全等于目标时
+loss 仍可能为零，所以仅检查“完美框 loss=0”不足以发现问题；新增测试同时检查
+非零误差下逐点参考损失及梯度、多图 batch 与空标注反向传播。
+这是明确的监督实现问题，但没有真实训练日志，不能认定它是某次训练停滞的唯一原因。
+
+排查顺序：
+
+1. 更新代码后，建议从阶段 0 的 `dino_init.pt` **重新开一个阶段 A 输出目录**，
+   与旧训练对照；可以加载旧检测权重继续训练，但不会自动消除过去错误监督的影响。
+2. 检查图片对应的标签是否存在、类别是否为 `0..nc-1`、YOLO 坐标是否归一化，
+   并可视化训练增广后的框。缺失标签会被当成无缺陷图，不一定报错。
+3. 看各分项 `box_o2m / box_o2o / cls_* / obj_*`，不要只看总 loss。
+   当前 L1 距离项以像素计，总 loss 的绝对值受缺陷尺寸影响，不能当准确率。
+4. 检测任务关注 `mAP50 / precision / recall`，不是分类 accuracy。
+   阶段 A 推理仍会按 `model.score_thresh` 和 `fusion.final_score_thresh` 过滤框；
+   早期得分低可能使指标全零。只改 `--val-conf` 无法找回此前已经被过滤的框。
+   若要做低阈值诊断，需同时在独立配置里降低上述阈值，并对照 `best_f1`，
+   不要把诊断配置当正式部署配置。
+5. 做 8–16 张真实标注图片的小样本过拟合实验（诊断时关闭增广和 AMP），
+   先确认能学会定位与类别，再恢复完整数据与增广。
+   关闭增广目前需要在训练入口将 `make_dataset(..., augment=True)` 临时改为 `False`；
+   不要用随机合成 `--smoke` 的零 mAP 判断模型学不动。
+6. 若从完整 `last.pt` 恢复，优化器和 cosine scheduler 也会恢复；
+   `--lr` 不会覆盖加载后的优化器学习率。检查实际打印的 `lr=`，
+   尤其是延长原本已结束的训练时；不要假设调大 `--epochs` 就自动重启学习率。
+
+推荐重训命令（先选 ViT-B/14 teacher；替换成实际使用的 n/s/p 学生配置，阶段 0 和 A 保持一致）：
+
+```bash
+python tools/pretrain_dino.py --cfg configs/jingwei_n.yaml \
+    --teacher dinov2_vitb14 --crop 448 --batch 2 --iters 5000
+python tools/train_detector.py --cfg configs/jingwei_n.yaml \
+    --pretrained runs/dino/dino_init.pt --out runs/detector_boxfix \
+    --epochs 150 --log-interval 20 --val-interval 1
+```
+
+回归自检：`python -m unittest discover -s tests -p test_detection_loss.py -v`。
+
+#### 大模型预训练的边界和初始化入口
+
+- `--pretrained FILE`：显式只加载 **JingWei 兼容权重**，从第 1 轮开始，重建
+  优化器和 scheduler，采用当前 `--lr / --epochs`。输入即使是检测阶段 `last.pt`
+  也不会恢复旧学习率。与 `--resume` 互斥。
+- `--resume FILE`：用于中断恢复，完整 checkpoint 会恢复旧优化器 / scheduler；
+  为兼容旧命令，仍允许用 `dino_init.pt` 热启动。
+- `--pretrained` 不会自动下载或运行大模型。不支持直接加载原始 DINOv2 / YOLO 权重，
+  因为 ViT / YOLO 与 WeaveCSP 架构不同；无兼容主干参数时会报错，而不是静默随机训练。
+- 新生成的阶段 A `last.pt / best.pt` 会保留 checkpoint 声明的 teacher 名称，
+  后续恢复时可以查看来源。旧文件缺少这一元数据时仍显示来源未知，不猜测。
+- 先用 `dinov2_vitb14`；资源充足可在阶段 0 换 `dinov2_vitl14`，并按显存减少 batch。
+  不必同时放大学生网络。teacher 只在训练侧使用，不增加现有部署图的推理开销。
+- 当前阶段 0 使用 `normaltrain` 做特征蒸馏，**不会预训练检测头或框回归**。
+  布纹 / 光照特征迁移可能有帮助，但不等同于有标注检测器的迁移学习；
+  大 teacher 不保证更快收敛或更高 mAP。检测头仍需在阶段 A 用真实标注学习。
+  如果要直接使用成熟检测器的检测预训练权重，需要另行实现架构兼容的主干 / 检测头，
+  或检测蒸馏，而不是把其 `.pt` 文件直接塞给当前模型。
+
+建议固定数据划分、学生配置、随机种子和阶段 A 超参数，对比随机初始化、
+ViT-S 蒸馏、ViT-B 蒸馏的每轮 mAP50、召回率以及达到相同指标所需的总训练时间
+（包含阶段 0）。没有真实数据 A/B 结果前，不承诺提升幅度。
