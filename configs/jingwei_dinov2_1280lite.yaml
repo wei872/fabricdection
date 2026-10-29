@@ -78,6 +78,8 @@ train:
   best_metric: best_f1
   warmup_epochs: 1
   detector_epochs: 50
+  # A longer --epochs budget must not silently stretch the LR decay to 500 epochs.
+  lr_decay_epochs: 50
   detector_batch: 2
   detector_lr: 0.0005
   weight_decay: 0.0005

@@ -295,6 +295,8 @@ class DetectionLoss(nn.Module):
         self.last_assignment = {"matched_gt": n_assigned, "total_gt": n_gt,
                                 "unmatched_gt": n_gt - n_assigned}
 
+        diagnostics = {k: torch.zeros((), device=device) for k in
+                       ("o2m_ciou", "o2m_pixel_l1_x0.1", "o2o_ciou", "o2o_pixel_l1_x0.1")}
         # ---------- one-to-many dense branch ----------
         for si, p in enumerate(preds):
             stride = self.strides[si]
@@ -322,8 +324,11 @@ class DetectionLoss(nn.Module):
             if pred_d.numel():
                 pb = boxes_from_distances(p_sel, pred_d)
                 gb = boxes_from_distances(p_sel, tgt_d)
-                losses["box_o2m"] = losses["box_o2m"] + \
-                    (1.0 - box_ciou(pb, gb)).mean() + 0.1 * F.l1_loss(pred_d, tgt_d)
+                ciou = (1.0 - box_ciou(pb, gb)).mean()
+                l1 = 0.1 * F.l1_loss(pred_d, tgt_d)
+                losses["box_o2m"] = losses["box_o2m"] + ciou + l1
+                diagnostics["o2m_ciou"] += ciou.detach()
+                diagnostics["o2m_pixel_l1_x0.1"] += l1.detach()
 
             if p["fg"] is not None:
                 losses["fg_align"] = losses["fg_align"] + \
@@ -359,13 +364,18 @@ class DetectionLoss(nn.Module):
                 gt_box = targets[b]["boxes"][g].to(device=device, dtype=torch.float32)
                 pd = reg[b, :, flat] * self.reg_scale * stride
                 pb = boxes_from_distances(grid[flat:flat + 1], pd[None])
-                losses["box_o2o"] = losses["box_o2o"] + \
-                    (1.0 - box_ciou(pb, gt_box[None])).mean() + \
-                    0.1 * F.l1_loss(pd, boxes_to_distances(grid[flat:flat + 1], gt_box[None])[0])
+                ciou = (1.0 - box_ciou(pb, gt_box[None])).mean()
+                l1 = 0.1 * F.l1_loss(pd, boxes_to_distances(grid[flat:flat + 1], gt_box[None])[0])
+                losses["box_o2o"] = losses["box_o2o"] + ciou + l1
+                diagnostics["o2o_ciou"] += ciou.detach()
+                diagnostics["o2o_pixel_l1_x0.1"] += l1.detach()
         n_match = max(1, sum(len(m) for m in matches))
         losses["cls_o2o"] = losses["cls_o2o"] / n_match
         losses["box_o2o"] = losses["box_o2o"] / n_match
 
+        diagnostics["o2o_ciou"] /= n_match
+        diagnostics["o2o_pixel_l1_x0.1"] /= n_match
+        self.last_diagnostics = diagnostics
         total = (self.w.cls_o2m * losses["cls_o2m"] + self.w.box_o2m * losses["box_o2m"] +
                  self.w.obj_o2m * losses["obj_o2m"] + self.w.cls_o2o * losses["cls_o2o"] +
                  self.w.box_o2o * losses["box_o2o"] + self.w.obj_o2o * losses["obj_o2o"] +

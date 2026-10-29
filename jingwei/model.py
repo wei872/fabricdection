@@ -97,6 +97,7 @@ class JingWei(nn.Module):
             if targets is not None:
                 out["losses"] = self.det_loss(preds, targets, x.shape[-2:])
                 out["assignment"] = dict(self.det_loss.last_assignment)
+                out["diagnostics"] = dict(self.det_loss.last_diagnostics)
             return out
         detections = self._decode(self.head(feats, training=False), x.shape[-2:])
         if self.novelty is not None and not self.known_only and bool(self.novelty.calibrated):

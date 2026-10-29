@@ -28,6 +28,12 @@ class DINOv2Backbone(nn.Module):
         source = "local" if Path(repo).is_dir() else "github"
         initialize = bool(m.get("dino_pretrained", True))
         weights = m.get("dino_weights")
+        if initialize and weights:
+            weights = Path(weights).expanduser().resolve()
+            if not weights.is_file():
+                raise FileNotFoundError(f"Official DINOv2 weight file not found: {weights}")
+        self.initialization_source = (f"official_file={weights}" if initialize and weights else
+                                      "official_hub_pretrained" if initialize else "detector_checkpoint_restore")
         try:
             self.encoder = torch.hub.load(repo, self.name, source=source,
                                           pretrained=initialize and not bool(weights))

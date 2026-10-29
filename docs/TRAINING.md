@@ -2,7 +2,8 @@
 
 ## 1. 数据合同与工况划分
 
-模型只有 `configs/jingwei_dinov2.yaml`，数据路径在 `configs/fabric19.yaml`。
+默认 640 模型为 `configs/jingwei_dinov2.yaml`，可选 1280lite 配置为
+`configs/jingwei_dinov2_1280lite.yaml`；数据路径在 `configs/fabric19.yaml`。
 路径相对仓库根目录或为绝对路径，不自动拼接数据 YAML 的 `path` 字段。
 
 ```yaml
@@ -55,15 +56,59 @@ python tools/train_detector.py --data configs/fabric19.yaml --epochs 50 --batch 
 - 训练时未知阈值尚未校准，验证日志中的 FPR 是已有类别路径，不是最终开放集误报率。
 - `best.pt` 按已知检测 `best_f1` 选择；未宣称按未知召回挑选最佳 epoch。
 
-离线模式修改模型配置已有字段：
+### 2.1 直接加载官方权重文件（推荐显式指定）
 
-```yaml
-dino_repo: C:/models/dinov2
-dino_weights: C:/models/dinov2_vits14_pretrain.pth
+官方标准、非 registers 版 ViT-S/14 权重：
+[dinov2_vits14_pretrain.pth](https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth)。
+先用浏览器下载到本机，例如 `D:/weights/dinov2_vits14_pretrain.pth`，然后运行：
+
+```bat
+python tools/train_detector.py --cfg configs/jingwei_dinov2.yaml --data configs/fabric19.yaml --dino-weights "D:/weights/dinov2_vits14_pretrain.pth" --epochs 100 --lr-decay-epochs 40 --early-stop-patience 15 --early-stop-min-epochs 20 --early-stop-min-delta 0.001 --batch 2 --val-batch 1 --amp off --out runs/dinov2s_official
 ```
 
-本地源码须有 `hubconf.py`；权重须为匹配的官方 raw backbone state_dict。下载或严格加载失败会报错，
-不会退回随机 ViT。`xFormers is not available` 一般表示标准 attention 回退，不是权重加载失败。
+路径请换成本机实际位置，输出用新目录。仅官方 encoder 权重被加载；原图细节层、适配层、PAN、
+检测头仍需要学习布匹数据。文件加载使用 `strict=True`，缺失参数／形状不匹配立即失败，
+不会回退随机主干，也不会再次请求 Hub 下载预训练权重。
+启动日志应显示 `backbone_source=official_file=...` 和实际 `source_repo`。
+结构匹配不等于来源认证，请从上面的官方地址获取文件；不要混用 ViT-B/L、registers 版本、
+外层含 teacher/student 的训练快照或 JingWei 的 `best.pt`。
+
+**本地权重不等于源码也离线。** 完全离线时再加 `--dino-repo "D:/src/dinov2"`，
+指向包含 `hubconf.py` 的官方源码目录，或已有的 Torch Hub 官方源码缓存目录。
+未指定时仍可能从 GitHub 获取模型源码，但不会下载预训练权重。
+也可在配置的 `model` 下设置同名字段：
+
+```yaml
+model:
+  # 其余模型字段不变
+  dino_repo: D:/src/dinov2
+  dino_weights: D:/weights/dinov2_vits14_pretrain.pth
+```
+
+`xFormers is not available` 通常表示标准 attention 回退，不是权重加载失败。
+
+### 2.2 不把 500 epoch 上限误当成学习率衰减周期
+
+旧代码用总 `--epochs` 决定 cosine 周期；设置 500 会比 50 拉长十倍，
+前几十轮保持较高学习率。这是可以确认的训练控制问题，但尚无你的逐轮日志，
+不能断言它解释了所有缓慢现象。
+
+- 新增 `train.lr_decay_epochs: 50`（640 和 1280lite 相同）；CLI `--lr-decay-epochs` 优先。
+  新训练实际周期不超过 `--epochs`。上面示例在第 40 轮结束时降到初始 LR 的 5%，
+  后续保持该下限，不重新回升；`--epochs 100` 只是预算上限。
+- 早停默认关闭。`--early-stop-patience 15` 表示从最小轮数后累计 15 次验证未取得
+  超过 `min_delta` 的有效提升，按 `train.best_metric`（默认 `best_f1`）停止。
+  低于最小轮数时也记录最佳锚点，但不累计耐心；多次微小提升累计超过锚点 + delta 后重置。
+  patience 计**验证次数**，不是 batch；`--val-interval 2` 时 15 次可能跨约 30 轮。
+- `best.pt` 仍按任何实际最佳分数更新，不受早停 min_delta 限制；早停前先保存完整 `last.pt`。
+  修改早停参数会明确重置计数；相同参数全量恢复时保留计数，已早停的 checkpoint 不会默默多训。
+  如需继续，可显式 `--early-stop-patience 0`，不会更改原学习率周期。
+- 新日志 `boxdiag` 分离 CIoU 和 `0.1 × pixel L1`，`grad preclip` 显示裁剪前梯度均值、
+  最大值及超过阈值 5 的 batch 比例。它们是 detached 诊断，不改变损失权重或梯度。
+  大框的像素 L1 数值较大不等于梯度一定更差，不能仅靠总 loss 判断检测质量。
+
+这些改动不保证“500 轮效果压到 40/50 轮”。请比较验证 mAP50、best_f1、每类召回和正常图误报率；
+若验证指标仍持续改善，应调整衰减周期和早停耐心，而不是强制追求小 loss。
 
 ## 3. 恢复与格式变更
 
@@ -71,13 +116,26 @@ dino_weights: C:/models/dinov2_vits14_pretrain.pth
 python tools/train_detector.py --resume runs/dinov2s/last.pt --epochs 50 --batch 2 --out runs/dinov2s
 ```
 
-保持结构、数据和总 schedule 不变。恢复包括模型、正常原型、AdamW、scheduler、主进程随机状态、
+保持结构、数据和原始 LR schedule 不变。新 checkpoint 保存独立衰减周期、warmup 步数及早停状态；
+延长 `--epochs` 不会拉长已保存周期。旧 checkpoint 尽量按原记录的 epochs / batches 重建周期，
+旧格式未记录 warmup 设置，因此须保持原配置的 warmup。显式更改周期或 best_metric 的全量恢复会报错，
+需要换 `--pretrained` 和新目录。恢复包括模型、正常原型、AdamW、scheduler、主进程随机状态、
 可用时的 FP16 scaler；多 worker 预取／进程内部状态不保证逐 batch 位级一致。
 不完整的 `--resume` 报错，不静默 warm start。
 
 `--pretrained CHECKPOINT --lr ... --out NEW_DIR` 表示仅恢复完整检测模型权重、重新建立 optimizer／schedule。
 原型再更新会使校准标志失效，结束后重新校准。
 `best.pt` 和 `calibrated.pt` 是权重产物，只能用于推理或 `--pretrained`，不是完整 resume 文件。
+
+三个入口互斥：`--dino-weights` = 仅官方 encoder；`--pretrained` = 已训练完整检测器权重；
+`--resume` = 完整续训。若已有较好的 640 检测器，想用新周期继续优化，优先保留已学到的检测头：
+
+```bat
+python tools/train_detector.py --cfg configs/jingwei_dinov2.yaml --data configs/fabric19.yaml --pretrained runs/dinov2s/best.pt --epochs 60 --lr 0.0001 --lr-decay-epochs 30 --early-stop-patience 15 --batch 2 --val-batch 1 --amp off --out runs/dinov2s_refine
+```
+
+这是新优化器／周期的微调，不是精确 resume；已训练检测器内部已含 encoder 权重，
+无需再叠加 `--dino-weights`。不要删原实验，用相同独立验证集比较。
 
 **当前默认已从 ViT-B／1280／448 改为 ViT-S／640／224，并增加正常原型 buffers，需重新训练。**
 旧 checkpoint 文件不删除，但不能直接按新配置 `--resume` 或 `--pretrained`；不使用 `strict=False` 掩盖不匹配。

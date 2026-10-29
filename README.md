@@ -43,7 +43,7 @@ pip install -r requirements.txt
 
 ## 训练、校准、验收
 
-所有工具默认使用唯一模型配置 `configs/jingwei_dinov2.yaml`。
+所有工具默认使用 640 模型配置 `configs/jingwei_dinov2.yaml`。
 
 ### 1. 从官方预训练 ViT-S 开始
 
@@ -51,9 +51,22 @@ pip install -r requirements.txt
 python tools/train_detector.py --data configs/fabric19.yaml --epochs 50 --batch 2 --val-batch 1 --amp off --out runs/dinov2s
 ```
 
-首次无需 `--pretrained`。官方权重下载失败会报错，不静默回退随机主干。
-离线可把模型配置的 `dino_repo` 改为官方源码目录，`dino_weights` 改为匹配的
-`dinov2_vits14_pretrain.pth`。原始 ViT 权重不要传给 CLI 的 `--pretrained`。
+也可以直接使用下载好的官方权重文件（不是蒸馏）：
+
+```bat
+python tools/train_detector.py --data configs/fabric19.yaml --dino-weights "D:/weights/dinov2_vits14_pretrain.pth" --epochs 100 --lr-decay-epochs 40 --early-stop-patience 15 --early-stop-min-epochs 20 --batch 2 --val-batch 1 --amp off --out runs/dinov2s_official
+```
+
+[官方 ViT-S/14 权重下载](https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth)。
+路径替换成本机实际位置。启动日志打印 `backbone_source=official_file=...`；严格加载失败直接报错，
+不退回随机主干。完全离线时加 `--dino-repo` 指向本地官方源码（需有 `hubconf.py`）。
+原始 ViT 权重用 `--dino-weights`，已训练完整检测器用 `--pretrained`，完整续训用 `--resume`，三者互斥。
+
+**500 epoch 预算不再自动拉长学习率周期。** 新训练默认 50 轮衰减，以上命令改为 40 轮，
+之后维持 5% LR 下限；早停按验证 `best_f1` 而非总 loss。官方权重只初始化 encoder，
+不代表检测头已预训练，也不保证 40/50 轮达到原来 500 轮效果。
+已有较好检测器时可用 `--pretrained best.pt` 配新周期，避免丢掉已训练检测头。
+详细早停／恢复语义及微调示例见 [训练指南](docs/TRAINING.md#22-不把-500-epoch-上限误当成学习率衰减周期)。
 
 ### 2. 校准独立正常集
 

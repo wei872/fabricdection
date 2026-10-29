@@ -343,8 +343,21 @@ def resume_checkpoint(state_or_path, model, optimizer=None, scheduler=None,
 
 
 def load_model(cfg_path: str, ckpt: str | None = None, device="cpu",
-               initialize_pretrained: bool = True):
+               initialize_pretrained: bool = True, dino_weights=None, dino_repo=None):
     cfg = load_config(cfg_path)
+    if dino_weights is not None:
+        if ckpt or not initialize_pretrained:
+            raise ValueError("Official --dino-weights cannot be combined with detector checkpoint initialization")
+        weights_path = resolve(Path(dino_weights).expanduser()).resolve()
+        if not weights_path.is_file():
+            raise FileNotFoundError(f"Official DINOv2 weight file not found: {weights_path}")
+        cfg.model.dino_weights = str(weights_path)
+        cfg.model.dino_pretrained = True
+    if dino_repo is not None:
+        repo_path = resolve(Path(dino_repo).expanduser()).resolve()
+        if not (repo_path / "hubconf.py").is_file():
+            raise ValueError("--dino-repo must be a local official source directory containing hubconf.py")
+        cfg.model.dino_repo = str(repo_path)
     # Complete detector checkpoints include the encoder: construct architecture
     # without downloading foundation weights, then restore all tensors strictly.
     original = cfg.model.get("dino_pretrained", True)

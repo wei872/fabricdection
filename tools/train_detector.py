@@ -3,7 +3,7 @@
 First run: python tools/train_detector.py --data configs/fabric19.yaml
 Resume:    python tools/train_detector.py --resume runs/detector_dinov2/last.pt
 Warm start a NEW schedule: --pretrained runs/detector_dinov2/last.pt
-Raw foundation weights belong in model.dino_weights, not --pretrained.
+Raw foundation weights use --dino-weights (or model.dino_weights), not --pretrained.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from _common import (SyntheticFabricDataset, collect_rng_state, data_paths,
                      set_global_seed, subset_indices)
 from evaluate import validate_detector
 from _run_dir import validate_output_dir
+from _training_control import EarlyStopper, cosine_factor, schedule_spec
 from jingwei.data import MixedFabricDataset, collate, make_worker_init_fn
 from jingwei.utils import count_parameters
 
@@ -30,6 +31,13 @@ def main():
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--batch", type=int, default=None)
     ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--lr-decay-epochs", type=int, default=None,
+                    help="cosine decay horizon, capped by total epochs; independent of a long training budget")
+    ap.add_argument("--early-stop-patience", type=int, default=None,
+                    help="stop after N validation checks without meaningful best_metric improvement (0 disables)")
+    ap.add_argument("--early-stop-min-delta", type=float, default=None)
+    ap.add_argument("--early-stop-min-epochs", type=int, default=None)
+    ap.add_argument("--dino-repo", default=None, help="local official DINOv2 source folder containing hubconf.py")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", default="runs/detector_dinov2",
                     help="new/empty output directory, or the same run directory with --resume last.pt")
@@ -49,7 +57,9 @@ def main():
                       help="resume complete detector training state; use --pretrained for weights only")
     init.add_argument("--pretrained", default=None,
                       help="JingWei checkpoint for weight-only initialization; resets "
-                           "optimizer/scheduler/epoch. Direct raw DINOv2 weights go in model.dino_weights.")
+                           "optimizer/scheduler/epoch. Direct raw DINOv2 weights use --dino-weights.")
+    init.add_argument("--dino-weights", default=None,
+                      help="official raw ViT-S/14 .pth backbone file, NOT a JingWei detector checkpoint")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save-interval", type=int, default=0,
                     help="also keep epoch_XXXX.pt every N epochs (0 disables snapshots)")
@@ -81,6 +91,8 @@ def main():
     except (ValueError, OSError) as exc:
         ap.error(str(exc))
 
+    init_path = args.resume or args.pretrained
+    resume_state = load_checkpoint(init_path) if init_path else None
     set_global_seed(args.seed)
     if str(args.device).startswith("cuda") and torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
@@ -88,7 +100,8 @@ def main():
     # Weights are loaded by resume_checkpoint() below so a full checkpoint can
     # restore model + optimizer + scheduler + RNG in one place.
     model, cfg = load_model(args.cfg, None, args.device,
-                            initialize_pretrained=not bool(args.resume or args.pretrained))
+                            initialize_pretrained=not bool(args.resume or args.pretrained),
+                            dino_weights=args.dino_weights, dino_repo=args.dino_repo)
     if not cfg.model.get("dino_pretrained", True) and not (args.resume or args.pretrained):
         raise ValueError("Direct DINOv2 training requires pretrained weights; "
                          "enable model.dino_pretrained or supply a direct-backbone checkpoint")
@@ -191,26 +204,35 @@ def main():
         groups.append({"params": encoder,
                        "lr": lr * float(cfg.model.get("dino_lr_mult", 0.1))})
     opt = torch.optim.AdamW(groups, lr=lr, weight_decay=float(cfg.train.weight_decay))
-    warmup = int(float(cfg.train.get("warmup_epochs", 0)) * n_batches)
-    if warmup > 0:
-        import math
-        total_steps = max(warmup + 1, epochs * n_batches)
-        def lr_factor(step):
-            if step < warmup:
-                return float(step + 1) / warmup
-            progress = min(1., (step - warmup) / (total_steps - warmup))
-            return 0.05 + 0.95 * 0.5 * (1. + math.cos(math.pi * progress))
-        sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_factor)
+    lr_schedule = schedule_spec(epochs, n_batches, cfg.train.get("warmup_epochs", 0),
+                                cfg.train.get("lr_decay_epochs"), args.lr_decay_epochs,
+                                (resume_state.get("train") or {}) if args.resume else None)
+    warmup, total_steps = lr_schedule["warmup_steps"], lr_schedule["decay_steps"]
+    if lr_schedule["kind"] == "legacy_cosine_annealing":
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps)
     else:
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=max(1, epochs * n_batches))
-
+        sched = torch.optim.lr_scheduler.LambdaLR(
+            opt, lambda step: cosine_factor(step, warmup, total_steps))
+    previous_stop = ((resume_state.get("train") or {}).get("early_stopping") or {}) if args.resume else {}
+    def stop_option(name, explicit, fallback):
+        return explicit if explicit is not None else previous_stop.get(name, fallback)
+    stopper = EarlyStopper(stop_option("patience", args.early_stop_patience, 0),
+                           stop_option("min_delta", args.early_stop_min_delta, .001),
+                           stop_option("min_epochs", args.early_stop_min_epochs, 20))
+    if previous_stop:
+        settings = ("patience", "min_delta", "min_epochs")
+        if all(previous_stop.get(k) == stopper.state_dict()[k] for k in settings):
+            stopper.load_state_dict(previous_stop)
+        else:
+            log("[!] Early-stop settings changed explicitly; resetting patience counters")
+    if stopper.patience and not args.val_interval:
+        raise ValueError("Early stopping requires validation; enable --val-interval")
     out.mkdir(parents=True, exist_ok=True)
 
-    init_path = args.resume or args.pretrained
-    resume_state = load_checkpoint(init_path) if init_path else None
     if args.resume:
         saved_train = resume_state.get("train") or {}
+        if saved_train.get("best_metric", cfg.train.get("best_metric", "best_f1")) != cfg.train.get("best_metric", "best_f1"):
+            raise ValueError("Cannot change best_metric during --resume; use --pretrained with a new --out")
         if (saved_train.get("assignment_version") != model.det_loss.assignment_version or
                 saved_train.get("objective_version") != model.det_loss.objective_version or
                 not model.architecture_compatible(saved_train.get("architecture"))):
@@ -240,6 +262,8 @@ def main():
     log("initialization=" + ("detector checkpoint (encoder/adapters/head restored)"
         if resume_state is not None else
         "official pretrained DINOv2; pyramid adapters / detector head=new"))
+    log(f"backbone_source={model.backbone.initialization_source}  source_repo={cfg.model.dino_repo}")
+    log(f"lr_schedule={lr_schedule}  early_stopping={stopper.state_dict()}")
     if args.device.startswith("cuda") and torch.cuda.is_available():
         log(f"gpu={torch.cuda.get_device_name(0)}")
     log(f"model={count_parameters(model) / 1e6:.2f} M params  "
@@ -280,6 +304,12 @@ def main():
         if args.pretrained:
             log("--pretrained: fresh optimizer / scheduler; using current --lr / --epochs")
 
+    if (info and info["full"] and stopper.patience and start_epoch >= stopper.min_epochs
+            and stopper.bad_checks >= stopper.patience):
+        log("Checkpoint already early-stopped; nothing to do. Set --early-stop-patience 0 "
+            "or explicitly change early-stop settings to continue.")
+        return
+
     if start_epoch >= epochs:
         log(f"checkpoint already reached epoch {start_epoch}/{epochs}; nothing to do")
         return
@@ -293,6 +323,8 @@ def main():
     for ep in range(start_epoch, epochs):
         t0 = time.time()
         interval_t0 = t0
+        diagnostics = {}
+        grad_sum = grad_max = grad_clipped = None
         running = {}                     # loss name -> GPU scalar (no per-iter sync)
         assignment_totals = dict(matched_gt=0, total_gt=0, unmatched_gt=0)
         interval_loss = None
@@ -322,7 +354,13 @@ def main():
                 scaler.unscale_(opt)
             else:
                 loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, max_norm=5.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=5.0).detach()
+            grad_sum = grad_norm if grad_sum is None else grad_sum + grad_norm
+            grad_max = grad_norm if grad_max is None else torch.maximum(grad_max, grad_norm)
+            clipped = (grad_norm > 5.).float()
+            grad_clipped = clipped if grad_clipped is None else grad_clipped + clipped
+            for key, value in result.get("diagnostics", {}).items():
+                diagnostics[key] = diagnostics.get(key, value.new_zeros(())) + value
             if scaler.is_enabled():
                 scaler.step(opt)
                 scaler.update()
@@ -359,6 +397,12 @@ def main():
         log(f"epoch {ep + 1:3d}/{epochs}  {msg}  total={float(running.get('total', 0.0)) / n:.3f} "
             f"({time.time() - t0:.1f}s)  elapsed_total={format_eta(time.time() - global_t0)}")
 
+        if diagnostics:
+            log("boxdiag " + " | ".join(f"{k}={float(v) / n:.4f}" for k, v in diagnostics.items()))
+        if grad_sum is not None:
+            log(f"grad preclip mean={float(grad_sum) / n:.3f} max={float(grad_max):.3f} "
+                f"clipped_fraction={float(grad_clipped) / n:.3f} max_norm=5")
+        stop_now = False
         log(f"assign epoch {ep + 1:3d}/{epochs}  "
             f"matched_gt={assignment_totals['matched_gt']}/{assignment_totals['total_gt']}  "
             f"unmatched_gt={assignment_totals['unmatched_gt']}")
@@ -394,6 +438,10 @@ def main():
             if metric not in ("mAP50", "precision", "f1", "best_f1"):
                 raise ValueError(f"unsupported train.best_metric: {metric}")
             score = float(val_metrics[metric])
+            stop_now = stopper.step(score, ep + 1)
+            if stopper.patience:
+                log(f"early_stop metric={metric} anchor={stopper.best:.5f} "
+                    f"bad_checks={stopper.bad_checks}/{stopper.patience} min_epochs={stopper.min_epochs}")
             if score > best_score:
                 best_score = score
                 save_checkpoint({"model": model.state_dict(),
@@ -430,6 +478,8 @@ def main():
                 "epoch": ep + 1,          # next epoch to run on resume
                 "iter": it,
                 "epochs": epochs,
+                "lr_schedule": lr_schedule,
+                "early_stopping": stopper.state_dict(),
                 "batch": batch,
                 "lr": lr,
                 "batches_per_epoch": n_batches,
@@ -444,6 +494,10 @@ def main():
         if args.save_interval and (ep + 1) % args.save_interval == 0:
             save_checkpoint(state, out / f"epoch_{ep + 1:04d}.pt")
         log(f"checkpoint -> {out / 'last.pt'}")
+        if stop_now:
+            log(f"Early stopping at epoch {ep + 1}: no meaningful validation improvement; "
+                "last.pt saved and best.pt preserved. This is NOT a guarantee of convergence.")
+            break
     log(f"saved -> {out / 'last.pt'}")
 
 
