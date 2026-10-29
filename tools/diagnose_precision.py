@@ -97,8 +97,12 @@ def collect(model, loader, device, nc, iou_thr=0.5):
                 labels=d["labels"].detach().cpu(),
                 scale=d.get("scale_idx", torch.full((len(d["labels"]),), -1,
                                                     dtype=torch.long)).detach().cpu(),
-                gt_boxes=batch["boxes"][b].cpu(),
-                gt_labels=batch["labels"][b].cpu(),
+                # normal-image loaders (SyntheticNormalDataset, --smoke) carry
+                # no ground truth at all -- an empty tensor, not a KeyError.
+                gt_boxes=(batch["boxes"][b].cpu() if "boxes" in batch else
+                          torch.zeros(0, 4)),
+                gt_labels=(batch["labels"][b].cpu() if "labels" in batch else
+                           torch.zeros(0, dtype=torch.long)),
             ))
     return frames
 
@@ -242,13 +246,12 @@ def main():
           f"final_score_thresh={float(cfg.fusion.final_score_thresh):.2f}  "
           f"obj_o2o_mode={cfg.train.get('obj_o2o_mode', 'focal')}")
     print(f"val images={len(val_loader.dataset)}  normal images={len(norm_loader.dataset)}")
-    print(f"candidates collected with final_score_thresh=0 (shipped value is "
-          f"{shipped_thresh:.2f}); decode's own model.score_thresh still applies")
-
     # ``JingWei.eval`` already drops boxes below fusion.final_score_thresh, which
     # would make any sweep below it meaningless.  Collect UNFILTERED candidates
     # (still >= model.score_thresh inside decode) and threshold offline.
     shipped_thresh = float(cfg.fusion.final_score_thresh)
+    print(f"candidates collected with final_score_thresh=0 (shipped value is "
+          f"{shipped_thresh:.2f}); decode's own model.score_thresh still applies")
     cfg.fusion.final_score_thresh = 0.0
     frames = collect(model, val_loader, args.device, nc, args.iou)
     norm_frames = collect(model, norm_loader, args.device, nc, args.iou)

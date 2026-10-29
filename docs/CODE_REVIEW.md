@@ -348,15 +348,15 @@ val 块新增一行（数值来自 `head.decode` 的 `last_stats`，是**加阈�
 |---|---|---|
 | `epoch 1–2 boxes/img` | 0.0（且之后很久仍为 0） | 前若干个 epoch 可能仍为 0（分数 ≈0.02 < 门槛），但 `gate: max_score` 会逐 epoch 上升 |
 | `gate: max_score` | 未打印 | 可见；越过 `conf` 后开始出框 |
-| `loss share: obj_o2o` | 0.7% | 17%–24%（smoke 实测） |
+| `loss share: obj_o2o` | 0.7% | 冷启动 58%（正样本还在 0.02），学开后回落到个位数——低位是"分支已解掉"，不是没在学（smoke 实测） |
 | `loss: box_o2m` | 32 / 28.8 | **~2.1**（smoke 实测；像素 L1 归一化，与输入尺寸无关） |
-| `loss: obj_o2m` | 0.025（恒定 = 死的） | 起始 ~6.9（目标=1，预测≈0.02），随训练下降 |
+| `loss: obj_o2m` | 0.025（恒定 = 死的） | 起始 ~8.0（目标=1.0，预测 0.018，两个尺度各 ~4），随训练下降 |
 | `loss: cls_o2m` | 46.9（`sum/n_pos` 膨胀） | 0.2 → 0.005 |
 
 smoke 实测（320²，4 张合成图，2 epoch）的 `loss share` 从
 `box_o2m=66% / obj_o2o=0.7%` 变成 `obj_o2m=26~28% obj_o2o=17~24% box_o2m=16~19% box_o2o=13~15% cls_o2m=12%`。
 
-回归测试（`test_53`–`test_57`）把四条缺陷都钉住了：质量目标不得为 0、
+回归测试（`test_53`–`test_56`）把四条缺陷都钉住了：质量目标不得为 0、
 分类在缺陷上必须被"推高"、平衡 focal 的量级必须是 O(1)、
 head 在 300 步 Adam 内必须把分数推过 `score_thresh`、验证集必须能区分"没出框"和"框错了"。
 
@@ -520,7 +520,7 @@ bias 高只会让**第 0 步就淹没在 0.5 的背景里**，而这正是用户
 > 改动落在 `jingwei/losses.py` / `jingwei/head.py` / `tools/evaluate.py` / `tools/train_detector.py` / 三个 config，
 > 回归测试 `test_58`–`test_62`。
 >
-> v0.2.1 的四项冷启动修复（质量目标塌陷、平衡归一化、像素 L1 未归一化、objectness 分支权重）见 **§0.7**，改动落在 `jingwei/losses.py` / `jingwei/head.py` / `tools/evaluate.py` / `tools/train_detector.py` / 三个 config，回归测试 `test_53`–`test_57`。
+> v0.2.1 的四项冷启动修复（质量目标塌陷、平衡归一化、像素 L1 未归一化、objectness 分支权重）见 **§0.7**，改动落在 `jingwei/losses.py` / `jingwei/head.py` / `tools/evaluate.py` / `tools/train_detector.py` / 三个 config，回归测试 `test_53`–`test_56`。
 
 ### P0-1 `AnomalyFusion(mode="gate")` 对概率做了第二次 sigmoid → 标定阈值失效
 

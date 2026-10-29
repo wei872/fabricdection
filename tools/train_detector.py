@@ -106,13 +106,19 @@ def main():
 
     if args.smoke:
         ds = SyntheticNormalDataset(n=args.smoke, size=size)
-        # fake YOLO targets so the whole loss graph is exercised
+        # Fake YOLO targets so the whole loss graph is exercised.  They are
+        # written at 1280 px and scaled to ``--size``: with a 320 px smoke the
+        # unscaled boxes fell *outside* the image, so every positive came from
+        # build_dense_targets' degenerate fallback and the smoke's loss numbers
+        # meant nothing (obj_o2m 8.1 instead of 27, wildly wrong t_reg).
+        _k = float(size) / 1280.0
+
         class Wrapped(torch.utils.data.Dataset):
             def __len__(self): return len(ds)
             def __getitem__(self, i):
                 d = ds[i]
                 d["boxes"] = torch.tensor([[100., 100., 260., 180.],
-                                           [600., 700., 980., 740.]])
+                                           [600., 700., 980., 740.]]) * _k
                 d["labels"] = torch.tensor([1, 17])
                 return d
         train_ds = Wrapped()
