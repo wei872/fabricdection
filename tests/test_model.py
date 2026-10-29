@@ -10,7 +10,7 @@ invariance, memory-bank algebra, the dataset readers, Chinese / Unicode
 file paths, non-square fabric augmentation, training progress logs,
 full checkpoint resume, numpy RNG state checkpointing, dynamic
 local+global attention foreground context, validation metrics, and
-unknown-defect boxes / objectness gate cold start / warm start / negative mixing (64 tests).
+unknown-defect boxes / objectness gate cold start / warm start / negative mixing / one-to-one matching (67 tests).
 """
 from __future__ import annotations
 
@@ -1306,11 +1306,11 @@ class TestModel(unittest.TestCase):
         tgt = [dict(boxes=torch.tensor([[480., 480., 500., 500.]]),
                     labels=torch.tensor([3]))]
 
-        def run(mode, base_logit=-4.0):
+        def run(mode, base_logit=-4.0, hit=(60, 60)):
             cfg = load_config(CFG_N)
             cfg.train.obj_o2o_mode = mode
             obj = torch.full((1, 1, 160, 160), float(base_logit))
-            obj[:, :, 60, 60] = 4.0        # the matched positive
+            obj[:, :, hit[0], hit[1]] = 4.0   # the matched positive
             obj3 = obj.clone().requires_grad_(True)
             preds = [dict(cls=torch.full((1, 19, 160, 160), -3.0),
                           reg=torch.full((1, 4, 160, 160), 1.0),
@@ -1325,8 +1325,28 @@ class TestModel(unittest.TestCase):
             g = obj3.grad
             return out, int((g.abs() > 0).sum()), float(g[0, 0, 5, 150])
 
-        out_ohem, n_ohem, far_ohem = run("ohem")
-        out_focal, n_focal, far_focal = run("focal")
+        # The matched positive is a region-restricted choice since v0.2.4, so
+        # first ask the matcher where it is, then light up exactly that cell.
+        # Comparing loss magnitudes without doing this measures the *positive*
+        # term, not the background term the test is about.
+        cfgl = load_config(CFG_N)
+        probe = [dict(cls=torch.full((1, 19, 160, 160), -3.0),
+                      reg=torch.full((1, 4, 160, 160), 1.0),
+                      obj=torch.full((1, 1, 160, 160), -4.0),
+                      obj_o2o=torch.full((1, 1, 160, 160), -4.0), fg=None),
+                 dict(cls=torch.full((1, 19, 40, 40), -3.0),
+                      reg=torch.full((1, 4, 40, 40), 1.0),
+                      obj=torch.full((1, 1, 40, 40), -4.0),
+                      obj_o2o=torch.full((1, 1, 40, 40), -4.0), fg=None)]
+        mm = hungarian_match(probe, tgt, (8, 32), int(cfgl.data.nc),
+                            float(cfgl.model.reg_scale),
+                            int(cfgl.train.o2o_candidates),
+                            radius=float(cfgl.train.o2o_radius))
+        flat = [f for si, m in enumerate(mm) for _, f, _ in m if si == 0][0]
+        hit = (flat // 160, flat % 160)
+
+        out_ohem, n_ohem, far_ohem = run("ohem", hit=hit)
+        out_focal, n_focal, far_focal = run("focal", hit=hit)
         for o in (out_ohem, out_focal):
             self.assertTrue(torch.isfinite(o["total"]))
             self.assertGreater(float(o["obj_o2o"]), 0.0)
@@ -1346,7 +1366,7 @@ class TestModel(unittest.TestCase):
         # What must hold is the property that matters: *wrong* background is
         # still punished hard, and it is punished because of the background
         # term (the balanced normalisation keeps that term alive).
-        out_wrong, _, _ = run("focal", base_logit=0.0)     # p = 0.5 everywhere
+        out_wrong, _, _ = run("focal", base_logit=0.0, hit=hit)   # p = 0.5
         self.assertGreater(float(out_wrong["obj_o2o"]), 0.05,
                            "a background predicted at p=0.5 must still cost a lot")
         self.assertGreater(float(out_wrong["obj_o2o"]),
@@ -1888,6 +1908,132 @@ class TestModel(unittest.TestCase):
             self.assertGreater(float(cfg.train.obj_o2m_neg_weight), 1.0)
             self.assertGreater(float(cfg.train.get("normal_image_frac", 0.0)), 0.0,
                                "defect-free frames must be mixed in")
+
+    def test_66_one_to_one_positive_lands_on_the_object(self):
+        """The deployed positive must be a cell that can *reach* its GT.
+
+        Regression is ``reg * reg_scale * stride`` from the cell centre, so a
+        positive matched to a cell hundreds of px away has an unlearnable
+        target: the least-squares answer is the dataset-mean offset (one
+        average-sized box at every firing cell) and the objectness branch is
+        simultaneously taught "object here" on plain fabric.  The old candidate
+        pool was the top-k of the model's *own* score map, so with an
+        uninformative (cold-start) score map -- exactly the fixture below, every
+        logit equal -- the pool was just the first k cells of the map and the
+        match landed in the top-left corner.  That is what kept every run at
+        55-85 boxes/img and precision <= 0.3%.
+        """
+        from jingwei.losses import DetectionLoss
+
+        cfg = load_config(CFG_N)
+        tgt = [dict(boxes=torch.tensor([[480., 480., 560., 560.]]),
+                    labels=torch.tensor([3]))]
+        loss_fn = DetectionLoss(cfg)
+        shapes = [(1, 1, 160, 160), (1, 1, 40, 40)]
+        preds = [dict(cls=torch.full((1, 19, shp[2], shp[3]), -2.0),
+                      reg=torch.full((1, 4, shp[2], shp[3]), 1.0),
+                      obj=torch.full(shp, -2.0),
+                      obj_o2o=torch.full(shp, -2.0), fg=None)
+                 for shp in shapes]
+        mm = hungarian_match(preds, tgt, loss_fn.strides, loss_fn.nc,
+                             loss_fn.reg_scale, loss_fn.o2o_candidates)
+        hits = [(si, flat) for si, m in enumerate(mm) for _, flat, _ in m]
+        self.assertEqual(len(hits), 1, "exactly one positive per GT")
+        si, flat = hits[0]
+        stride = loss_fn.strides[si]
+        _, _, H, W = shapes[si]
+        cx, cy = flat % W, flat // W
+        px, py = (cx + 0.5) * stride, (cy + 0.5) * stride
+        lim = float(cfg.train.get("o2o_radius", 1.5)) * stride + stride
+        self.assertLessEqual(abs(px - 520.0), lim,
+                             f"matched cell is {px:.0f} px from the GT centre")
+        self.assertLessEqual(abs(py - 520.0), lim,
+                             f"matched cell is {py:.0f} px from the GT centre")
+        # ... and the loss reports that distance, so a regression is visible in
+        # the training log (``match_cell=``) instead of silently destroying
+        # box_o2o.
+        out = loss_fn(preds, tgt, (1280, 1280))
+        self.assertLess(float(out["match_cell"]), 2.5)
+
+    def test_67_the_deployed_objectness_can_represent_a_one_cell_peak(self):
+        """A 5x5 low-pass cannot express a single-cell target.
+
+        ``obj_stem`` is 3x3 then 5x5 depthwise, i.e. a 7x7 smoothing of the
+        regression stem.  With ``t_obj = 1`` on exactly one cell, smoothing
+        forces the head to satisfy the demand by raising the whole field --
+        measured ``obj_mean = 0.148`` against a 0.15 gate on the real v0.2.3 run
+        (82 boxes/img, precision 0.3%).  The residual path keeps an unattenuated
+        local channel so the peak survives.
+        """
+        from jingwei.head import NMSFreeDetect
+
+        cfg = load_config(CFG_N)
+        head = NMSFreeDetect(cfg, [32, 64, 128, 256]).eval()
+        feats = {"n3": torch.randn(1, 64, 16, 16),
+                 "n5": torch.randn(1, 256, 4, 4)}
+        with torch.no_grad():
+            out = head(feats, training=True)[0]["obj_o2o"]
+            # kill the smoothing branch: whatever is left is the local path
+        self.assertGreater(float(out.std()), 1e-4)
+        with torch.no_grad():
+            for m in head.heads[0].obj_stem.modules():
+                if isinstance(m, torch.nn.Conv2d):
+                    m.weight.zero_()
+                    if m.bias is not None:
+                        m.bias.zero_()
+        with torch.no_grad():
+            flat = head.heads[0](torch.randn(1, 64, 16, 16), training=True)["obj_o2o"]
+        self.assertGreater(float(flat.std()), 1e-5,
+                           "with the residual the 1x1 conv still sees f_reg; "
+                           "without it this output is the constant bias")
+        # A/B: the old (non-residual) wiring degenerates to a constant.
+        cfg2 = load_config(CFG_N)
+        cfg2.model.obj_head_residual = False
+        head2 = NMSFreeDetect(cfg2, [32, 64, 128, 256]).eval()
+        with torch.no_grad():
+            for m in head2.heads[0].obj_stem.modules():
+                if isinstance(m, torch.nn.Conv2d):
+                    m.weight.zero_()
+                    if m.bias is not None:
+                        m.bias.zero_()
+        with torch.no_grad():
+            const = head2.heads[0](torch.randn(1, 64, 16, 16), training=True)["obj_o2o"]
+        self.assertLess(float(const.std()), 1e-6)
+
+    def test_68_background_level_is_below_the_gate_by_construction(self):
+        """``obj_o2o`` positives are ~8 cells per map, the negatives ~25k.
+
+        The two terms fight through the shared 1x1 conv, and with an
+        inseparable feature the only way to satisfy the positives is a bias
+        offset that lifts the *whole* field, so the equilibrium tracks the
+        pressure ratio: ``p_eq ~ K / obj_o2o_neg_weight``.
+
+        ``K`` is calibrated on the one real measurement available: v0.2.3
+        shipped ``obj_o2o_neg_weight = 2.5`` and the run reported
+        ``obj_mean = 0.148`` (== K = 0.37).  The gate is ``0.15``, i.e. the
+        background field was parked *exactly on* the gate -- the mechanical
+        reason for 82 boxes/img, 97%-of-outputs-background and precision 0.3%.
+        The shipped weights must therefore put ``K / neg_weight`` at most half
+        the gate, which needs ``neg_weight >= 4.9``.
+        """
+        K = 0.148 * 2.5          # measured: obj_mean at obj_o2o_neg_weight 2.5
+        for name in ("jingwei_n", "jingwei_p", "jingwei_s"):
+            cfg = load_config(str(ROOT / f"configs/{name}.yaml"))
+            w_neg = float(cfg.train.obj_o2o_neg_weight)
+            gate = float(cfg.model.score_thresh)
+            p_eq = K / w_neg
+            self.assertLess(p_eq, 0.5 * gate,
+                            f"{name}: background equilibrium {p_eq:.3f} "
+                            f"(obj_o2o_neg_weight={w_neg:.1f}) is not clearly "
+                            f"below the {gate} gate")
+            self.assertTrue(bool(cfg.model.get("obj_head_residual", True)),
+                            f"{name}: objectness must keep its local path")
+            rad = float(cfg.train.get("o2o_radius", 1.5))
+            self.assertGreater(rad, 0.0)
+            self.assertLessEqual(rad, 2.0, f"{name}: o2o_radius too wide")
+            # the two thresholds are one number
+            self.assertAlmostEqual(gate, float(cfg.fusion.final_score_thresh),
+                                   places=9)
 
 
 if __name__ == "__main__":

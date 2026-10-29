@@ -362,12 +362,36 @@ def main():
                               if v / tot >= 0.02 or k in ("obj_o2o", "cls_o2o")))
                 deployed = sum(contrib.get(k, 0.0)
                                for k in ("obj_o2o", "cls_o2o", "box_o2o"))
-                if deployed / tot < 0.15:
+                # A *converged* deployed objectness has a tiny value (every
+                # negative at p~0, every positive at p~1), so a small share is
+                # only a symptom when the raw term is still large: measured
+                # 0.0001-0.05 after the branch converges, 0.51 in the run whose
+                # `gate: p99` was stuck on the threshold (CODE_REVIEW 0.10).
+                # Absolute cutoff on the raw value, not on the share.
+                starved = float(running.get("obj_o2o", 0.0)) / n > 0.2
+                if deployed / tot < 0.15 and starved:
                     log(f"      [!] the branches that actually run at "
                         f"inference own only {100.0 * deployed / tot:.0f}% of "
                         "the loss (obj_o2o + cls_o2o + box_o2o); the o2m "
                         "terms are training-only. Raise loss_weights.obj_o2o "
-                        "or lower the o2m weights (docs/CODE_REVIEW.md 0.9).")
+                        "or lower the o2m weights (docs/CODE_REVIEW.md 0.9). "
+                        "If `gate: p99` is small AND `normal: boxes/img` is "
+                        "falling, ignore this: a solved objectness branch "
+                        "shrinks to ~0 by construction.")
+        except Exception:
+            pass
+        # Matching health (v0.2.4): the one-to-one positive must sit ON the
+        # object.  Anything much beyond one stride means the assignment is
+        # picking cells the regression head cannot reach, which atomises
+        # ``box_o2o`` into an unlearnable target (the v0.2.3 failure).
+        try:
+            if "match_cell" in running:
+                mc = float(running["match_cell"]) / n
+                if mc > 3.0:
+                    log(f"      [!] one-to-one positives sit {mc:.1f} cells "
+                        "from their GT centre (expected <= 2); the o2o "
+                        "regression target is then unreachable -- check "
+                        "train.o2o_radius and docs/CODE_REVIEW.md 0.10.")
         except Exception:
             pass
 
@@ -401,14 +425,24 @@ def main():
             # bad localisation, or pure background.  Without this line a low
             # precision is unactionable.
             fb = val_metrics.get("fp_breakdown", {})
+            # ``best_f1_thr`` is the score *at the F1 arg-max of the PR curve*.
+            # When nothing is a TP the arg-max degenerates to index 0, i.e. the
+            # single highest-scored box in the whole validation set -- printing
+            # that as an "operating point" (``conf>=0.65 -> P=0.000 R=0.000``)
+            # reads like a threshold bug and hides the real message: the model
+            # has no true positive at any threshold.
+            if float(val_metrics.get("best_f1", 0.0)) > 0.0:
+                op = (f"best operating point: conf>={val_metrics['best_f1_thr']:.2f} "
+                      f"-> P={val_metrics.get('best_precision', 0.0):.3f} "
+                      f"R={val_metrics.get('best_recall', 0.0):.3f}")
+            else:
+                op = ("no true positive at any threshold (the model is not "
+                      "placing boxes on defects yet)")
             log(f"      boxes/img={val_metrics.get('dets_per_image', 0.0):5.1f}  "
                 f"FP: duplicate={fb.get('duplicate_same_gt', 0)} "
                 f"wrong_class={fb.get('wrong_class', 0)} "
                 f"localization={fb.get('localization', 0)} "
-                f"background={fb.get('background', 0)}  "
-                f"(best operating point: conf>={val_metrics['best_f1_thr']:.2f} "
-                f"-> P={val_metrics.get('best_precision', 0.0):.3f} "
-                f"R={val_metrics.get('best_recall', 0.0):.3f})")
+                f"background={fb.get('background', 0)}  ({op})")
             # Is the deployed gate open at all?  ``gate`` is the maximum
             # ``sigmoid(obj)*sigmoid(cls)`` over every decoded peak *before* the
             # threshold is applied, so it separates the two very different

@@ -71,6 +71,10 @@ model:
   # 受控 A/B（冻结真实特征的 head-only 探针，300 步）：neck 时部署分数只有 0.033
   # = 门永远打不开；reg 时 0.52~0.95。这是本轮唯一"非它不可"的改动。
   obj_head_from: reg
+  # v0.2.4: objectness 走 f_reg + DWConv(3x3)->DWConv(5x5) 的残差路径。
+  # 只用 5x5 平滑时无法表示"单 cell 峰"，网络只能靠抬高整张图的水位来满足
+  # 正样本（实测 obj_mean=0.148 ≈ 阈值 0.15 -> 82 框/图）。残差 0 参数、0 MACs。
+  obj_head_residual: true
 
 normality:
   enabled: true
@@ -129,12 +133,19 @@ train:
   # 13% + 12% + 14%），obj_o2o 从 2% 升到 ~13%。
   # 注意 obj_o2o 的"值"天生很小（平衡 focal，背景学会后接近 0），所以权重必须大：
   # 这是"权重 × 量级"的问题，不是损失本身有问题。
+  # v0.2.4: obj_o2o 10 -> 8，box_o2o 2.5 -> 3.0。部署分支（o2o 三项）仍占 ~55%，
+  # 但 o2o 的"背景水位"改由 obj_o2o_neg_weight 负责（见下），回归不再被压。
   loss_weights: {cls_o2m: 0.9, box_o2m: 1.0, obj_o2m: 0.3,
-                 cls_o2o: 3.0, box_o2o: 2.5, obj_o2o: 10.0, fg_align: 0.5}
+                 cls_o2o: 3.0, box_o2o: 3.0, obj_o2o: 8.0, fg_align: 0.5}
   class_weights: null
   o2o_candidates: 1200
   o2o_neg_ratio: 0.02       # per-scale hard negatives as a fraction of all cells
-  o2o_min_neg: 2048         # floor for scales with few/no matches in a batch
+  o2o_min_neg: 2048
+  # v0.2.4: o2o 的匈牙利匹配只在"每个 GT 自己的中心区域"内选正样本（radius 单位
+  # = stride，与 o2m 的 FCOS 中心采样同一规则）。旧实现从当前 score 的 top-k 里挑，
+  # 等于让回归去拟合一个离目标几百像素的 cell —— 学不到（退化成数据集平均尺寸），
+  # 同时把"有目标"教在普通布面上，而且自我强化、换任何权重都救不回来。
+  o2o_radius: 1.5
   # o2o（部署分支）objectness 的监督方式：
   #   focal = 全网所有 cell 都参与 focal loss（默认，背景不会被漏掉）
   #   ohem  = 只对最难的 ~8% 负样本做 hard mining（旧行为；p=0 的
@@ -145,9 +156,13 @@ train:
   obj_o2o_mode: focal
   obj_o2o_gamma: 2.0
   obj_o2o_alpha: 0.5          # 正样本比例 0.1%~1%，alpha=0.25 是在惩罚前景
-  obj_o2o_neg_weight: 2.5     # 负样本均值项的权重：1.0 时背景电平会停在
-                              # obj~0.5（平衡 = 50/50 份额，没有"关闭"的压力），
-                              # 2.5 把它压到 ~0.02 量级（见 docs/CODE_REVIEW.md §0.8）
+  obj_o2o_neg_weight: 6.0     # 负样本均值项的权重。这一项是"背景水位"的唯一
+                              # 来源：正样本只有每图 ~8 个 cell，负样本 25k 个，
+                              # 两者在权值空间里打架，结果是整张图被抬到 p ~ 1/w_n。
+                              # 2.5 时实测 obj_mean=0.148，正好压在 0.15 的阈值上
+                              # （= 82 框/图、precision 0.3%，见 §0.10）；6.0 对应
+                              # p ~ 0.06，留出安全余量。不要再往上调，正样本侧的
+                              # 压力由 loss_weights.obj_o2o 独立控制。
   obj_o2m_neg_weight: 2.0     # o2m 分支同样加背景压力（1.0 = 纯 50/50）
   cls_o2m_neg_weight: 2.0     # 分类背景压低 => score=obj*cls 的乘积更干净
   obj_quality_floor: 0.0      # 质量目标下限；0.5 会把"定位很差的匹配"教成

@@ -188,47 +188,117 @@ def build_dense_targets(pred, targets, stride, nc, reg_scale, radius=1.5,
 # 3. One-to-one Hungarian matching
 # --------------------------------------------------------------------------------------
 @torch.no_grad()
-def hungarian_match(preds, targets, strides, nc, reg_scale, max_candidates=1600):
-    """Return matches[si] = list of (batch, flat_index, gt_index)."""
+def hungarian_match(preds, targets, strides, nc, reg_scale, max_candidates=1600,
+                    radius=1.5):
+    """Return matches[si] = list of (batch, flat_index, gt_index).
+
+    The candidate pool is each GT's **own** FCOS centre region, not the
+    top-``max_candidates`` cells of the current score map (v0.2.4).
+
+    Why this had to change: the deployed one-to-one branch supervises two
+    things at the matched cell -- ``t_obj = 1`` and a regression *from that
+    cell* to the GT box.  A cell can only regress an offset the head can
+    express (``reg * reg_scale * stride``), so the positive MUST lie on the
+    object.  The old pool was the top 800 cells per scale out of ~26k, i.e.
+    ~3% of the map, ranked by ``sigmoid(obj_o2o) * sigmoid(cls)`` -- the
+    model's own, at cold start random, score.  Most GTs were therefore matched
+    to a cell hundreds of pixels away, where
+
+    * the regression target is unlearnable (the features of a plain fabric
+      cell carry no information about the offset to a defect elsewhere), so
+      the least-squares optimum is the *dataset-mean* offset -- one
+      medium/large box at every firing cell, which is exactly the "55-85
+      boxes/img, 97% of them background FPs, precision 0.3%" signature of
+      every run so far, and
+    * the objectness branch is taught "object here" on plain fabric.
+
+    It is self-reinforcing: the wrongly chosen cells become the high-score
+    cells, so they stay in the pool for ever -- no loss weight can undo it.
+    YOLOv10's TAL filters candidates with the same centre rule for the same
+    reason.
+
+    A GT whose region holds no cell (object smaller than the stride, or a
+    stride-32 scale for a tiny defect) falls back to the nearest cell of that
+    scale, so every GT still receives **exactly one** positive -- the property
+    that makes ``decode`` NMS-free.
+
+    ``max_candidates`` is kept for API compatibility.  Region-restricted
+    matching yields ~9 cells per GT per scale, so the cap only ever binds as a
+    safety bound on pathological label counts.
+    """
     from scipy.optimize import linear_sum_assignment
 
     B = preds[0]["cls"].shape[0]
     device = preds[0]["cls"].device
     per_scale: list[list] = [[] for _ in preds]
-    candidate_meta = [[] for _ in preds]      # (si, local flat idx) per global slot order
+    # A cost this large is "forbidden" to the assignment, but keeps every entry
+    # finite (scipy rejects inf).  Costs are O(3), so 1e4 cannot be won.
+    forbidden = 1e4
+    budget = max(1, int(max_candidates))
 
     for b in range(B):
-        all_cls, all_obj, all_boxes, meta = [], [], [], []
-        for si, p in enumerate(preds):
-            Bn, _, H, W = p["cls"].shape
-            stride = strides[si]
-            pts = _grid_points(H, W, stride, device, torch.float32)
-            cls = p["cls"][b].float().reshape(nc, -1).t().sigmoid()    # (HW, nc)
-            obj = p["obj_o2o"][b].float().reshape(-1).sigmoid()
-            dist = p["reg"][b].float().reshape(4, -1).t() * reg_scale * stride
-            boxes = boxes_from_distances(pts, dist)
-            score = obj * cls.max(-1).values
-            k = min(max(1, max_candidates // len(preds)), score.numel())
-            top = torch.topk(score, k).indices
-            all_cls.append(cls[top])
-            all_obj.append(obj[top])
-            all_boxes.append(boxes[top])
-            meta.extend([(si, int(flat)) for flat in top.cpu().tolist()])
-
         boxes_gt = targets[b]["boxes"].to(device=device, dtype=torch.float32)
         labels = targets[b]["labels"].to(device=device, dtype=torch.long)
         if boxes_gt.numel() == 0:
             continue
-        cls_all = torch.cat(all_cls, 0)                # (C, nc)
-        obj_all = torch.cat(all_obj, 0)
-        box_all = torch.cat(all_boxes, 0).clamp(min=0)
+        G = boxes_gt.shape[0]
+        cx = (boxes_gt[:, 0] + boxes_gt[:, 2]) * 0.5
+        cy = (boxes_gt[:, 1] + boxes_gt[:, 3]) * 0.5
 
-        cls_gt = cls_all[:, labels].t()                # (G, C)
-        iou = box_iou(box_all, boxes_gt).t()           # (G, C)
+        all_cls, all_obj, all_boxes, all_valid, spans = [], [], [], [], []
+        for si, p in enumerate(preds):
+            Bn, _, H, W = p["cls"].shape
+            stride = strides[si]
+            pts = _grid_points(H, W, stride, device, torch.float32)
+            # identical rule to build_dense_targets: cell inside the box AND
+            # within radius*stride of the centre (FCOS centre sampling)
+            l = pts[:, 0:1] - boxes_gt[None, :, 0]
+            t = pts[:, 1:2] - boxes_gt[None, :, 1]
+            r = boxes_gt[None, :, 2] - pts[:, 0:1]
+            bo = boxes_gt[None, :, 3] - pts[:, 1:2]
+            inside = torch.stack([l, t, r, bo], -1).min(-1).values > 0
+            near = ((pts[:, 0:1] - cx[None, :]).abs() <= radius * stride) & \
+                   ((pts[:, 1:2] - cy[None, :]).abs() <= radius * stride)
+            valid = inside & near                                   # (HW, G)
+            missing = ~valid.any(0)
+            if bool(missing.any()):
+                centre = torch.stack([cx, cy], -1)
+                d2 = (pts[:, None, :] - centre[None]).pow(2).sum(-1)  # (HW, G)
+                nearest = d2.argmin(0)
+                for g in missing.nonzero().flatten().tolist():
+                    valid[int(nearest[g]), g] = True
+            idx = valid.any(1).nonzero().flatten()
+            if idx.numel() > budget:                # safety bound only
+                idx = idx[:budget]
+            if idx.numel() == 0:
+                spans.append((si, idx))
+                continue
+            cls = p["cls"][b].float().reshape(nc, -1).t().sigmoid()[idx]
+            obj = p["obj_o2o"][b].float().reshape(-1).sigmoid()[idx]
+            dist = p["reg"][b].float().reshape(4, -1).t()[idx] * reg_scale * stride
+            all_cls.append(cls)
+            all_obj.append(obj)
+            all_boxes.append(boxes_from_distances(pts[idx], dist))
+            all_valid.append(valid[idx])
+            spans.append((si, idx))
+
+        if not all_cls:
+            continue
+        cls_all = torch.cat(all_cls, 0)                       # (C, nc)
+        obj_all = torch.cat(all_obj, 0)                       # (C,)
+        box_all = torch.cat(all_boxes, 0).clamp(min=0)         # (C, 4)
+        valid_all = torch.cat(all_valid, 0)                   # (C, G)
+
+        cls_gt = cls_all[:, labels].t()                        # (G, C)
+        iou = box_iou(box_all, boxes_gt).t()                   # (G, C)
         cost = (-cls_gt - 0.5 * obj_all[None, :] - 2.0 * iou).detach().float().cpu().numpy()
+        cost = np.where(valid_all.t().cpu().numpy(), cost, forbidden)
 
         rows, cols = linear_sum_assignment(cost)
+        meta = [(si, int(f)) for si, idx in spans for f in idx.tolist()]
         for g, c in zip(rows, cols):
+            if cost[g, c] >= forbidden * 0.5:      # GT had no free valid cell
+                continue
             si, flat = meta[c]
             per_scale[si].append((b, flat, int(g)))
     return per_scale
@@ -269,6 +339,10 @@ class DetectionLoss(nn.Module):
         self.register_buffer("class_weights",
                              torch.tensor(cw, dtype=torch.float32) if cw else torch.ones(self.nc))
         self.o2o_candidates = int(cfg.train.get("o2o_candidates", 1600))
+        # Centre radius (in strides) of the region a GT may be matched to.
+        # Same rule as the dense branch, so the deployed positive sits on the
+        # object and its regression target is within the head's range.
+        self.o2o_radius = float(cfg.train.get("o2o_radius", 1.5))
         self.o2o_neg_ratio = float(cfg.train.get("o2o_neg_ratio", 0.02))
         self.o2o_min_neg = int(cfg.train.get("o2o_min_neg", 2048))
         # How the DEPLOYED objectness branch is supervised.
@@ -367,7 +441,17 @@ class DetectionLoss(nn.Module):
 
         # ---------- one-to-one deployed branch ----------
         matches = hungarian_match(preds, targets, self.strides, self.nc,
-                                  self.reg_scale, self.o2o_candidates)
+                                  self.reg_scale, self.o2o_candidates,
+                                  radius=self.o2o_radius)
+        # Diagnostic (detached, no gradient): the mean distance between the
+        # one-to-one positive cell and the GT centre it is matched to, in
+        # units of its own stride.  This is the number that exposes a broken
+        # assignment: before v0.2.4 it was tens of cells because the candidate
+        # pool came from the model's own score map, which made every
+        # ``box_o2o`` target unlearnable.  With region-restricted matching it
+        # stays around ``o2o_radius`` (1.5) plus half a cell; the training log
+        # prints it as ``match_cell``.
+        match_px = torch.zeros((), device=device)
         for si, p in enumerate(preds):
             stride = self.strides[si]
             B, _, H, W = p["cls"].shape
@@ -422,6 +506,8 @@ class DetectionLoss(nn.Module):
                 losses["cls_o2o"] = losses["cls_o2o"] + \
                     F.binary_cross_entropy_with_logits(cls[b, :, flat], onehot)
                 gt_box = targets[b]["boxes"][g].to(device=device, dtype=torch.float32)
+                match_px = match_px + (grid[flat] -
+                                       (gt_box[:2] + gt_box[2:]) * 0.5).abs().max() / stride
                 pd = reg[b, :, flat] * self.reg_scale * stride
                 pb = boxes_from_distances(grid[flat:flat + 1], pd[None])
                 tgt_d = torch.stack([
@@ -433,6 +519,7 @@ class DetectionLoss(nn.Module):
         n_match = max(1, sum(len(m) for m in matches))
         losses["cls_o2o"] = losses["cls_o2o"] / n_match
         losses["box_o2o"] = losses["box_o2o"] / n_match
+        losses["match_cell"] = match_px / n_match
 
         total = (self.w.cls_o2m * losses["cls_o2m"] + self.w.box_o2m * losses["box_o2m"] +
                  self.w.obj_o2m * losses["obj_o2m"] + self.w.cls_o2o * losses["cls_o2o"] +

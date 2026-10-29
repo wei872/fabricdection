@@ -35,7 +35,7 @@
 | `jingwei/` | 参考实现：主干 / 双尺度头 / 记忆库 / 线性注意力重建 / 安全网 / 损失 / 数据集 / **Unicode 安全图像 I/O** / **安全 checkpoint 加载** / DINO teacher 工具 |
 | `configs/` | `jingwei_n.yaml`（实时优先）、`jingwei_s.yaml`（精度优先）、**`jingwei_p.yaml`（GTX 1660 SUPER 等无 Tensor Core 卡专用）**、`fabric19.yaml`（数据）；均含 `dino:` 阶段 0 配置 |
 | `tools/` | **DINOv2 蒸馏预训练**、训练（启动 / batch 级日志 + **完整断点续训** + **每 epoch 验证指标**）、建库、标定、评估、推理、导出、算力剖析、**真实设备延迟实测** CLI |
-| `tests/test_model.py` | 64 项单元测试（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态注意力前景 / 验证指标 / 未知框） |
+| `tests/test_model.py` | 67 项单元测试（含中文路径 / 非方形图 / 训练日志 / 断点续训 / numpy RNG / 动态注意力前景 / 验证指标 / 未知框） |
 
 > `dataset/dataset.yaml` 保持原样，作为 19 个类别名的真源。
 
@@ -46,7 +46,7 @@
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m unittest discover -s tests -v     # 应输出 OK (64 tests，含验证指标 / 未知缺陷框 / 冷启动门控)
+python -m unittest discover -s tests -v     # 应输出 OK (67 tests，含验证指标 / 未知缺陷框 / 冷启动门控)
 python tools/benchmark.py --both            # 参数量 / MACs / 延迟估算
 ```
 
@@ -105,7 +105,7 @@ python tools/train_normality.py  --cfg configs/jingwei_n.yaml --resume runs/norm
 
 ```
 python -m unittest discover -s tests -v
-Ran 64 tests in ~145 s — OK
+Ran 67 tests in ~130 s — OK
   jingwei_n = 6.36 M / 16.62 G MACs @1280
   jingwei_p = 2.93 M /  8.09 G MACs @1280
   stage 0 DINOv2 distillation + local+global attention fg context = smoke OK

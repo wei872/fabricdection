@@ -29,7 +29,8 @@ from .utils import boxes_from_distances
 class DecoupledHead(nn.Module):
     def __init__(self, c: int, nc: int, width: float, training_branch: bool = True,
                  obj_bias_init: float = -4.0, cls_bias_init: float = -2.0,
-                 obj_from: str = "reg", obj_pred_bias_init: float = -4.0):
+                 obj_from: str = "reg", obj_pred_bias_init: float = -4.0,
+                 obj_residual: bool = True):
         super().__init__()
         h = max(16, int(c * width))
         stem = lambda: nn.Sequential(DWConv(c, h, 3), DWConv(h, h, 3))
@@ -64,9 +65,24 @@ class DecoupledHead(nn.Module):
             # objectness field (obj ~ 0.5 on background).
             self.obj_stem = nn.Sequential(DWConv(h, h, 3), DWConv(h, h, 5))
             src = h
+        # RESIDUAL objectness path (v0.2.4).
+        #
+        # ``obj_stem`` is two depthwise convs -- 3x3 then 5x5 -- i.e. a
+        # low-pass filter over a 7x7 patch.  That is the right receptive field
+        # for "this patch does not look like the fabric around it", but it is
+        # the wrong *operator* for a one-cell peak: the deployed branch is
+        # supervised with ``t_obj = 1`` on a single cell per defect, and a
+        # 5x5 smoothing cannot represent that, so the head satisfies the
+        # conflicting demands by raising the field *uniformly*.  That is the
+        # measured ``obj_mean`` = 0.148 sitting exactly on the 0.15 gate in the
+        # v0.2.3 run (82 boxes/img, 97% background FPs) -- a bias offset, not a
+        # detection.  A residual keeps the context AND the unattenuated local
+        # path, so the 1x1 prediction can keep the peak sharp.  Costs 0 MACs
+        # (one add) and no parameters.
         else:
             self.obj_stem = nn.Identity()
             src = c
+        self.obj_residual = bool(obj_residual) and self.obj_from == "reg"
         self.obj_pred = nn.Conv2d(src, 1, 1)        # one-to-many (train only)
         self.obj_o2o = nn.Conv2d(src, 1, 1)         # one-to-one  (deployed)
         self.fg_pred = nn.Conv2d(h, 1, 1) if training_branch else None
@@ -96,7 +112,12 @@ class DecoupledHead(nn.Module):
 
     def forward(self, x, training: bool = False):
         f_cls, f_reg = self.cls_stem(x), self.reg_stem(x)
-        obj_src = self.obj_stem(f_reg) if self.obj_from == "reg" else x
+        if self.obj_from != "reg":
+            obj_src = x
+        elif self.obj_residual:
+            obj_src = f_reg + self.obj_stem(f_reg)
+        else:
+            obj_src = self.obj_stem(f_reg)
         out = {
             "cls": self.cls_pred(f_cls),
             "reg": F.relu(self.reg_pred(f_reg)),
@@ -134,17 +155,21 @@ class NMSFreeDetect(nn.Module):
         obj_bias_init = float(m.get("obj_bias_init", -4.0))
         cls_bias_init = float(m.get("cls_bias_init", -2.0))
         obj_from = str(m.get("obj_head_from", "reg"))
+        obj_residual = bool(m.get("obj_head_residual", True))
         obj_pred_bias_init = float(m.get("obj_pred_bias_init", -4.0))
         self.obj_bias_init = obj_bias_init
         self.cls_bias_init = cls_bias_init
         self.obj_from = obj_from
+        self.obj_residual = obj_residual
         self.heads = nn.ModuleList([
             DecoupledHead(channels[1], self.nc, m.head_width, m.fg_align,
                           obj_bias_init=obj_bias_init, cls_bias_init=cls_bias_init,
-                          obj_from=obj_from, obj_pred_bias_init=obj_pred_bias_init),
+                          obj_from=obj_from, obj_pred_bias_init=obj_pred_bias_init,
+                          obj_residual=obj_residual),
             DecoupledHead(channels[3], self.nc, m.head_width, m.fg_align,
                           obj_bias_init=obj_bias_init, cls_bias_init=cls_bias_init,
-                          obj_from=obj_from, obj_pred_bias_init=obj_pred_bias_init),
+                          obj_from=obj_from, obj_pred_bias_init=obj_pred_bias_init,
+                          obj_residual=obj_residual),
         ])
         # Diagnostics for "is the deployed gate open?" (see train_detector's
         # val line).  decode() is graph-external, so bookkeeping here is free.

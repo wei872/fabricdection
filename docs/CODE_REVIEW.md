@@ -1,4 +1,4 @@
-# 代码审查与优化建议（v0.2.3）
+# 代码审查与优化建议（v0.2.4）
 
 > 审查对象：`jingwei/`（推理库）+ `tools/`（训练/评估/部署 CLI）+ `tests/` + `configs/`。
 > 审查方式：逐文件静态审查 + 全部单元测试实跑 + 针对性探针脚本（下面每条结论都附复现方式或实测数字）。
@@ -613,8 +613,125 @@ val   epoch   9/150  mAP50=0.0450 precision=0.0033 recall=0.1897 best_f1=0.0867@
 
 ---
 
+## 0.10 专题：precision 第六轮（v0.2.4）——正样本被匹配到了**离缺陷三百多像素**的地方
+
+v0.2.3 上线后的重跑（第 1 个 epoch，权重确认是新表）：`obj_o2o` 份额从 2% 涨到 **29%**，
+部署分支合计 ~54% —— 上一轮的权重确实生效了。但仍然：
+
+```
+epoch 1/150  fg_defect=1.125 ... total=17.712 (37.9s)
+      loss share: obj_o2o=29%  box_o2o=21%  cls_o2m=14%  obj_o2m=12%  box_o2m=12%
+                  fg_context=6%  cls_o2o=4%  fg_align=2%
+val   epoch   1/150  mAP50=0.0000 precision=0.0000 recall=0.0000
+      boxes/img= 82.6  FP: background=8827 localization=261
+      gate: max_score=0.6514 p99=0.5251  obj_max=0.995 obj_mean=0.148 cls_max=0.982
+            cand>0.15=9286 -> out=9090  normal: boxes/img=61.9 max_score=0.651
+```
+
+三个数字就够了：**`obj_mean=0.148`**、阈值 **`0.15`**、**61.9 框/图（正常布面）**。
+objectness 场的平均值正好停在阈值上 —— 这不是"阈值没调好"，是模型的输出
+**在整张布面上就是一个偏置**。
+
+### 根因 1：`obj_mean ≈ 1 / obj_o2o_neg_weight`
+
+`obj_o2o` 是平衡 focal：正样本均值（每图 ~8 个 cell）+ `w_neg × 负样本均值`（~25 600 个 cell）。
+只要正样本那 8 个 cell 无法用特征和背景分开，唯一的解就是**抬高整张图的偏置**——
+两者在权值空间里达到平衡时 `p_eq ≈ K / w_neg`。用 v0.2.3 唯一的实测点标定：
+`w_neg = 2.5 → obj_mean = 0.148`，即 `K ≈ 0.37`；代入阈值 0.15 得 `w_neg ≥ 4.9` 才安全。
+
+**但为什么那 8 个 cell 无法和背景分开？这才是真问题。**
+
+### 根因 2：一对一匹配的正样本**根本不在缺陷上**
+
+`hungarian_match` 的候选池以前是**当前分数图的 top-k**（每个尺度 800 个 cell / 25 600 个）。
+冷启动时这张分数图没有信息量，于是候选池 = 图像左上角的 3%。用仓库里的复现脚本
+（`reg=1.0` 均匀、全图 logit 相同，即"分数图完全无信息"）：
+
+```
+OLD match: scale 0 cell (23,109) -> (188,876) px, GT centre (520,520) => 44.5 cells away
+NEW match: 偏差 ≤ 1.5 cells（o2o_radius）
+```
+
+44.5 个 cell 意味着回归头要从一块普通布面的 cell 输出 **~356 px** 的四个距离。这在特征上
+是不可学的（那块布面不含"缺陷在哪里"的任何信息），最小二乘的最优解就是**数据集平均偏移**，
+于是每个亮着的 cell 都吐出一个"平均尺寸"的框 —— 正是 `background=8827`、
+`localization` 只有 261、precision 0.0000 的来源。同时 `t_obj=1` 被写在普通布面上，
+objectness 分支被正面教成"这里有目标"。
+
+更糟的是它**自我强化**：被错误匹配的 cell 变成高分 cell，于是下一轮仍在候选池里，
+换任何 loss 权重都救不回来（这解释了为什么 v0.2.1→v0.2.3 三轮调权都只改变了
+"框有多少"，没改变"框落在哪"）。
+
+### 根因 3：objectness stem 是 5×5 低通，表示不了单 cell 峰
+
+`obj_stem = DWConv(3×3) → DWConv(5×5)`（v0.2.2 为提高感受野加的）。对"这块布和周围不像"
+是对的，但对**单 cell 目标**是错的算子：7×7 平滑之后，`t_obj=1` 只落在一格上的约束无法满足，
+网络只能用"整体抬高"来折中 —— 根因 1 的偏置解因此成为**唯一可行解**。
+
+### 修复（v0.2.4）
+
+| 改动 | 之前 | 现在 | 理由 |
+|---|---|---|---|
+| **一对一匹配** | 候选池 = 当前分数 top-k（自指） | 每个 GT 只在自己的 **FCOS 中心区域**内选（`train.o2o_radius: 1.5`，与 o2m 同一规则；无可用 cell 时退回最近 cell） | 正样本必须在目标上：回归目标才落在头的动态范围内，`t_obj` 才写在缺陷上。YOLOv10 的 TAL 用同一条规则过滤候选 |
+| **objectness 残差路径** | `obj = 1×1( obj_stem(f_reg) )` | `obj = 1×1( f_reg + obj_stem(f_reg) )` | 保留 9-cell 上下文 **和** 一条不衰减的局部通路，单 cell 峰才表示得出来。0 参数、0 MACs |
+| **背景压力** | `obj_o2o_neg_weight: 2.5`（`p_eq ≈ 0.148`，正压在阈值上） | `6.0`（`p_eq ≈ 0.062`） | 只有单侧压力能降 "背景水位"，不能靠调阈值 |
+| **`obj_o2o` / `box_o2o`** | 10.0 / 2.5 | 8.0 / 3.0 | 背景压力改由 neg_weight 提供后，把份额还给**回归**（框要落在缺陷上靠它） |
+| **`match_cell` 诊断** | 无 | 每个 epoch 打印 `match_cell=`（正样本离 GT 中心的格数，应为 ≤2，>3 告警） | 这个数就是根因 2 的探针；以前它不存在，所以三轮都没发现 |
+| **`best operating point`** | `conf>=0.65 -> P=0.000 R=0.000` | 无任何 TP 时直接写 "no true positive at any threshold" | `best_f1_thr` 在 F1 恒为 0 时退化成"全验证集最高分那一个框"，读起来像阈值 bug |
+
+### 探针证据（head-only，冻结真实 backbone/neck 特征，320²，AdamW 2e-3，300 步）
+
+输入 4 张图：2 张带 3 个缺陷、2 张**无缺陷**；`boxes@…` 是 `decode` 在阈值 0.15 下真正吐出的框数
+（每 50 步采样，同一个种子、同一份特征）。
+
+| 配置 | `score_max` | `p99`（背景电平） | `obj_mean` | boxes@缺陷(3 个) | **boxes@正常(2 张)** |
+|---|---|---|---|---|---|
+| v0.2.1 发布值 | 0.033 | 0.028 | 0.027 | **0** | 0 |
+| bias -1 / neg 2.5 | 0.933 | 0.264 | 0.043 | 4 | 2 |
+| bias -1 / neg 6.0 | 0.954 | 0.375 | 0.042 | 5 | 2 |
+| bias -4 / neg 2.5（v0.2.3 发布值） | 0.992 | 0.102 | 0.018 | 3 | 1 |
+| bias -4 / neg 4.0 | 0.988 | 0.099 | 0.016 | 3 | 0 |
+| **bias -4 / neg 6.0（v0.2.4 发布值）** | 0.985 | **0.057** | 0.016 | **3** | **0** |
+| bias -4 / neg 6.0，**关掉残差路径** | 0.988 | 0.105 | 0.020 | 3 | 0 |
+
+读法：
+
+1. **v0.2.1 那行复现了用户的原始日志**：300 步后 `score_max` 只有 0.033，一个框也吐不出来
+   （正是 `boxes/img=0.0`、precision 全 0 的那次）。
+2. 一旦 objectness 读 reg stem（v0.2.2 的正解），门就开到 0.98+，而且
+   **3 个缺陷 = 3 个框**（NMS-free 的性质成立）。
+3. 背景电平只被两件事影响：`obj_o2o_neg_weight`（2.5 → 0.102、4.0 → 0.099、6.0 → 0.057，单调）
+   和**残差路径**（同权重下 0.105 → 0.057，约 2×）。这两个就是本节的两处主改。
+4. 注意"p99 低"本身不是健康：v0.2.1 的 p99 最低（0.028），因为门根本没开。
+   要看 `score_max` 与 `p99` 的**差距**，以及正常图上的框数。
+5. 表里 `obj_mean` 只有 0.016–0.02（真实训练里是 0.148）：这是冻结的**随机**特征，
+   量级不可直接比，可比的是相对排序；真跑时 `obj_mean` 必须明显低于 0.15。
+6. `obj_bias_init` 仍是 **-4.0**（§0.8 曾根据 neck-1×1 的旧探针把它改成 -1.0，
+   在那个 head 上"能开"确实是 -1 的门槛；换成 reg stem 之后 -4 反而场更尖：
+   p99 0.102 vs 0.264）。**不要**为了让门早开去抬 bias。
+
+### 重训时该看的三行
+
+| 日志 | 之前 | 期望 |
+|---|---|---|
+| `match_cell=` | 无（旧匹配在 40+ cells） | ≤ 2，且稳定 |
+| `gate: obj_mean` | 0.148（= 阈值） | 0.02–0.06；`p99` 与 `max_score` 拉开 |
+| `normal: boxes/img` | 61.9 | 逐 epoch 下降；它先动，precision 后动 |
+
+> ⚠️ 旧 checkpoint 不兼容（`obj_o2o` 的输入通道 `c → h`、新增 `obj_stem`），
+> stage A 必须从头训；`--resume` 会打印 shape mismatch 清单。
+
+回归测试：`test_66`（匹配的正样本必须落在 `o2o_radius` 内，且 `match_cell` 把它报出来）、
+`test_67`（残差路径让 1×1 在 5×5 被清零后仍非恒定）、
+`test_68`（`K/neg_weight < 0.5 × 阈值`、`obj_head_residual` 为真、`o2o_radius ≤ 2`、两个阈值相等）。
+
+---
+
 ## 1. 本轮已修复（按严重程度；0.5 / 0.6 / 0.7 三节专列的 precision 修复也在此列）
 
+> v0.2.4 的第六轮（**一对一匹配只在 GT 中心区域内选正样本**、objectness 残差路径、
+> 背景压力 2.5→6.0、`match_cell` 诊断）见 **§0.10**，回归测试 `test_66`–`test_68`。
+>
 > v0.2.3 的第五轮（部署分支的 loss 份额、正常帧作为纯负样本、`loss share` 告警）见 **§0.9**，
 > 回归测试 `test_64`–`test_65`。
 >
@@ -960,10 +1077,25 @@ configs/*.yaml         loss_weights 重分配（obj_o2o 6.0 -> 10.0，obj_o2m 0.
 tests/test_model.py    +2 项回归（64–65）
 ```
 
+v0.2.4（第 6 轮，§0.10）增量：
+
+```
+jingwei/losses.py      hungarian_match：候选池从"当前分数 top-k"改为"每个 GT 的 FCOS 中心区域"
+                       （train.o2o_radius，默认 1.5 stride；无有效 cell 时退回最近 cell）
+                       新增 detached 诊断 match_cell（正样本离 GT 中心的格数，>3 时 train 告警）
+jingwei/head.py        obj_residual：obj_src = f_reg + obj_stem(f_reg)，单 cell 峰可表示
+                       （model.obj_head_residual，0 参数 / 0 MACs，可 A/B）
+configs/*.yaml         obj_o2o_neg_weight 2.5 -> 6.0（背景水位 p ≈ K/w，2.5 时实测 0.148 = 阈值）
+                       obj_o2o 10 -> 8、box_o2o 2.5 -> 3.0（把份额还给回归）；新增 o2o_radius
+tools/train_detector.py 每 epoch 的 `match_cell=`；匹配健康告警；
+                       F1 恒为 0 时不再把"全验证集最高分那个框"当成 operating point
+tests/test_model.py    +3 项回归（66–68）；test_50 的对照改用实际匹配到的 cell
+```
+
 ## 4. 复现命令
 
 ```bash
-# 全量测试（本机 64 项；装 requirements-dev.txt 后 onnx 用例不再 skip）
+# 全量测试（本机 67 项；装 requirements-dev.txt 后 onnx 用例不再 skip）
 python -m unittest discover -s tests -v
 
 # P0-1：融合门控是否破坏 0.5 标定点

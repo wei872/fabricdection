@@ -166,9 +166,11 @@ python tools/export.py    --cfg configs/jingwei_n.yaml --ckpt runs/bank/memory_b
   | `train.obj_quality_floor` | 0.0 | 质量目标下限。目标是 `w·(qual/qmax)+(1-w)`、`w=qmax`：回归没学时自动恒为 1.0，不需要再垫底线；设成 0.5 会把"定位很差的匹配"教成 objectness 0.5 |
   | `train.cls_quality_target` | false | true 时分类目标是 `one-hot × 质量`，冷启动会把缺陷的分类学成 ~0.02 |
   | `train.obj_o2o_mode / gamma / alpha` | focal / 2.0 / 0.5 | 正样本只占 0.1%–1%，alpha=0.25 是在压前景 |
-  | `train.obj_o2o_neg_weight` | 2.5 | 背景项权重。平衡归一化给正负各 50% 份额，等于"输出 0.5 不亏"；>1 才有人为压低背景的梯度。**这是背景电平（`gate: p99`）的直接旋钮** |
+  | `train.obj_o2o_neg_weight` | 6.0 | 背景项权重，**背景电平（`gate: p99`）的直接旋钮**。实测（300 步 head-only 探针）：2.5 → p99 0.102、4.0 → 0.099、6.0 → **0.057**，单调。2.5 的时候真实训练跑出 `obj_mean=0.148`，正好压在阈值 0.15 上（= 82 框/图、precision 0.3%，见 CODE_REVIEW §0.10）；不要再往上调，正样本侧的压力由 `loss_weights.obj_o2o` 独立控制 |
   | `train.obj_o2m_neg_weight` / `cls_o2m_neg_weight` | 2.0 / 2.0 | 同上，作用在 o2m 分支与分类上；`score = obj·cls` 是乘积，两个因子都要低 |
-  | `loss_weights.obj_o2o` | 10.0 | **门控分支的份额**。o2m 两项是训练专用的辅助分支，推理时一行都不跑；实测旧权重下它们拿走了 62% 的梯度、`obj_o2o` 只剩 2%，背景 objectness 于是永远压不下去。发布值让部署分支（`obj_o2o+cls_o2o+box_o2o`）占 ~58%（不含 fg 项） |
+  | `loss_weights.obj_o2o` / `box_o2o` | 8.0 / 3.0 | **部署分支的份额**。o2m 两项是训练专用的辅助分支，推理时一行都不跑；实测旧权重下它们拿走了 62% 的梯度、`obj_o2o` 只剩 2%。发布值让部署分支（`obj_o2o+cls_o2o+box_o2o`）占 ~55%。注意：objectness 一旦学会（负样本 p≈0、正样本 p≈1），`obj_o2o` 的**数值**会缩到 0.05 以下，份额随之下降是**正常的**——判断标准是 `gate: p99` 与 `normal: boxes/img`，不是份额 |
+  | `train.o2o_radius` | 1.5 | 一对一（部署分支）匹配时，每个 GT 允许被匹配到的**中心区域**半径（单位 = stride，与 o2m 的 FCOS 中心采样同一规则）。它保证正样本落在目标上——回归要从 cell 中心输出四个距离，离目标几百像素的 cell 上这个目标是学不出来的（旧实现从当前分数 top-k 里选，冷启动时实测偏 44.5 个 cell，见 CODE_REVIEW §0.10）。每个 epoch 打印的 `match_cell=` 应 ≤2 |
+  | `model.obj_head_residual` | true | objectness 走 `f_reg + DWConv(3×3)→DWConv(5×5)` 残差路径。纯 5×5 低通表示不了单 cell 峰，网络只能用"整体抬高水位"来满足正样本（同权重下 p99 0.105 → 0.057）。0 参数、0 MACs；设 false 只用于 A/B |
   | `train.normal_image_frac` | 0.25 | 每个 batch 里来自 `normaltrain` 的**无框**图比例（`--normal-frac` 可覆盖）。阶段 A 以前一张正常布都没见过，"整帧无目标"是分布外输入——这是降 `normal_fpr` 最便宜的一招；数据集 yaml 没有 `normaltrain` 时会打印告警并跳过 |
 
 - 每个 epoch 的 val 块多两行：
@@ -273,7 +275,7 @@ python tools/train_normality.py --cfg configs/jingwei_n.yaml \
 ## 4. 快速自检（无真实数据）
 
 ```bash
-python -m unittest discover -s tests -v                 # 64 项，约 145 s（含验证指标 / 未知缺陷框 / 冷启动门控）
+python -m unittest discover -s tests -v                 # 67 项，约 130 s（含验证指标 / 未知缺陷框 / 冷启动门控）
 python tools/benchmark.py --all                         # p/n/s 参数量 / MACs / 延迟估算
 python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both  # 在你的 GPU 上实测
 python tools/train_detector.py   --smoke 2 --epochs 1 --batch 1 --device cpu --log-interval 1
@@ -292,7 +294,8 @@ python tools/export.py --check --out runs/export/jingwei_n.onnx
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | val 一直 `precision=0 recall=0 boxes/img=0.0`，且 `gate: max_score < conf` | 部署门没开：objectness 分支没有可用的特征（`obj_head_from: neck`）或质量目标塌陷 | v0.2.1/0.2.2 已修（[CODE_REVIEW.md §0.7](CODE_REVIEW.md) / §0.8）；确认 `model.obj_head_from: reg` 后重训。v0.2.2 之前保存的 checkpoint 与新 objectness 头**形状不同**：weight-only warm start（`dino_init.pt`）会自动跳过那 4 个张量并打印报告，完整 checkpoint 则降级为 weight-only（optimizer/LR schedule 重置） |
-| `boxes/img` 几十上百、`normal_fpr=1.0000`、`gate: max_score≈1` 但 `p99≈0.5`（v0.2.2 之后仍然如此） | 背景电平太高：`score = obj·cls` 在每个 cell 都过阈值 | 看 `gate: p99`；调 `train.obj_o2o_neg_weight`（2.5→4）、`obj_o2m_neg_weight` / `cls_o2m_neg_weight`；**不要**调高 `model.obj_bias_init`（那正是病因） |
+| `boxes/img` 几十上百、`normal_fpr=1.0000`、`gate: max_score≈1` 但 `p99≈0.5` | 背景电平太高：`score = obj·cls` 在每个 cell 都过阈值 | 看 `gate: p99` 和 `gate: obj_mean`。v0.2.4 起先确认 `match_cell≤2`（匹配坏了会同时抬高水位，见 §0.10），再调 `train.obj_o2o_neg_weight`（6.0）与 `obj_o2m_neg_weight` / `cls_o2m_neg_weight`；**不要**调高 `model.obj_bias_init` |
+| `match_cell` > 3（每个 epoch 一行的 `match_cell=`，或在 `loss share` 行上方告警） | 一对一匹配把正样本挂到了离缺陷很远的 cell 上：回归目标不可学、`t_obj=1` 被写在布面上 | 检查 `train.o2o_radius`（默认 1.5）：调大只会让问题回来；确认没有本地改动覆盖了 `jingwei/losses.py` 的匹配规则（§0.10） |
 | `precision`（下发阈值处）很低，但 `-> P=… R=…` 很高 | 阈值没标定，不是模型差 | 跑 `tools/calibrate_fusion.py`，把 `fusion.final_score_thresh` 回填（decode 用的是同一个值） |
 | val 一直 `precision=0` 但 `gate: max_score ≫ conf` | 框出来了但都是错框 | 跑 `tools/diagnose_precision.py` 看 FP 分解（duplicate / wrong_class / localization / background），再按 [CODE_REVIEW.md §0.5/§0.6](CODE_REVIEW.md) 的表格处理 |
 | `loss share` 里 `box_o2m` 长期 >60% | v0.2.1 之前像素 L1 没有归一化，量级随输入分辨率线性变化 | 已改成按图像边长归一化；若仍 >60%，说明 GT 框质量差或 `box_o2m` 权重过高 |
