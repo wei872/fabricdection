@@ -31,6 +31,7 @@ from export import ExportWrapper
 class TestRuntime(unittest.TestCase):
     def cfg(self):
         cfg = load_config(ROOT / "configs/jingwei_dinov2.yaml")
+        cfg.unknown.enabled = False
         cfg.input_size = [128, 128]
         cfg.model.dino_input_size = 56
         return cfg
@@ -216,7 +217,7 @@ class TestRuntime(unittest.TestCase):
                 load_config(path)
 
     def test_all_public_help_commands_work_without_model_download(self):
-        for script in ("train_detector", "evaluate", "predict", "bench_device", "export"):
+        for script in ("train_detector", "evaluate", "predict", "bench_device", "export", "calibrate_anomaly"):
             result = subprocess.run([sys.executable, f"tools/{script}.py", "--help"],
                                     cwd=ROOT, capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)

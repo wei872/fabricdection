@@ -19,7 +19,7 @@ from _common import (ROOT, SyntheticFabricDataset, collect_rng_state, data_paths
                      make_dataset, resolve, resume_checkpoint, save_checkpoint,
                      set_global_seed, subset_indices)
 from evaluate import validate_detector
-from jingwei.data import collate, make_worker_init_fn
+from jingwei.data import MixedFabricDataset, collate, make_worker_init_fn
 from jingwei.utils import count_parameters
 
 
@@ -35,8 +35,8 @@ def main():
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--prefetch", type=int, default=2,
                     help="batches prefetched per worker (0 uses the torch default)")
-    ap.add_argument("--amp", choices=["off", "bf16", "fp16"], default="bf16",
-                    help="mixed precision: bf16 (default on CUDA, no scaler) / "
+    ap.add_argument("--amp", choices=["off", "bf16", "fp16"], default="off",
+                    help="mixed precision: bf16 (supported GPUs only, no scaler) / "
                          "off / fp16")
     ap.add_argument("--smoke", type=int, default=0, help="synthetic images for a dry run")
     ap.add_argument("--no-augment", action="store_true",
@@ -91,6 +91,8 @@ def main():
     size = int(cfg.input_size[0])
 
     use_amp = args.amp != "off" and str(args.device).startswith("cuda")
+    if use_amp and args.amp == "bf16" and not torch.cuda.is_bf16_supported():
+        raise ValueError("BF16 is not supported on this GPU (including GTX 1660); use --amp off or fp16")
     amp_dtype = torch.bfloat16 if args.amp == "bf16" else torch.float16
     scale_enabled = use_amp and args.amp == "fp16"
     # torch.amp.GradScaler was added after the supported torch 2.0/2.2 releases.
@@ -109,11 +111,20 @@ def main():
                                            [600., 700., 980., 740.]])
                 d["boxes"] *= size / 1280.0
                 d["labels"] = torch.tensor([1, 17])
+                d["is_normal"] = (i % 2 == 0)
+                if d["is_normal"]:
+                    d.update(boxes=torch.zeros(0, 4), labels=torch.zeros(0, dtype=torch.long))
                 return d
         train_ds = Wrapped()
     else:
         train_ds = make_dataset(resolve(paths["train"]), size, has_labels=True, augment=not args.no_augment,
                                 seed=args.seed)
+        if paths.get("normaltrain"):
+            normals = make_dataset(resolve(paths["normaltrain"]), size, has_labels=False,
+                                   augment=not args.no_augment, seed=args.seed)
+            train_ds = MixedFabricDataset(train_ds, normals, float(cfg.train.get("normal_ratio", .5)))
+        elif model.novelty is not None:
+            raise ValueError("unknown.enabled requires explicit clean normaltrain images in the data YAML")
 
     nw = 0 if args.smoke else max(0, args.num_workers)
     loader_kw = dict(num_workers=nw, collate_fn=collate, drop_last=False,
@@ -253,6 +264,9 @@ def main():
         log(f"checkpoint already reached epoch {start_epoch}/{epochs}; nothing to do")
         return
 
+    if model.novelty is not None:
+        log("Unknown novelty: shared frozen ViT prototypes; calibrate AFTER training on normalcal. "
+            "Unknown detections are inactive until calibrated.")
     global_t0 = time.time()
     global_it0 = it
     check_every = max(1, args.log_interval or 100)
@@ -270,7 +284,9 @@ def main():
                        for b, l in zip(batch_data["boxes"], batch_data["labels"])]
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                result = model(images, targets=targets)
+                normal_mask = (torch.tensor(batch_data["is_normal"], dtype=torch.bool, device=args.device)
+                               if "is_normal" in batch_data else None)
+                result = model(images, targets=targets, normal_mask=normal_mask)
                 loss = result["losses"]["total"]
             do_log = bool(args.log_interval and (it == 0 or
                                                  (bi + 1) % args.log_interval == 0 or

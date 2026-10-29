@@ -2,8 +2,8 @@
 # dino_input_size must be a multiple of 14. Encoder remains at inference.
 name: jingwei_dinov2
 input_size:
-- 1280
-- 1280
+- 640
+- 640
 data:
   nc: 19
   dataset_yaml: configs/fabric19.yaml
@@ -29,16 +29,16 @@ data:
   - 飘絮
 model:
   backbone: dinov2
-  dino_name: dinov2_vitb14
+  dino_name: dinov2_vits14
   dino_repo: facebookresearch/dinov2
   dino_weights: null
   dino_pretrained: true
   dino_freeze: true
-  dino_input_size: 448
+  dino_input_size: 224
   dino_lr_mult: 0.1
   reg_activation: softplus
   detector_nms_iou: 0.5
-  width: 0.75
+  width: 0.5
   depth: 1.0
   detail_ch: 48
   p3_ch: 96
@@ -49,7 +49,7 @@ model:
   dwconv: true
   balance_p3: 1.0
   balance_p5: 1.0
-  top_k: 150
+  top_k: 64
   score_thresh: 0.05
   reg_scale: 1.0
   fg_align: true
@@ -72,6 +72,14 @@ train:
   detector_batch: 2
   detector_lr: 0.0005
   weight_decay: 0.0005
+  normal_ratio: 0.5
 inference:
   final_score_thresh: 0.15
   large_area_ratio: 0.001
+# Shared-feature novelty is calibrated separately, not an extra ViT pass.
+unknown:
+  enabled: true
+  prototypes: 32
+  momentum: 0.95
+  min_patches: 1
+  max_regions: 8

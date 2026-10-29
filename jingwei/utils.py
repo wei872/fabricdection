@@ -95,13 +95,20 @@ def classwise_nms(boxes, scores, labels, iou_threshold=0.5):
     Optional class-aware detector postprocessing.
     Inputs are already bounded by detector top_k. Returns kept tensor indices.
     """
-    order = scores.argsort(descending=True)
-    keep = []
-    while order.numel():
-        i = order[0]
-        keep.append(i)
-        rest = order[1:]
-        overlap = box_iou(boxes[i].unsqueeze(0), boxes[rest])[0]
-        suppress = (overlap > iou_threshold) & (labels[rest] == labels[i])
-        order = rest[~suppress]
-    return torch.stack(keep) if keep else labels.new_empty((0,))
+    if not len(boxes):
+        return labels.new_empty((0,))
+    # A single small host transfer + native OpenCV greedy NMS avoids a Python
+    # loop with one CUDA synchronization per candidate on older GPUs.
+    import cv2
+    import numpy as np
+    packed = torch.cat((boxes, scores[:, None], labels[:, None].to(boxes.dtype)), 1).float().cpu().numpy()
+    xywh = packed[:, :4].copy()
+    xywh[:, 2:] -= xywh[:, :2]
+    if hasattr(cv2.dnn, "NMSBoxesBatched"):
+        kept = cv2.dnn.NMSBoxesBatched(xywh.tolist(), packed[:, 4].tolist(),
+                                      packed[:, 5].astype(int).tolist(), 0., iou_threshold)
+    else:
+        offset = packed[:, 5] * (np.abs(packed[:, :4]).max() * 2 + 1)
+        xywh[:, :2] += offset[:, None]
+        kept = cv2.dnn.NMSBoxes(xywh.tolist(), packed[:, 4].tolist(), 0., iou_threshold)
+    return torch.as_tensor(np.asarray(kept).reshape(-1), dtype=torch.long, device=labels.device)

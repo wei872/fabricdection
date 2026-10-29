@@ -26,6 +26,7 @@ from helpers import FakeEncoder
 class TestDirectDINO(unittest.TestCase):
     def cfg(self):
         cfg = load_config(ROOT / "configs/jingwei_dinov2.yaml")
+        cfg.unknown.enabled = False
         cfg.input_size = [128, 128]
         cfg.model.dino_input_size = 56
         return cfg
@@ -34,7 +35,7 @@ class TestDirectDINO(unittest.TestCase):
         cfg = self.cfg()
         with patch("torch.hub.load", return_value=FakeEncoder()) as hub:
             backbone = DINOv2Backbone(cfg)
-        hub.assert_called_once_with("facebookresearch/dinov2", "dinov2_vitb14",
+        hub.assert_called_once_with("facebookresearch/dinov2", "dinov2_vits14",
                                     source="github", pretrained=True)
         backbone.train()
         self.assertFalse(backbone.encoder.training)
@@ -166,7 +167,7 @@ class Fake(nn.Module):
     def get_intermediate_layers(self, x, n, reshape):
         f = self.proj(x)
         return tuple(f for _ in n)
-def dinov2_vitb14(pretrained=True):
+def dinov2_vits14(pretrained=True):
     print("FIXTURE pretrained=" + str(pretrained))
     return Fake()
 ''', encoding="utf-8")

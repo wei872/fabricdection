@@ -1,6 +1,10 @@
-# Edit these paths. normalval is optional and used ONLY for FPR evaluation.
+# Edit paths. Split by physical roll/fabric/lighting, NOT augmented images.
+# normalcal MUST be disjoint from normaltrain and final normalval.
 train: D:/tyhn/yolo/dataset/source5_augmenteds/images/train
 val: D:/tyhn/yolo/dataset/source5_augmenteds/images/val
+normaltrain: D:/tyhn/yolo/dataset/source5_augmenteds/normal/images/train
+normalcal: null  # Set to an independent normal calibration directory
+unknownval: null  # Optional held-out unknown-defect images with YOLO boxes
 normalval: D:/tyhn/yolo/dataset/source5_augmenteds/normal/images/val
 nc: 19
 names:

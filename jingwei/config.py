@@ -62,6 +62,20 @@ def load_config(path: str | Path) -> Cfg:
     for section, key in (("model", "score_thresh"), ("inference", "final_score_thresh")):
         if not 0 <= float(raw[section][key]) <= 1:
             raise ValueError(f"{section}.{key} must be between 0 and 1")
+    u = raw.get("unknown", {})
+    if not isinstance(u, dict):
+        raise ValueError("unknown must be a mapping")
+    if u.get("enabled", False):
+        if not raw["model"].get("dino_freeze", True):
+            raise ValueError("Shared normal prototypes require dino_freeze=true")
+        for key, default in (("prototypes", 32), ("min_patches", 1), ("max_regions", 8)):
+            value = u.get(key, default)
+            if not isinstance(value, int) or not 1 <= value <= 256:
+                raise ValueError(f"unknown.{key} must be an integer between 1 and 256")
+        if not 0 <= float(u.get("momentum", .95)) < 1:
+            raise ValueError("unknown.momentum must be in [0,1)")
+    if not 0 < float(raw["train"].get("normal_ratio", .5)) < 1:
+        raise ValueError("train.normal_ratio must be between 0 and 1")
     cfg = Cfg(raw)
     cfg["_config_path"] = str(path)
     return cfg

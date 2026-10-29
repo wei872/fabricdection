@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from _common import (data_paths, load_model,
+from _common import (configure_inference, data_paths, load_model,
                      make_dataset, resolve, subset_indices)
 from jingwei.data import collate, make_worker_init_fn
 from jingwei.image_io import ascii_safe, console_safe
@@ -90,7 +90,7 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
     fp_breakdown = {"duplicate_same_gt": 0, "wrong_class": 0,
                     "localization": 0, "background": 0}
     for batch in loader:
-        dets = model(batch["image"].to(device))
+        dets = model(batch["image"].to(device=device, dtype=next(model.parameters(), batch["image"]).dtype))
         for b, d in enumerate(dets):
             gt_boxes = batch["boxes"][b].to(device)
             gt_labels = batch["labels"][b].to(device)
@@ -177,12 +177,14 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
 
 @torch.no_grad()
 def normal_fpr(model, loader, device):
-    n = fp = 0
+    n = fp = known_fp = unknown_fp = 0
     for batch in loader:
-        dets = model(batch["image"].to(device))
+        dets = model(batch["image"].to(device=device, dtype=next(model.parameters(), batch["image"]).dtype))
         n += len(dets)
-        fp += sum(len(d["boxes"]) > 0 for d in dets)
-    return fp / max(1, n), fp, n
+        known_fp += sum(len(d["boxes"]) > 0 for d in dets)
+        unknown_fp += sum(len(d.get("unknown_boxes", [])) > 0 for d in dets)
+        fp += sum(len(d["boxes"]) > 0 or len(d.get("unknown_boxes", [])) > 0 for d in dets)
+    return fp / max(1, n), fp, n, known_fp, unknown_fp
 
 
 @torch.no_grad()
@@ -200,10 +202,15 @@ def validate_detector(model, val_loader, norm_loader, device, cfg,
                                   pr_thresholds=pr_thresholds)
     rec = pr.pop("large_recall", 0.0)
     if norm_loader is not None:
-        fpr, nfp, nn = normal_fpr(model, norm_loader, device)
+        fpr, nfp, nn, known_fp, unknown_fp = normal_fpr(model, norm_loader, device)
     else:
-        fpr, nfp, nn = float("nan"), 0, 0
+        fpr, nfp, nn, known_fp, unknown_fp = float("nan"), 0, 0, 0, 0
+    novelty = getattr(model, "novelty", None)
+    unknown_active = novelty is not None and bool(novelty.calibrated) and not getattr(model, "known_only", False)
     out = {
+        "unknown_active": unknown_active,
+        "normal_known_fpr": known_fp / nn if nn else float("nan"),
+        "normal_unknown_fpr": unknown_fp / nn if nn and unknown_active else float("nan"),
         "mAP50": float(map50),
         "AP50": [float(a) for a in aps],
         "large_recall": float(rec),
@@ -217,6 +224,39 @@ def validate_detector(model, val_loader, norm_loader, device, cfg,
     return out
 
 
+@torch.no_grad()
+def evaluate_unknown(model, loader, device, iou_thr=.5):
+    """Held-out novel categories only; labels ignored, one-to-one box matching."""
+    tp = fp = gt_count = images = image_hits = 0
+    for batch in loader:
+        detections = model(batch["image"].to(device=device, dtype=next(model.parameters(), batch["image"]).dtype))
+        for i, det in enumerate(detections):
+            gt = batch["boxes"][i].to(device)
+            boxes = det.get("unknown_boxes", gt.new_empty(0, 4))
+            scores = det.get("unknown_scores", gt.new_empty(0))
+            gt_count += len(gt)
+            images += int(len(gt) > 0)
+            used = torch.zeros(len(gt), device=device, dtype=torch.bool)
+            hit = False
+            for j in scores.argsort(descending=True).tolist():
+                if len(gt):
+                    overlap = box_iou(boxes[j:j + 1], gt)[0]
+                    overlap[used] = -1
+                    match = int(overlap.argmax())
+                    if overlap[match] >= iou_thr:
+                        used[match] = True
+                        tp += 1
+                        hit = True
+                        continue
+                fp += 1
+            image_hits += int(hit)
+    return dict(tp=tp, fp=fp, gt=gt_count,
+                box_precision=tp / max(tp + fp, 1),
+                box_recall=tp / gt_count if gt_count else float("nan"),
+                positive_images=images,
+                image_localization_recall=image_hits / images if images else float("nan"))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--cfg", default="configs/jingwei_dinov2.yaml")
@@ -226,6 +266,8 @@ def main():
     ap.add_argument("--max-val", type=int, default=0)
     ap.add_argument("--normal-max", type=int, default=0)
     ap.add_argument("--subset-seed", type=int, default=0)
+    ap.add_argument("--known-only", action="store_true")
+    ap.add_argument("--half", action="store_true", help="CUDA FP16, must match calibration")
     ap.add_argument("--diag", action="store_true")
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--workers", type=int, default=2)
@@ -233,7 +275,7 @@ def main():
     ap.add_argument("--val-iou", type=float, default=0.5)
     args = ap.parse_args()
     model, cfg = load_model(args.cfg, args.ckpt, args.device)
-    model.eval()
+    configure_inference(model, args.known_only, args.half)
     paths = data_paths(cfg, args.data)
     size = int(cfg.input_size[0])
     kw = dict(num_workers=max(0, args.workers), collate_fn=collate, pin_memory=True)
@@ -263,6 +305,13 @@ def main():
         print("normal FPR: N/A (normalval not configured)")
     else:
         print(f"normal FPR: {m['normal_fpr']:.4f} ({m['normal_fp']}/{m['normal_n']})")
+    print(f"normal known/unknown FPR: {m['normal_known_fpr']:.4f} / {m['normal_unknown_fpr']:.4f}")
+    print(f"unknown active: {m['unknown_active']}")
+    if paths.get("unknownval") and m["unknown_active"]:
+        uv = loader("unknownval", True, args.max_val, args.subset_seed)
+        print("held-out unknown localization:", evaluate_unknown(model, uv, args.device, args.val_iou))
+    else:
+        print("held-out unknown localization: N/A (requires calibrated branch and unknownval YOLO boxes)")
     if args.diag:
         for t, v in sorted(m['pr_at'].items()):
             print(f"conf {t:.2f}: P={v['precision']:.4f} R={v['recall']:.4f} "

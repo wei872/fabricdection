@@ -143,6 +143,13 @@ def fabric_photometric(img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
             sl[:, -band:min(w, -band + 2), :] *= 0.65
             x[:, -band:, :] = sl.astype(np.uint8)
 
+    if rng.random() < .4:
+        gamma = rng.uniform(.65, 1.5)
+        lut = np.clip(255 * (np.arange(256) / 255.) ** gamma, 0, 255).astype(np.uint8)
+        x = cv2.LUT(x, lut)
+    if rng.random() < .3:
+        gain = rng.uniform(.85, 1.15, (1, 1, 3)).astype(np.float32)
+        x = np.clip(x.astype(np.float32) * gain, 0, 255).astype(np.uint8)
     return np.ascontiguousarray(x)
 
 
@@ -173,17 +180,7 @@ def geometric_augment(img: np.ndarray, boxes: np.ndarray, rng,
             h, w = w, h                     # rot90 swaps width/height
         h, w = img.shape[:2]
 
-    # aniso-resize changes thread density along warp/weft, boxes scale with it
-    if anisotropic and rng.random() < 0.3:
-        sx, sy = rng.uniform(0.85, 1.18), rng.uniform(0.85, 1.18)
-        nw, nh = int(w * sx), int(h * sy)
-        img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
-        if len(boxes):
-            boxes[:, [0, 2]] *= sx
-            boxes[:, [1, 3]] *= sy
-        h, w = img.shape[:2]
-
-    # final resize to the fixed 1280x1280 network input
+    # final resize to fixed detector input
     fx, fy = img_size / w, img_size / h
     img = cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
     if len(boxes):
@@ -191,6 +188,19 @@ def geometric_augment(img: np.ndarray, boxes: np.ndarray, rng,
         boxes[:, [1, 3]] *= fy
         boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, img_size)
         boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, img_size)
+    # Apply AFTER final resize, otherwise scale changes cancel out. Constant
+    # padding avoids reflecting/tessellating defects without copying their GT.
+    if anisotropic and rng.random() < .5:
+        sx, sy = rng.uniform(.75, 1.4, 2)
+        tx, ty = (1 - sx) * img_size / 2, (1 - sy) * img_size / 2
+        matrix = np.array([[sx, 0, tx], [0, sy, ty]], dtype=np.float32)
+        fill = tuple(float(v) for v in np.median(img.reshape(-1, 3), axis=0))
+        img = cv2.warpAffine(img, matrix, (img_size, img_size),
+                             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                             borderValue=fill)
+        if len(boxes):
+            boxes[:, [0, 2]] = (boxes[:, [0, 2]] * sx + tx).clip(0, img_size)
+            boxes[:, [1, 3]] = (boxes[:, [1, 3]] * sy + ty).clip(0, img_size)
     return img, boxes
 
 
@@ -200,6 +210,7 @@ def geometric_augment(img: np.ndarray, boxes: np.ndarray, rng,
 class YOLODefectDataset(Dataset):
     def __init__(self, images_dir, labels_dir=None, img_size=1280, augment=True, seed=0):
         self.img_size, self.augment = img_size, augment
+        self.images_dir = Path(images_dir)
         self.files = list_images(images_dir)
         if labels_dir is None:
             labels_dir = infer_labels_dir(images_dir)
@@ -212,8 +223,8 @@ class YOLODefectDataset(Dataset):
         return len(self.files)
 
     def _label_path(self, img_path):
-        stem = Path(img_path).stem
-        return os.path.join(self.labels_dir, stem + ".txt")
+        relative = Path(img_path).relative_to(self.images_dir).with_suffix(".txt")
+        return str(Path(self.labels_dir) / relative)
 
     def _load_label(self, path, w, h):
         boxes, labels = [], []
@@ -250,6 +261,8 @@ class YOLODefectDataset(Dataset):
                 boxes[:, [1, 3]] *= self.img_size / h
             img = cv2.resize(img, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
 
+        valid = (boxes[:, 2] - boxes[:, 0] > 1) & (boxes[:, 3] - boxes[:, 1] > 1)
+        boxes, labels = boxes[valid], labels[valid]
         return dict(image=to_chw_float(img),
                     boxes=torch.from_numpy(boxes).float(),
                     labels=torch.from_numpy(labels).long(),
@@ -287,7 +300,42 @@ class NormalImageDataset(Dataset):
 
 def collate(batch):
     out = {"image": torch.stack([b["image"] for b in batch], 0)}
-    for key in ("boxes", "labels", "path"):
+    for key in ("boxes", "labels", "path", "is_normal"):
         if key in batch[0]:
             out[key] = [b[key] for b in batch]
     return out
+
+
+class MixedFabricDataset(Dataset):
+    """Fixed per-epoch normal ratio; explicit clean normal images only.
+
+    Missing/empty defect labels are NOT automatically trusted as normal texture.
+    One shared RNG preserves checkpoint/worker seeding for both subdatasets.
+    """
+    def __init__(self, defects, normals, normal_ratio=.5):
+        if not 0 < normal_ratio < 1:
+            raise ValueError("normal_ratio must be between 0 and 1")
+        self.defects, self.normals = defects, normals
+        self.normal_count = max(1, round(len(defects) * normal_ratio / (1 - normal_ratio)))
+        self.rng = defects.rng
+
+    @property
+    def rng(self):
+        return self.defects.rng
+
+    @rng.setter
+    def rng(self, rng):
+        self.defects.rng = self.normals.rng = rng
+
+    def __len__(self):
+        return len(self.defects) + self.normal_count
+
+    def __getitem__(self, index):
+        normal = index >= len(self.defects)
+        if normal:
+            item = dict(self.normals[int(self.rng.integers(len(self.normals)))])
+            item.update(boxes=torch.zeros(0, 4), labels=torch.zeros(0, dtype=torch.long))
+        else:
+            item = dict(self.defects[index])
+        item["is_normal"] = normal
+        return item

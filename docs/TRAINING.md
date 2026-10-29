@@ -1,161 +1,148 @@
-# DINOv2 检测训练手册
+# ViT-S：已知检测、正常学习与未知疵点
 
-所有命令在仓库根目录执行。模型配置只有 `configs/jingwei_dinov2.yaml`，所有工具默认使用它。
-只有一个训练入口 `tools/train_detector.py`，不再需要多阶段预训练、建库或异常融合标定。
+## 1. 数据合同与工况划分
 
-## 1. 数据准备
-
-编辑 `configs/fabric19.yaml`：
+模型只有 `configs/jingwei_dinov2.yaml`，数据路径在 `configs/fabric19.yaml`。
+路径相对仓库根目录或为绝对路径，不自动拼接数据 YAML 的 `path` 字段。
 
 ```yaml
 train: D:/fabric/images/train
 val: D:/fabric/images/val
-normalval: D:/fabric/normal/images/val  # 可省略或 null；仅评估 FPR
+normaltrain: D:/fabric/normal/train
+normalcal: D:/fabric/normal/cal
+normalval: D:/fabric/normal/test
+unknownval: D:/fabric/images/unknown_test
 ```
 
-路径可以是绝对路径或相对仓库根目录的路径。不自动拼接数据 YAML 的 `path` 字段。
-训练标签必须位于对应 `labels/train`，验证标签位于 `labels/val`，与图片同名：
+缺陷图对应 `images/train → labels/train`、`images/val → labels/val` 等目录，标签一行
+`class_id cx cy width height`（归一化），类别 `0..18`。类别名字／顺序以模型配置 `data.names` 为准。
+读者将缺失标签当背景，因此务必检查漏标和标签路径；缺失标签的图不会被自动当作可信正常纹理。
+`normaltrain` 仅放人工确认无疵点的图；程序自动产生空 boxes／labels，并标记正常图更新原型。
 
-```text
-D:/fabric/
-  images/train/布面1.jpg
-  labels/train/布面1.txt
-  images/val/布面2.jpg
-  labels/val/布面2.txt
+`train.normal_ratio: 0.5` 表示每轮抽取与缺陷图同等数量的正常图，正常池内随机抽样。
+正常图同时贡献背景检测监督和正常原型更新；带标注的缺陷图只训练检测头，不更新正常原型。
+正常池与缺陷池共享 RNG，支持 worker 独立种子和 checkpoint 恢复。
+
+**必须按物理原图／布卷分组，不可按增广图片随机切分。** 至少记录：
+
+| 分组变量 | 训练与校准应覆盖 | 最终独立验收 |
+|---|---|---|
+| 经纬密度 | 多种真实密度／纱线粗细 | 留出密度区间／布卷 |
+| 光照 | 正常曝光、亮暗、不同方向、反光 | 留出灯光组合／采集批次 |
+| 布种／颜色 | 多种干净正常图和缺陷图 | 留出布种或新卷 |
+| 已知缺陷 | 每类都有标注 | 每类 P/R 与小缺陷召回 |
+| 未知疵点 | 不用于检测训练或阈值选取 | 留出整类缺陷作为 unknownval |
+
+训练增强包含独立经纬缩放（0.75–1.4）、同步框变换、曝光、gamma、色温扰动、阴影、反光、轻微模糊／锐化。
+经纬缩放发生在固定尺寸 resize **之后**，避免被整图 resize 抵消；缩小时使用常量填充，不镜像复制疵点。
+这只是工况模拟：过强光照增强可能让类似污点的变化变成“正常”，参数应以真实验证结果调整。
+真实光照／密度多样性不能靠合成增强保证。
+
+## 2. 训练
+
+```bat
+python tools/train_detector.py --data configs/fabric19.yaml --epochs 50 --batch 2 --val-batch 1 --num-workers 4 --amp off --out runs/dinov2s
 ```
 
-每行 `class_id cx cy width height`，坐标归一化到 `[0,1]`，类别编号为 `0..18`。
-模型配置的 `data.nc` 和 `data.names` 决定检测输出和显示名称；数据 YAML 中类别定义应保持一致。
-空标签表示背景图；当前 reader 也把缺失标签视为背景，因此必须自行排查路径误配、漏标。
-训练集和验证集按原始布面图划分，不要把同一图的增广版本分到两边。
-非方形原图会连同标注框一起缩放为配置的方形检测输入。
+默认官方预训练 `dinov2_vits14`，冻结 encoder，训练适配层／PAN／检测头。
+仅可信 `normaltrain` 特征以在线聚类更新 32 个正常原型。未知模块不需要独立 teacher、蒸馏或第二次 ViT。
+启用未知模块时要求冻结主干，避免更新 encoder 后旧原型空间失效。
 
-正常图不参与额外分支训练。若无 `normalval`，日志中的 `normal_fpr=nan` / 评估的 `N/A`
-表示没有测量，不代表误报率为零；不存在 fallback 到另一个训练目录的行为。
+- GTX1660：**不支持 BF16**，默认 FP32；OOM 时减 `--batch 1`／`--val-batch 1`。
+- `--amp fp16` 可单独比较，但不能假定它在 1660 上更快；训练混合精度不意味着最终推理必须 FP16。
+- `--num-workers 0` 用于排查 Windows／读图问题；`--no-augment` 用于小样本过拟合检查。
+- `--smoke N` 是合成数据测试，仍加载配置的 ViT；不是收敛或性能证明。
+- 训练时未知阈值尚未校准，验证日志中的 FPR 是已有类别路径，不是最终开放集误报率。
+- `best.pt` 按已知检测 `best_f1` 选择；未宣称按未知召回挑选最佳 epoch。
 
-## 2. 官方预训练权重
-
-默认配置：
-
-```yaml
-model:
-  backbone: dinov2
-  dino_name: dinov2_vitb14
-  dino_repo: facebookresearch/dinov2
-  dino_weights: null
-  dino_pretrained: true
-  dino_freeze: true
-  dino_input_size: 448
-```
-
-第一次训练加载官方已预训练的 ViT，检测适配器和头随机初始化。
-没有独立 teacher 或学生蒸馏过程。网络失败会报错，不会静默使用随机 ViT。
-已缓存 ViT-S 不代表已缓存 ViT-B；所需权重和 `dino_name` 必须匹配。
-
-离线机器将已有字段改为：
+离线模式修改模型配置已有字段：
 
 ```yaml
 dino_repo: C:/models/dinov2
-dino_weights: C:/models/dinov2_vitb14_pretrain.pth
+dino_weights: C:/models/dinov2_vits14_pretrain.pth
 ```
 
-源码目录须包含 `hubconf.py`，`.pth` 必须是对应标准官方 backbone-only state_dict，严格检查键和形状。
-不要把原始 ViT `.pth` 当成完整检测 checkpoint 传给 CLI 的 `--pretrained`。
-可换 `dinov2_vits14` 或 `dinov2_vitl14`，但也要使用对应权重并评估显存。
+本地源码须有 `hubconf.py`；权重须为匹配的官方 raw backbone state_dict。下载或严格加载失败会报错，
+不会退回随机 ViT。`xFormers is not available` 一般表示标准 attention 回退，不是权重加载失败。
 
-## 3. 开始训练
-
-Windows CMD：
+## 3. 恢复与格式变更
 
 ```bat
-python tools/train_detector.py --data configs/fabric19.yaml --epochs 50 --batch 2 --val-batch 2 --num-workers 4 --amp bf16 --log-interval 20 --val-interval 1 --out runs/detector_dinov2
+python tools/train_detector.py --resume runs/dinov2s/last.pt --epochs 50 --batch 2 --out runs/dinov2s
 ```
 
-首次不传 `--resume` 或 `--pretrained`。应看到：
+保持结构、数据和总 schedule 不变。恢复包括模型、正常原型、AdamW、scheduler、主进程随机状态、
+可用时的 FP16 scaler；多 worker 预取／进程内部状态不保证逐 batch 位级一致。
+不完整的 `--resume` 报错，不静默 warm start。
 
-```text
-DIRECT pretrained DINOv2 backbone=dinov2_vitb14 frozen=True encoder_input=448
-initialization=official pretrained DINOv2; pyramid adapters / detector head=new
-```
+`--pretrained CHECKPOINT --lr ... --out NEW_DIR` 表示仅恢复完整检测模型权重、重新建立 optimizer／schedule。
+原型再更新会使校准标志失效，结束后重新校准。
+`best.pt` 和 `calibrated.pt` 是权重产物，只能用于推理或 `--pretrained`，不是完整 resume 文件。
 
-- `--batch`、`--val-batch` 都从 2 起步；OOM 时降为 1。
-- `--num-workers 0` 用于排查读图／Windows worker 问题，正常可用 4。
-- RTX 4070 可尝试 BF16；其他设备若不支持，使用 `--amp off` 或 FP16。
-- `--log-interval 20` 控制 batch 日志，0 关闭。`--val-interval 1` 每轮验证，0 关闭。
-- `--save-interval 5` 额外保留轮次快照；默认每轮覆盖 `last.pt`，改善时保存 `best.pt`。
-- `--val-max` / `--normal-max` 用固定随机种子抽取评估子集，正式指标使用全部验证集。
-- `--no-augment` 关闭训练增广，用于 8–32 张真实图的小样本过拟合排查。
-- `--smoke N` 只替换成合成输入，**仍使用配置的真实 DINOv2 主干**，不是准确率实验，也不会绕过权重下载。
+**当前默认已从 ViT-B／1280／448 改为 ViT-S／640／224，并增加正常原型 buffers，需重新训练。**
+旧 checkpoint 文件不删除，但不能直接按新配置 `--resume` 或 `--pretrained`；不使用 `strict=False` 掩盖不匹配。
 
-训练日志显示分项损失、mAP50、P/R/F1、TP/FP/FN 和可选正常图 FPR。
-回归损失包含像素 L1，绝对值受缺陷大小影响，不应与其他模型的 loss 数字直接比较。
-
-## 4. 恢复与重新开始优化
+## 4. 独立校准
 
 ```bat
-python tools/train_detector.py --resume runs/detector_dinov2/last.pt --epochs 50 --batch 2 --val-batch 2 --out runs/detector_dinov2
+python tools/calibrate_anomaly.py --data configs/fabric19.yaml --ckpt runs/dinov2s/best.pt --out runs/dinov2s/calibrated.pt --target-fpr 0.01
 ```
 
-完整 `--resume` 恢复模型、optimizer、scheduler、随机状态、epoch 和 iteration；新 checkpoint
-还保存 FP16 scaler 状态和 NumPy 全局 RNG。旧 checkpoint 若缺少 scaler 会明确警告并重置 loss scale。
-`best.pt` 是权重文件，用 `--pretrained` 初始化；只有 `last.pt`／轮次快照可以完整恢复，
-不完整的 `--resume` 会报错，不会静默从第 1 轮重训。
-多 worker 的预取／worker 内部状态不保存在 checkpoint，恢复不保证逐 batch 位级一致。
-保持同一结构、冻结设置、warmup、总训练计划。恢复旧 optimizer 后 `--lr` 不覆盖其学习率；
-不要通过改 `--epochs` 假设 cosine 会自动重启。
+- `normalcal` 必须与训练／最终验证目录互不包含，程序检查目录重叠；不同目录里的内容重复仍需用户按来源排查。
+- 不更新原型、不使用异常验证图。按**每张图最大 patch 距离**取有限样本顺序统计量。
+- 默认 1% 目标至少需 99 张独立正常图，建议 200–500 张以上并覆盖实际工况；不是 99 张同图增广副本。
+- 同分布／可交换性成立时才有该阈值的统计意义；新布种或新照明可能破坏假设，必须重测误报并重新校准。
+- 目标只针对未知分支，已有类别检测也可能误报，因此组合系统 FPR 可能更高。
+- `min_patches`、得分阈值、输入大小或精度变动后重新验证，输入／原型空间改变后重新校准。
 
-如果要保留检测权重、重新设置优化计划：
+FP16 推理要单独 `calibrate_anomaly.py --half`，并在 `predict.py`／`evaluate.py`／`bench_device.py` 同时传 `--half`。
+程序拒绝校准和推理精度不一致。正常原型／阈值保留 FP32；DINO 特征精度仍会影响分数。
+不把未知距离分数解释为缺陷类别置信概率。
+
+## 5. 泛化与开放集验收
 
 ```bat
-python tools/train_detector.py --pretrained runs/detector_dinov2/last.pt --lr 0.0001 --epochs 30 --batch 2 --val-batch 2 --out runs/detector_dinov2_lr1e4
+python tools/evaluate.py --data configs/fabric19.yaml --ckpt runs/dinov2s/calibrated.pt --batch 1 --diag
+python tools/predict.py --ckpt runs/dinov2s/calibrated.pt --source D:/fabric_test/
 ```
 
-`--pretrained` 与 `--resume` 互斥。两者都仅接受结构匹配的完整 DINOv2 检测权重，严格加载；
-恢复时不重复下载官方预训练权重，但仍需 hub 源码或本地源码目录。
-若使用此前的直接 DINOv2 检测权重，需要改用当前清理后的配置、保持模块尺寸一致；
-旧 CNN／学生蒸馏权重不能使用。六张量导出接口不兼容旧的异常图导出接口。
+输出：已知类别自定义 mAP50、P/R/F1，正常图组合 FPR、已知 FPR、未知 FPR；
+若配置 `unknownval`，再输出未知框一对一 IoU 匹配的 precision／recall 和正样本图定位召回。
+未知标签类别不参与匹配，但框不能缺失；没有未知标注集时报告 N/A，不能据此声称未知召回已验证。
 
-## 5. 精确率、阈值与模型选择
+`unknownval` 只放留出的新类型缺陷，不混入训练缺陷后称为“未知”。评价按布卷／密度／照明分组分别运行，
+记录每组指标、最差组和整体指标。没有用户确认的召回率与误报上限，不宣称质量验收合格。
+完整推理入口要求已校准；`--known-only` 明确关闭未知提示，不能用它的速度代表完整系统。
 
-默认 AdamW `5e-4`，1 epoch warmup + cosine；ViT 冻结。
-若要解冻，另开实验把 `dino_freeze: false`，使用 `--pretrained` 重新初始化 optimizer；
-encoder 学习率是检测头学习率乘 `dino_lr_mult`（默认 0.1），显存会明显增加。
+已知检测先受 `model.score_thresh`、`inference.final_score_thresh` 两层过滤。
+`--val-conf` 只调整统计阈值，不能恢复已滤掉的框。mAP50 不是未截断的 COCO 全量指标；
+`best_f1` 对应阈值不会自动写回推理配置。
 
-`train.best_metric` 支持 `best_f1`（默认）、`f1`、`precision` 或 `mAP50`。
-只追求 precision 可能让召回过低，应同时检查 P/R。`best_f1` 的阈值不会自动成为推理阈值，
-需要在验证后设置 `inference.final_score_thresh`。
+## 6. 1660 速度验收
 
 ```bat
-python tools/evaluate.py --data configs/fabric19.yaml --ckpt runs/detector_dinov2/best.pt --diag --batch 2
-python tools/predict.py --ckpt runs/detector_dinov2/best.pt --source D:/fabric_test/
+python tools/bench_device.py --ckpt runs/dinov2s/calibrated.pt --source D:/fabric_acceptance/ --device cuda --warmup 30 --iters 300 --target-fps 30 --require-target --out runs/1660_acceptance.json
 ```
 
-推理有两层得分过滤：`model.score_thresh` 和 `inference.final_score_thresh`。
-评估 CLI 的 `--val-conf` 仅调整 P/R 统计阈值，不会恢复已被过滤的框，也不改变 FPR 的出框阈值。
-若需低阈值诊断，应在独立配置同时降低两层阈值；当前 mAP 也受模型前置过滤影响，
-不是未经阈值截断的 COCO 全量评测。
+代表帧需要同时覆盖正常、已有缺陷、未知疵点及不同密度／光照，包括多候选／多异常区域场景。
+内存中循环使用已解码真实帧，计时包含 resize／RGB／tensor、H2D、ViT、检测解码／NMS、
+未知距离和连通域、原图坐标、D2H。**不包含相机等待、磁盘解码、绘制／显示、写盘**。
+报告 GPU 型号、精度、输入大小、候选数、平均／P50／P95／P99 延迟。
 
-`model.detector_nms_iou: 0.5` 抑制同类别重复框，0 关闭。
-NMS 不能修复错分类、背景误报或定位不准，也不等于训练收敛改进。
-同一 checkpoint 对比 NMS 和阈值时，应分开记录，避免把后处理收益归因于预训练主干。
+平均 ≥30 FPS 且 P95≤33.3ms 才能通过延迟检查；真实 1660、完整未知路径、真实输入且至少 10 张代表帧、10 次预热、100 次采样
+才可能标记 `gtx1660_full_acceptance=true`，失败时 `--require-target` 返回 2。
+质量另行验收；温度、功耗、其他 GPU 负载会影响复测结果。FP16 可另开完整校准／验证／测速实验，不假定加速。
 
-## 6. 验证与导出边界
+若仍达不到目标，先根据实测瓶颈调整；增加 ViT 分辨率／切片通常提高开销，缩图可能漏微小疵点。
+不能通过跳帧、关闭未知路径、改计时范围或牺牲召回来冒充完整 30 FPS。
+
+## 7. 导出与测试边界
 
 ```bat
 python -m unittest discover -s tests -v
-python tools/bench_device.py --ckpt runs/detector_dinov2/best.pt --warmup 3 --iters 20
+python tools/export.py --ckpt runs/dinov2s/calibrated.pt --known-only --out runs/export/known.onnx --check
 ```
 
-测试使用本地 tiny hub fixture，无需网络，覆盖反向传播、冻结、严格权重加载、恢复、
-数据和中文路径、评估／预测／测速 CLI、同类 NMS、预测框原图坐标和六张量接口。
-这些测试不证明真实数据精确率。官方大模型下载与真实训练需在用户机器执行。
-
-实验性导出需另装 `onnx`：
-
-```bat
-python tools/export.py --ckpt runs/detector_dinov2/best.pt --out runs/export/dinov2_detector.onnx --check
-```
-
-输出仅 `cls3/reg3/obj3/cls5/reg5/obj5`，需外部解码、阈值与 NMS。
-当前验证的是 PyTorch 和六张量接口；未完成真实 ViT ONNX/TensorRT/INT8 部署验证，
-不宣称导出一定成功或达到任何实时速度。
+ONNX 目前仅实验性导出已有类别六张量，外部解码／NMS；不包含正常原型、校准阈值或未知区域处理。
+真实模型的 ONNX/TensorRT/INT8 全流程没有验证。当前实现以 PyTorch/OpenCV 为准。
+回归测试不下载权重；另做过官方源码随机 ViT-S 前后向接口检查，但没有官方权重／真实数据／1660 实测结果。

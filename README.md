@@ -1,99 +1,103 @@
-# JingWei · DINOv2 布匹缺陷检测
+# JingWei · DINOv2-S 布匹缺陷与未知疵点检测
 
-只保留一条训练路径：**官方预训练 DINOv2 ViT → 特征适配金字塔 → PAN → 缺陷检测头**。
-默认冻结 ViT，使用真实 YOLO 框标注训练适配器和检测头，支持 19 类布匹缺陷。
-不再提供 CNN 主干、离线 teacher 蒸馏、记忆库或异常重建训练流程。
+单一主干：**官方预训练 DINOv2 ViT-S/14 → 轻量 PAN／检测头 + 共享特征正常原型**。
+已有类别用框标注学习，正常图片作为背景负样本并更新正常纹理原型。
+未知疵点由偏离正常原型的 patch 区域提示，不需要第二次 ViT 推理。
 
-> DINOv2 是预训练视觉主干，不是已经训练好的缺陷检测器。检测头仍需学习；
-> 代码测试通过不代表在真实数据上已达到目标精确率。大模型保留在推理端，不承诺实时 FPS。
+> 目标是 GTX 1660、batch=1、30 FPS。**目前没有 1660 实测，不是已保证达标。**
+> 未知检测是新颖性启发式，不保证发现所有未知缺陷；跨经纬密度／光照泛化需独立实物数据验证。
 
-## 安装
+## 默认预算
 
-Python ≥ 3.10。先按设备安装合适的 PyTorch，再安装其余依赖：
+| 项目 | 默认值 |
+|---|---|
+| 主干 | `dinov2_vits14`，官方标准最小档 ViT-S/14，encoder 约 22.1M 参数 |
+| 主干策略 | 官方预训练、冻结；不蒸馏、不替换 CNN |
+| 检测输入 / ViT 输入 | 640×640 / 224×224 |
+| neck 宽度 / 候选数 | 0.5 / top-k 64 |
+| 正常原型 | 32 个，FP32 存储约 48 KiB；不保存整套 patch 记忆库 |
+| 训练正常图占比 | 50%，正常图检测标签为空 |
+| 精度 | 默认 FP32；1660 不支持 BF16，FP16 是否更快必须实测 |
+
+224 的 ViT 输入只有 16×16 patch 网格，640 图上的未知区域较粗，微小疵点可能丢失。
+调大 ViT 输入（如 280/336）可能改善细节，但会更贵；不能只通过缩图刷 FPS 而不测召回率。
+
+## 安装与数据
+
+Python ≥ 3.10。先安装适合显卡的 PyTorch，再运行：
 
 ```bat
 pip install -r requirements.txt
 ```
 
-首次训练需要访问官方 DINOv2 hub 源码和权重地址；也支持本地源码及官方 `.pth`。
-`xFormers is not available` 通常表示回退标准 PyTorch attention，不是权重加载失败。
+编辑 `configs/fabric19.yaml`，配置相互独立的：
 
-## 训练：一个配置、一个入口
+- `train` / `val`：已有类别的 YOLO 缺陷图和框标签。
+- `normaltrain`：确认无缺陷的正常图，参与背景训练和正常纹理学习。
+- `normalcal`：独立正常图，**只在训练后校准未知阈值**，默认 1% 目标至少需要 99 张；推荐更多独立原图。
+- `normalval`：独立正常测试图，测实际误报率。
+- `unknownval`：可选，训练中留出的新缺陷类型图片和 YOLO 框；类别值忽略，只测未知区域定位。
 
-把 `configs/fabric19.yaml` 中的 `train`、`val` 改成实际图片目录。
-YOLO 标签目录按 `images/train → labels/train`、`images/val → labels/val` 推断。
-`normalval` 仅用于正常图误报率评估，可省略或设置为 `null`。
+按原始布卷／布种／经纬密度／光照条件分组划分，不能把同一原图的增广副本分到不同集合。
+增强不能替代覆盖不同工况的真实正常图和缺陷图。
 
-```bat
-python tools/train_detector.py --data configs/fabric19.yaml --epochs 50 --batch 2 --val-batch 2 --amp bf16 --out runs/detector_dinov2
-```
+## 训练、校准、验收
 
-所有工具默认使用 **`configs/jingwei_dinov2.yaml`**。首次运行不传 checkpoint，
-自动加载 `dinov2_vitb14(pretrained=True)`。失败会报错，不静默回退随机主干。
+所有工具默认使用唯一模型配置 `configs/jingwei_dinov2.yaml`。
 
-已下载官方权重时，在该配置的 `model` 中修改已有项：
-
-```yaml
-dino_repo: C:/models/dinov2                  # 官方源码目录，包含 hubconf.py
-dino_weights: C:/models/dinov2_vitb14_pretrain.pth
-dino_pretrained: true
-```
-
-### 恢复训练
+### 1. 从官方预训练 ViT-S 开始
 
 ```bat
-python tools/train_detector.py --resume runs/detector_dinov2/last.pt --epochs 50 --batch 2 --val-batch 2 --out runs/detector_dinov2
+python tools/train_detector.py --data configs/fabric19.yaml --epochs 50 --batch 2 --val-batch 1 --amp off --out runs/dinov2s
 ```
 
-`--resume` 恢复模型、优化器、scheduler 和随机状态。
-若要重置学习率和训练计划，改用 `--pretrained CHECKPOINT --lr 0.0001` 并另开输出目录。
-**`--pretrained` 仅接收完整 DINOv2 检测权重；原始 ViT `.pth` 应配置在 `model.dino_weights`。**
+首次无需 `--pretrained`。官方权重下载失败会报错，不静默回退随机主干。
+离线可把模型配置的 `dino_repo` 改为官方源码目录，`dino_weights` 改为匹配的
+`dinov2_vits14_pretrain.pth`。原始 ViT 权重不要传给 CLI 的 `--pretrained`。
 
-## 评估、预测与测速
+### 2. 校准独立正常集
 
 ```bat
-python tools/evaluate.py --ckpt runs/detector_dinov2/best.pt --data configs/fabric19.yaml --diag --batch 2
-python tools/predict.py --ckpt runs/detector_dinov2/best.pt --source D:/fabric_test/ --out runs/predict
-python tools/bench_device.py --ckpt runs/detector_dinov2/best.pt --iters 20
+python tools/calibrate_anomaly.py --data configs/fabric19.yaml --ckpt runs/dinov2s/best.pt --out runs/dinov2s/calibrated.pt --target-fpr 0.01
 ```
 
-预测结果为原图坐标，中文类别名保存在 `results.json`，图片绘制使用 ASCII 类别标签。
-图片、文件夹、视频和中文路径均支持；不包含未知异常类或未标注异常兜底。
-测速包含检测解码与 NMS，不包括读图、缩放和输入传输。
+校准不更新原型，也不接触未知测试集。1% 是同分布假设下的**未知分支图像级**目标，
+不是全流程误报率或跨工况保证。校准后必须在 `normalval`、`unknownval` 验证。
 
-## 默认训练策略
+### 3. 评估与预测
 
-- 官方 ViT-B/14 主干冻结，适配层与检测头可训练。
-- AdamW，学习率 `5e-4`，1 epoch warmup 后 cosine 衰减。
-- Softplus 距离回归，保留已修复的逐网格 box loss。
-- 双分配监督，推理使用一对一 objectness 和可选同类 NMS。
-- 按验证集 `best_f1` 保存 `best.pt`；对应阈值不会自动写入推理配置。
-- 检测图为 1280×1280，DINO 输入默认 448×448。微小缺陷可对比 672，代价是更多显存与计算。
+```bat
+python tools/evaluate.py --data configs/fabric19.yaml --ckpt runs/dinov2s/calibrated.pt --batch 1 --diag
+python tools/predict.py --ckpt runs/dinov2s/calibrated.pt --source D:/fabric_test/ --out runs/predict
+```
 
-## 代码目录
+JSON 分别输出 `detections`（已有类别）和 `unknown_regions`（未知纹理偏离提示），框均为原图坐标。
+未知得分不是类别概率，已有缺陷也可能出现在未知区域内；不要把两者当成互斥分类。
+未校准的 checkpoint 默认拒绝完整预测／测速；调试仅已有类别时显式传 `--known-only`。
 
-| 路径 | 职责 |
-|---|---|
-| `configs/jingwei_dinov2.yaml` | 唯一模型配置 |
-| `configs/fabric19.yaml` | 数据路径、类别元数据 |
-| `jingwei/dinov2_backbone.py` | 官方预训练 ViT、中间层输出和可训练适配器 |
-| `jingwei/neck.py`, `head.py`, `losses.py` | PAN、检测头和监督损失 |
-| `jingwei/model.py` | 训练／推理及六张量导出接口 |
-| `jingwei/data.py`, `image_io.py` | 标注读取、增广及 Unicode I/O |
-| `tools/train_detector.py` | 唯一训练入口 |
-| `tools/evaluate.py`, `predict.py` | 指标与实际预测 |
-| `tools/bench_device.py`, `export.py` | 实测延迟、实验性 ONNX 导出 |
-| `tests/` | 无网络回归测试，使用 tiny hub fixture 而非实际大模型权重 |
+### 4. 在真正的 1660 上验收 30 FPS
 
-## 文档与测试
+```bat
+python tools/bench_device.py --ckpt runs/dinov2s/calibrated.pt --source D:/fabric_acceptance/ --device cuda --warmup 30 --iters 300 --target-fps 30 --require-target --out runs/1660_acceptance.json
+```
 
-- [训练、数据、调参与 checkpoint 说明](docs/TRAINING.md)
-- [模型结构、计算与验证边界](docs/DINOV2_DETECTOR.md)
+包含 CPU 预处理、H2D、同次 ViT、检测解码／NMS、未知区域、原图坐标及输出 D2H；
+不含相机等待、磁盘解码、显示、写盘。验收检查 **平均 ≥30 FPS 且 P95≤33.3 ms**，
+必须是真实 1660、真实帧、开启已校准未知分支；CPU／合成输入不能通过。
+这仍只是速度验收，必须另外确认已有类别召回、未知定位召回和正常误报率。
+
+## 恢复、文档与测试
+
+`--resume runs/dinov2s/last.pt` 恢复完整训练状态；`--pretrained` 是完整检测权重的显式 warm start。
+当前 ViT-S＋新尺寸／未知原型的结构不兼容此前 ViT-B 检测 checkpoint，需要重新训练。
+数据和旧权重文件不删除。
+
+- [数据、训练、校准与泛化验收](docs/TRAINING.md)
+- [结构、预算与限制](docs/DINOV2_DETECTOR.md)
 
 ```bat
 python -m unittest discover -s tests -v
 ```
 
-本次整理移除了旧方案源码、配置、脚本和对应文档／测试，未删除已有图片或训练产物。
-旧 CNN／蒸馏 checkpoint 不受支持，旧配置会明确报错。PyTorch 是当前验证路径；
-ONNX 是六预测张量的实验导出接口，不宣称已经验证真实 ViT 的 TensorRT/INT8 部署。
+回归测试使用 tiny 本地 hub 验证流程，不证明真实模型准确率或显卡速度。
+ONNX 目前只实验性导出已有类别的六张量；未知模块仍为 PyTorch/OpenCV，不能宣称全流程 TensorRT/INT8 已支持。

@@ -8,7 +8,7 @@ from pathlib import Path
 import cv2
 import torch
 
-from _common import load_model, resolve
+from _common import configure_inference, load_model, resolve
 from jingwei.data import list_images
 from jingwei.image_io import (VideoCaptureUnicode, ascii_safe, console_safe,
                               imread_unicode, imwrite_unicode)
@@ -26,7 +26,10 @@ def predict_image(model, bgr, size, device, half=False):
     x = torch.from_numpy(rgb.transpose(2, 0, 1).copy()).float()[None] / 255.
     x = x.to(device)
     det = model(x.half() if half else x)[0]
-    return {**det, "boxes": scale_boxes(det["boxes"], (size, size), (w, h))}
+    result = {**det, "boxes": scale_boxes(det["boxes"], (size, size), (w, h))}
+    if "unknown_boxes" in det:
+        result["unknown_boxes"] = scale_boxes(det["unknown_boxes"], (size, size), (w, h))
+    return result
 
 
 def source_images(source):
@@ -62,14 +65,13 @@ def main():
     ap.add_argument("--out", default="runs/predict")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--half", action="store_true", help="FP16 on CUDA only")
+    ap.add_argument("--known-only", action="store_true", help="explicitly disable unknown alerts")
     ap.add_argument("--no-draw", action="store_true")
     args = ap.parse_args()
     if args.half and not args.device.startswith("cuda"):
         ap.error("--half is supported on CUDA only")
     model, cfg = load_model(args.cfg, args.ckpt, args.device)
-    model.eval()
-    if args.half:
-        model.half()
+    configure_inference(model, args.known_only, args.half)
     out = resolve(args.out)
     out.mkdir(parents=True, exist_ok=True)
     names = cfg.data.names
@@ -83,7 +85,15 @@ def main():
             dict(box=[round(v, 1) for v in box], score=round(score, 4),
                  class_id=label, label=names[label])
             for box, score, label in zip(boxes, scores, labels)]}
+        unknown_boxes = det.get("unknown_boxes", torch.empty(0, 4)).cpu().tolist()
+        unknown_scores = det.get("unknown_scores", torch.empty(0)).cpu().tolist()
+        results[name]["unknown_regions"] = [dict(box=box, novelty_score=score, label="unknown")
+                                             for box, score in zip(unknown_boxes, unknown_scores)]
         if not args.no_draw:
+            for box in unknown_boxes:
+                x0, y0, x1, y1 = map(round, box)
+                cv2.rectangle(bgr, (x0, y0), (x1, y1), (0, 0, 255), 2)
+                cv2.putText(bgr, "unknown", (x0, max(16, y0 - 4)), cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 0, 255), 1)
             for box, score, label in zip(boxes, scores, labels):
                 x0, y0, x1, y1 = map(round, box)
                 color = COLORS[label % len(COLORS)]
@@ -94,7 +104,7 @@ def main():
             path = out / name
             path.parent.mkdir(parents=True, exist_ok=True)
             imwrite_unicode(path, bgr)
-        print(console_safe(f"{name}: {len(boxes)} detections"))
+        print(console_safe(f"{name}: {len(boxes)} known / {len(unknown_boxes)} unknown regions"))
     with (out / "results.json").open("w", encoding="utf-8") as fh:
         json.dump(results, fh, ensure_ascii=False, indent=2)
     print(console_safe(f"results -> {out}"))

@@ -9,6 +9,7 @@ from .dinov2_backbone import DINOv2Backbone
 from .head import DualScaleDetect
 from .losses import DetectionLoss
 from .neck import DualScalePAN
+from .novelty import NormalPrototypes
 
 
 class JingWei(nn.Module):
@@ -19,22 +20,35 @@ class JingWei(nn.Module):
         if cfg.model.get("backbone", "dinov2") != "dinov2":
             raise ValueError("Only the direct DINOv2 backbone is supported")
         self.cfg = cfg
+        self.known_only = False
         self.img_size = tuple(int(v) for v in cfg.input_size)
         self.backbone = DINOv2Backbone(cfg)
         channels = self.backbone.out_channels
         self.neck = DualScalePAN(cfg, channels)
         self.head = DualScaleDetect(cfg, channels)
         self.det_loss = DetectionLoss(cfg)
+        u = cfg.get("unknown", {})
+        self.novelty = (NormalPrototypes(self.backbone.encoder.embed_dim,
+                                        u.get("prototypes", 32), u.get("momentum", .95),
+                                        u.get("min_patches", 1), u.get("max_regions", 8))
+                        if u.get("enabled", False) else None)
 
-    def forward(self, x, targets=None):
-        feats = self.neck(self.backbone(x))
+    def forward(self, x, targets=None, normal_mask=None):
+        backbone = self.backbone(x, return_raw=self.novelty is not None and (self.training or not self.known_only), include_detail=False)
+        if self.training and self.novelty is not None and normal_mask is not None:
+            self.novelty.update(backbone["raw"][normal_mask.to(x.device).bool()])
+        feats = self.neck(backbone)
         if self.training:
             preds = self.head(feats, training=True)
             out = {"preds": preds, "feats": feats}
             if targets is not None:
                 out["losses"] = self.det_loss(preds, targets, x.shape[-2:])
             return out
-        return self._decode(self.head(feats, training=False), x.shape[-2:])
+        detections = self._decode(self.head(feats, training=False), x.shape[-2:])
+        if self.novelty is not None and not self.known_only and bool(self.novelty.calibrated):
+            for detection, regions in zip(detections, self.novelty.regions(backbone["raw"], x.shape[-2:])):
+                detection.update(regions)
+        return detections
 
     @torch.no_grad()
     def _decode(self, preds, img_size):
@@ -47,7 +61,7 @@ class JingWei(nn.Module):
         """Six prediction tensors; thresholding and NMS run outside ONNX."""
         if self.training:
             raise RuntimeError("Call eval() before export_forward")
-        preds = self.head(self.neck(self.backbone(x)), training=False)
+        preds = self.head(self.neck(self.backbone(x, include_detail=False)), training=False)
         return tuple(p[key] for p in preds for key in ("cls", "reg", "obj_o2o"))
 
     @torch.no_grad()

@@ -27,9 +27,10 @@ def local_config(root):
     hub.mkdir(exist_ok=True)
     (hub / "hubconf.py").write_text(
         "from torch import nn\n" + inspect.getsource(FakeEncoder) +
-        "\ndef dinov2_vitb14(pretrained=True):\n    return FakeEncoder()\n", encoding="utf-8")
+        "\ndef dinov2_vits14(pretrained=True):\n    return FakeEncoder()\n", encoding="utf-8")
     repo = Path(__file__).resolve().parents[1]
     cfg = yaml.safe_load((repo / "configs/jingwei_dinov2.yaml").read_text(encoding="utf-8"))
+    cfg["unknown"]["enabled"] = False
     cfg["input_size"] = [128, 128]
     cfg["model"].update(dino_repo=str(hub), dino_input_size=56)
     path = root / "config.yaml"

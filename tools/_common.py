@@ -338,3 +338,23 @@ class SyntheticFabricDataset(Dataset):
         img = cv2.resize(img, (self.size, self.size), interpolation=cv2.INTER_LINEAR)
         return dict(image=torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0,
                     path=f"synthetic_{idx:05d}")
+
+
+def configure_inference(model, known_only=False, half=False):
+    """Fail loudly rather than benchmark/predict an uncalibrated unknown path."""
+    model.eval()
+    model.known_only = known_only
+    novelty = getattr(model, "novelty", None)
+    if novelty is not None and not known_only:
+        if not bool(novelty.calibrated) or int(novelty.updates) == 0:
+            raise ValueError("Unknown detection is not calibrated. Run tools/calibrate_anomaly.py "
+                             "or explicitly use --known-only (no unknown detection).")
+        if novelty.calibration_shape.tolist() != [model.backbone.encoder_size, int(model.img_size[0])]:
+            raise ValueError("Input sizes differ from novelty calibration; recalibrate for this configuration")
+        if int(novelty.precision_bits) != (16 if half else 32):
+            raise ValueError("Inference precision differs from novelty calibration; recalibrate with matching --half")
+    if half:
+        if next(model.parameters()).device.type != "cuda":
+            raise ValueError("--half requires CUDA")
+        model.half()
+    return model

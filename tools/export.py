@@ -27,6 +27,7 @@ def main():
     ap.add_argument("--out", default="runs/export/dinov2_detector.onnx")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--opset", type=int, default=17)
+    ap.add_argument("--known-only", action="store_true", help="acknowledge export excludes novelty prototypes and regions")
     ap.add_argument("--check", action="store_true")
     args = ap.parse_args()
     try:
@@ -34,6 +35,8 @@ def main():
     except ImportError as exc:
         raise SystemExit("ONNX export requires: pip install onnx") from exc
     model, cfg = load_model(args.cfg, args.ckpt, args.device)
+    if model.novelty is not None and not args.known_only:
+        ap.error("Six-tensor ONNX contains known detection only; explicitly pass --known-only")
     model.eval()
     path = resolve(args.out)
     path.parent.mkdir(parents=True, exist_ok=True)

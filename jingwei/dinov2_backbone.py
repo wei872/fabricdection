@@ -19,7 +19,7 @@ class DINOv2Backbone(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         m = cfg.model
-        self.name = str(m.get("dino_name", "dinov2_vitb14"))
+        self.name = str(m.get("dino_name", "dinov2_vits14"))
         if not self.name.startswith("dinov2_vit"):
             raise ValueError("Direct backbone requires a DINOv2 ViT hub model")
         repo = str(m.get("dino_repo", "facebookresearch/dinov2"))
@@ -46,7 +46,7 @@ class DINOv2Backbone(nn.Module):
         self.encoder.requires_grad_(not self.frozen)
         if self.frozen:
             self.encoder.eval()
-        self.encoder_size = int(m.get("dino_input_size", 448))
+        self.encoder_size = int(m.get("dino_input_size", 224))
         if self.encoder_size <= 0 or self.encoder_size % 14:
             raise ValueError("model.dino_input_size must be a positive multiple of 14")
         # Four distributed layers, not four copies of the last feature map.
@@ -69,7 +69,7 @@ class DINOv2Backbone(nn.Module):
             self.encoder.eval()
         return self
 
-    def forward(self, x):
+    def forward(self, x, return_raw=False, include_detail=True):
         h, w = x.shape[-2:]
         if h % 32 or w % 32:
             raise ValueError("Detector image dimensions must be multiples of 32")
@@ -79,7 +79,11 @@ class DINOv2Backbone(nn.Module):
         # no_grad, NOT inference_mode: adapters need to save their input for backward.
         with torch.no_grad() if self.frozen else nullcontext():
             maps = self.encoder.get_intermediate_layers(z, n=self.layers, reshape=True)
-        return {name: F.interpolate(adapter(feat), (h // stride, w // stride),
-                                    mode="bilinear", align_corners=False)
-                for name, adapter, feat, stride in
-                zip(("d", "p3", "p4", "p5"), self.adapters, maps, self.strides)}
+        output = {name: F.interpolate(adapter(feat), (h // stride, w // stride),
+                                      mode="bilinear", align_corners=False)
+                  for i, (name, adapter, feat, stride) in enumerate(
+                      zip(("d", "p3", "p4", "p5"), self.adapters, maps, self.strides))
+                  if include_detail or i > 0}
+        if return_raw:
+            output["raw"] = maps[1]  # intermediate texture features; same ViT pass
+        return output
