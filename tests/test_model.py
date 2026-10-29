@@ -1267,5 +1267,128 @@ class TestModel(unittest.TestCase):
         self.assertEqual(pr["fp_breakdown"]["duplicate_same_gt"], 5)
 
 
+    # ------------------------------------------------ precision round 2 (v0.2.0)
+    def test_49_cross_scale_dedup(self):
+        """The same defect found by P3 AND P5 (nested boxes) -> one box."""
+        m = build_model(self.cfg).eval()
+        cls3 = torch.full((1, 19, 160, 160), -6.0)
+        cls3[:, 3] = 4.0
+        cls5 = torch.full((1, 19, 40, 40), -6.0)
+        cls5[:, 3] = 4.0
+        o3 = torch.full((1, 1, 160, 160), -8.0)
+        o3[:, :, 60:72, 60:72] = 3.0
+        o5 = torch.full((1, 1, 40, 40), -8.0)
+        o5[:, :, 16:20, 16:20] = 3.0
+        preds = [dict(cls=cls3, reg=torch.full((1, 4, 160, 160), 1.0), obj_o2o=o3),
+                 dict(cls=cls5, reg=torch.full((1, 4, 40, 40), 4.0), obj_o2o=o5)]
+        on = m.head.decode(preds, (1280, 1280))[0]
+        self.assertEqual(len(on["boxes"]), 1,
+                         "nested P3/P5 duplicate must be suppressed")
+        m.head.dedup = False
+        off = m.head.decode(preds, (1280, 1280))[0]
+        self.assertEqual(len(off["boxes"]), 2)
+        m.head.dedup = True
+        # two defects far apart on different scales must both survive
+        o3b = torch.full((1, 1, 160, 160), -8.0)
+        o3b[:, :, 20:26, 20:26] = 3.0
+        o5b = torch.full((1, 1, 40, 40), -8.0)
+        o5b[:, :, 25:27, 25:27] = 3.0
+        two = m.head.decode([dict(cls=cls3, reg=torch.full((1, 4, 160, 160), 1.0),
+                                  obj_o2o=o3b),
+                             dict(cls=cls5, reg=torch.full((1, 4, 40, 40), 4.0),
+                                  obj_o2o=o5b)], (1280, 1280))[0]
+        self.assertEqual(len(two["boxes"]), 2)
+
+    def test_50_objectness_supervises_every_cell(self):
+        """ohem leaves ~92% of the frame without any background gradient."""
+        from jingwei.losses import DetectionLoss
+
+        tgt = [dict(boxes=torch.tensor([[480., 480., 500., 500.]]),
+                    labels=torch.tensor([3]))]
+
+        def run(mode):
+            cfg = load_config(CFG_N)
+            cfg.train.obj_o2o_mode = mode
+            obj = torch.full((1, 1, 160, 160), -4.0)
+            obj[:, :, 60, 60] = 4.0        # the matched positive
+            obj3 = obj.clone().requires_grad_(True)
+            preds = [dict(cls=torch.full((1, 19, 160, 160), -3.0),
+                          reg=torch.full((1, 4, 160, 160), 1.0),
+                          obj=obj.clone(), obj_o2o=obj3, fg=None),
+                     dict(cls=torch.full((1, 19, 40, 40), -3.0),
+                          reg=torch.full((1, 4, 40, 40), 1.0),
+                          obj=obj.new_full((1, 1, 40, 40), -4.0),
+                          obj_o2o=obj.new_full((1, 1, 40, 40), -4.0).requires_grad_(True),
+                          fg=None)]
+            out = DetectionLoss(cfg)(preds, tgt, (1280, 1280))
+            out["obj_o2o"].backward()
+            g = obj3.grad
+            return out, int((g.abs() > 0).sum()), float(g[0, 0, 5, 150])
+
+        out_ohem, n_ohem, far_ohem = run("ohem")
+        out_focal, n_focal, far_focal = run("focal")
+        for o in (out_ohem, out_focal):
+            self.assertTrue(torch.isfinite(o["total"]))
+            self.assertGreater(float(o["obj_o2o"]), 0.0)
+        self.assertEqual(n_focal, 160 * 160, "focal must touch every cell")
+        self.assertLess(n_ohem, 160 * 160 // 2,
+                        "ohem only touches the sampled hard negatives")
+        self.assertEqual(far_ohem, 0.0,
+                         "far background cells get NO gradient under ohem")
+        self.assertNotEqual(far_focal, 0.0,
+                            "focal must supervise far background cells too")
+        self.assertGreater(float(out_focal["obj_o2o"]), float(out_ohem["obj_o2o"]))
+
+    def test_51_precision_diagnosis_helpers(self):
+        """The diagnosis tool must classify FPs the same way evaluate.py does."""
+        from diagnose_precision import _match, report_at
+
+        gt_b = torch.tensor([[10., 10., 100., 100.], [200., 200., 300., 300.]])
+        gt_l = torch.tensor([3, 7])
+        boxes = torch.tensor([
+            [10., 10., 100., 100.],      # exact TP (class 3)
+            [11., 11., 101., 101.],      # duplicate of the same GT
+            [200., 200., 300., 300.],    # right box, wrong class (3 instead of 7)
+            [400., 400., 500., 500.],    # background
+        ])
+        labels = torch.tensor([3, 3, 3, 5])
+        scores = torch.tensor([0.9, 0.8, 0.7, 0.6])
+        kinds = [k for k, _ in _match(boxes, labels, scores, gt_b, gt_l, 19, 0.5)]
+        self.assertEqual(kinds, ["tp", "duplicate", "wrong_class", "background"])
+
+        frames = [dict(boxes=boxes, scores=scores, labels=labels,
+                       scale=torch.tensor([0, 0, 1, 1]),
+                       gt_boxes=gt_b, gt_labels=gt_l)]
+        r = report_at(frames, 0.0, 19, 0.5)
+        self.assertEqual((r["tp"], r["fp"], r["fn"]), (1, 3, 1))
+        self.assertEqual(r["cats"]["duplicate"], 1)
+        self.assertEqual(r["cats"]["wrong_class"], 1)
+        self.assertEqual(r["cats"]["background"], 1)
+        self.assertAlmostEqual(r["precision"], 0.25)
+        self.assertAlmostEqual(r["recall"], 0.5)
+        self.assertEqual(r["per_scale"][(0, "tp")], 1)
+        self.assertEqual(r["per_scale"][(1, "fp")], 2)
+        self.assertEqual(r["confusions"][(7, 3)], 1)
+        # a high threshold must remove everything
+        self.assertEqual(report_at(frames, 0.95, 19, 0.5)["n_det"], 0)
+
+    def test_52_dedup_survives_fusion(self):
+        """scale_idx must travel through the safety net so per-scale FP stats work."""
+        from jingwei.fusion import fuse_detections
+
+        cfg = load_config(CFG_N)
+        det = dict(boxes=torch.tensor([[100., 100., 300., 300.],
+                                       [400., 400., 600., 600.]]),
+                   scores=torch.tensor([0.9, 0.8]),
+                   labels=torch.tensor([3, 4]),
+                   obj=torch.tensor([0.9, 0.8]),
+                   points=torch.zeros(2, 2),
+                   scale_idx=torch.tensor([0, 1]))
+        anomaly = torch.zeros(1, 1, 160, 160)      # no extra safety boxes
+        out = fuse_detections(det, anomaly, (1280, 1280), cfg, 19)
+        self.assertIn("scale_idx", out)
+        self.assertEqual(out["scale_idx"].tolist(), [0, 1])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

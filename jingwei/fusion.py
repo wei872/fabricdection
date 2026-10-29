@@ -262,6 +262,8 @@ def fuse_detections(det: dict, anomaly: torch.Tensor, img_size, cfg,
     normal edge fold-in without assuming fixed image-border pixels.
     """
     device = det["boxes"].device
+    n_in = int(det["boxes"].shape[0])
+    scale_idx = det.get("scale_idx")
     a = anomaly[0, 0].detach().cpu().numpy().astype(np.float32)
     ctx = context[0].detach().cpu().numpy().astype(np.float32) if context is not None else None
     out = safety_net_numpy(
@@ -279,8 +281,20 @@ def fuse_detections(det: dict, anomaly: torch.Tensor, img_size, cfg,
         scores, labels = roi_refiner(feats, boxes, img_size, scores, labels)
 
     keep = scores >= float(cfg.fusion.final_score_thresh)
+    # keep the (P3/P5) scale of every box: the FP breakdown per scale is what
+    # tells you whether a small scale is flooding the frame.
+    if scale_idx is not None and scale_idx.numel() == n_in:
+        n_extra = int(boxes.shape[0]) - n_in
+        if n_extra > 0:
+            scale_idx = torch.cat([scale_idx.to(device),
+                                   torch.full((n_extra,), -1, dtype=torch.long,
+                                              device=device)])
+        else:
+            scale_idx = scale_idx.to(device)
     result = dict(boxes=boxes[keep], scores=scores[keep], labels=labels[keep],
                   n_safety_boxes=out["n_safety_boxes"],
                   n_unknown_boxes=out.get("n_unknown_boxes", 0),
                   n_global_components=out.get("n_global_components", 0))
+    if scale_idx is not None and scale_idx.numel() == keep.numel():
+        result["scale_idx"] = scale_idx[keep]
     return result

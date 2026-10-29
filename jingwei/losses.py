@@ -204,6 +204,20 @@ class DetectionLoss(nn.Module):
         self.o2o_candidates = int(cfg.train.get("o2o_candidates", 1600))
         self.o2o_neg_ratio = float(cfg.train.get("o2o_neg_ratio", 0.02))
         self.o2o_min_neg = int(cfg.train.get("o2o_min_neg", 2048))
+        # How the DEPLOYED objectness branch is supervised.
+        #
+        # ``ohem`` (old): positives + only the top ``o2o_neg_ratio`` ~ 8% hardest
+        #   negative cells.  The other ~92% of the map never gets an explicit
+        #   "background" gradient, so a cell the teacher never looked at can
+        #   keep a high objectness for ever -> *background* false positives that
+        #   no score threshold removes.  It also makes precision depend on which
+        #   cells happened to be sampled.
+        # ``focal`` (default): sigmoid focal loss over EVERY cell (alpha/gamma),
+        #   normalised by the positive count -- the standard dense-detector
+        #   treatment, still bounded and cheap (one extra elementwise pass).
+        self.o2o_mode = str(cfg.train.get("obj_o2o_mode", "focal")).lower()
+        self.o2o_gamma = float(cfg.train.get("obj_o2o_gamma", 2.0))
+        self.o2o_alpha = float(cfg.train.get("obj_o2o_alpha", 0.25))
 
     def forward(self, preds, targets, img_size):
         device = preds[0]["cls"].device
@@ -256,15 +270,27 @@ class DetectionLoss(nn.Module):
                 t_obj[b, flat] = 1.0
             bce = F.binary_cross_entropy_with_logits(obj, t_obj, reduction="none")
             n_pos = len(matches[si])
-            n_neg = o2o_negative_count(B * HW, n_pos, self.o2o_neg_ratio,
-                                       self.o2o_min_neg)
-            pos_loss = (bce * t_obj).sum() / float(max(1, n_pos))
-            if n_neg:
-                neg_loss = torch.topk((bce * (1 - t_obj)).reshape(-1),
-                                      k=n_neg).values.mean()
+            norm = float(max(1, n_pos))
+            if self.o2o_mode == "focal":
+                # all-cell sigmoid focal loss; positives are up-weighted by
+                # alpha, hard negatives by (1 - p_t)^gamma.
+                # NOTE: do not name this ``p`` -- ``p`` is the prediction dict
+                # of this scale (shadowing it broke the cls/reg losses below).
+                prob = obj.sigmoid()
+                p_t = prob * t_obj + (1.0 - prob) * (1.0 - t_obj)
+                a_t = self.o2o_alpha * t_obj + (1.0 - self.o2o_alpha) * (1.0 - t_obj)
+                foc = a_t * (1.0 - p_t).pow(self.o2o_gamma) * bce
+                losses["obj_o2o"] = losses["obj_o2o"] + foc.sum() / norm
             else:
-                neg_loss = obj.new_zeros(())
-            losses["obj_o2o"] = losses["obj_o2o"] + pos_loss + neg_loss
+                n_neg = o2o_negative_count(B * HW, n_pos, self.o2o_neg_ratio,
+                                           self.o2o_min_neg)
+                pos_loss = (bce * t_obj).sum() / norm
+                if n_neg:
+                    neg_loss = torch.topk((bce * (1 - t_obj)).reshape(-1),
+                                          k=n_neg).values.mean()
+                else:
+                    neg_loss = obj.new_zeros(())
+                losses["obj_o2o"] = losses["obj_o2o"] + pos_loss + neg_loss
 
             cls = p["cls"].reshape(B, self.nc, HW)
             reg = p["reg"].float().reshape(B, 4, HW)

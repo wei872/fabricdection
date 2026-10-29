@@ -85,11 +85,20 @@ fusion:
 
 train:
   loss_weights: {cls_o2m: 1.0, box_o2m: 2.0, obj_o2m: 1.0,
-                 cls_o2o: 1.5, box_o2o: 2.0, obj_o2o: 1.5, fg_align: 0.5}
+                 cls_o2o: 1.5, box_o2o: 2.0, obj_o2o: 0.5, fg_align: 0.5}
   class_weights: null        # 可填 19 个类的权重, 处理类别不均衡
   o2o_candidates: 1600
   o2o_neg_ratio: 0.02       # per-scale hard negatives as a fraction of all cells
   o2o_min_neg: 2048         # floor for scales with few/no matches in a batch
+  # o2o（部署分支）objectness 的监督方式：
+  #   focal = 全网所有 cell 都参与 focal loss（默认，背景不会被漏掉）
+  #   ohem  = 只对最难的 ~8% 负样本做 hard mining（旧行为；p=0 的
+  #           简单背景 cell 拿不到梯度，会留下无法用阈值消除的误报）
+  # 注意：focal 的绝对量级约为 ohem 的 ~50 倍，所以上面 loss_weights 里
+  #      obj_o2o 已从 1.5 调成 0.5。
+  obj_o2o_mode: focal
+  obj_o2o_gamma: 2.0
+  obj_o2o_alpha: 0.25
   rec_p_final: 0.9
   rec_warmup: 1000
   rec_factor: 0.1

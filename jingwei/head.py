@@ -72,6 +72,13 @@ class NMSFreeDetect(nn.Module):
         # near 0.1 no matter how well the detector localises.
         self.peak_filter = bool(m.get("peak_filter", True))
         self.peak_kernel = max(1, int(m.get("peak_kernel", 3)))
+        # Peak filtering is per scale; the SAME defect is still found by both
+        # P3 and P5 (a small box inside a big one -> low IoU, so an IoU-only
+        # NMS would keep both).  Deduplicate across scales with IoU plus a
+        # containment test before the boxes reach the evaluator.
+        self.dedup = bool(m.get("dedup", True))
+        self.dedup_iou = float(m.get("dedup_iou", 0.70))
+        self.dedup_contain = float(m.get("dedup_contain", 0.85))
         self.heads = nn.ModuleList([
             DecoupledHead(channels[1], self.nc, m.head_width, m.fg_align),
             DecoupledHead(channels[3], self.nc, m.head_width, m.fg_align),
@@ -91,6 +98,45 @@ class NMSFreeDetect(nn.Module):
     def forward(self, feats: dict, training: bool = False):
         return [head(feats[name], training=training)
                 for head, name in zip(self.heads, ("n3", "n5"))]
+
+    @torch.no_grad()
+    def _dedup_mask(self, boxes: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        """Keep-mask that removes duplicates (incl. cross-scale, nested) boxes.
+
+        ``boxes``/``scores`` must be sorted by descending score, so the greedy
+        pass keeps the most confident of each group.  Two boxes are duplicates
+        when
+
+        * ``IoU > dedup_iou``            (same object, similar size), or
+        * ``inter / min(area) > contain`` (small box nested in a big one, which
+          is exactly what P3-inside-P5 looks like and has a *low* IoU).
+
+        The loop runs over at most ``top_k`` boxes, i.e. a fixed, small bound,
+        and it is executed outside the exported graph (like the rest of
+        ``decode``), so latency stays deterministic.
+        """
+        n = boxes.shape[0]
+        keep = torch.ones(n, dtype=torch.bool, device=boxes.device)
+        if n <= 1:
+            return keep
+        area = ((boxes[:, 2] - boxes[:, 0]).clamp(min=0) *
+                (boxes[:, 3] - boxes[:, 1]).clamp(min=0))
+        for i in range(n):
+            if not bool(keep[i]):
+                continue
+            rest = keep.clone()
+            rest[:i + 1] = False
+            if not bool(rest.any()):
+                break
+            b = boxes[rest]
+            inter = ((torch.min(boxes[i, 2], b[:, 2]) - torch.max(boxes[i, 0], b[:, 0])).clamp(min=0) *
+                     (torch.min(boxes[i, 3], b[:, 3]) - torch.max(boxes[i, 1], b[:, 1])).clamp(min=0))
+            union = area[i] + area[rest] - inter
+            iou = inter / union.clamp(min=1e-7)
+            contain = inter / torch.minimum(area[i], area[rest]).clamp(min=1e-7)
+            dup = (iou > self.dedup_iou) | (contain > self.dedup_contain)
+            keep[rest] = ~dup
+        return keep
 
     # ----------------------------------------------------------------------------------
     @torch.no_grad()
@@ -183,8 +229,12 @@ class NMSFreeDetect(nn.Module):
             si = torch.cat(cand_si)[sel]
             boxes[..., 0::2] = boxes[..., 0::2].clamp(0, img_size[1])
             boxes[..., 1::2] = boxes[..., 1::2].clamp(0, img_size[0])
-            results.append(dict(boxes=boxes, scores=scores[sel], labels=labels,
-                                obj=obj, points=pts, scale_idx=si))
+            scores = scores[sel]
+            box_keep = self._dedup_mask(boxes, scores) if self.dedup else \
+                torch.ones(boxes.shape[0], dtype=torch.bool, device=device)
+            results.append(dict(boxes=boxes[box_keep], scores=scores[box_keep],
+                                labels=labels[box_keep], obj=obj[box_keep],
+                                points=pts[box_keep], scale_idx=si[box_keep]))
         return results
 
     @property

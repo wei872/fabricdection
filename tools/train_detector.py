@@ -308,6 +308,25 @@ def main():
                          if k != "total")
         log(f"epoch {ep + 1:3d}/{epochs}  {msg}  total={float(running.get('total', 0.0)) / n:.3f} "
             f"({time.time() - t0:.1f}s)  elapsed_total={format_eta(time.time() - global_t0)}")
+        # Weighted contribution of every loss term.  A single term owning most
+        # of `total` (e.g. the dense classification sum) starves regression /
+        # objectness and shows up as bad localisation, i.e. low precision --
+        # but that is invisible in the un-weighted line above.
+        try:
+            weights = {k: float(v) for k, v in dict(cfg.train.loss_weights).items()}
+            weights.update(rec=float(cfg.train.rec_weight),
+                           fg_context=(float(cfg.foreground.loss_weight)
+                                       if model.foreground is not None else 0.0))
+            contrib = {k: weights[k] * float(v) / n for k, v in running.items()
+                       if k in weights}
+            tot = sum(contrib.values())
+            if tot > 0:
+                top = sorted(contrib.items(), key=lambda kv: -kv[1])
+                log("      loss share: " +
+                    "  ".join(f"{k}={100.0 * v / tot:.0f}%" for k, v in top
+                              if v / tot >= 0.02))
+        except Exception:
+            pass
 
         # ---- validation: precision / recall / F1 / mAP50 / large recall -----
         val_metrics = None

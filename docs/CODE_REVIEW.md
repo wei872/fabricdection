@@ -1,11 +1,12 @@
-# 代码审查与优化建议（v0.1.9）
+# 代码审查与优化建议（v0.2.0）
 
 > 审查对象：`jingwei/`（推理库）+ `tools/`（训练/评估/部署 CLI）+ `tests/` + `configs/`。
 > 审查方式：逐文件静态审查 + 全部单元测试实跑 + 针对性探针脚本（下面每条结论都附复现方式或实测数字）。
 > 结论：**架构与工程质量已经不错，但存在 1 个会让"未知异常兜底"整体失效的 P0 级标定缺陷**，
-> 以及若干 P1 级坐标/平台/多进程/依赖兼容问题。本轮已修复 19 项（含 3 个 P0），剩余 13 项
+> 以及若干 P1 级坐标/平台/多进程/依赖兼容问题。本轮已修复 24 项（含 5 个 P0），剩余 13 项
 > （其中 2.13 汇总了 8 个低风险小项）按优先级列在第 2 节。
-> **第 0.5 节专门回答「precision 为什么涨不上来」**（v0.1.9 修复）。
+> **第 0.5 / 0.6 节专门回答「precision 为什么涨不上来」**（v0.1.9 第一轮 + v0.2.0 第二轮），
+> 并给出定位工具 `tools/diagnose_precision.py`。
 
 ---
 
@@ -16,7 +17,7 @@
 | 沙箱 | 2 vCPU / 3 GB RAM / 无 GPU（只为复现正确性与相对性能，不代表产线速度） |
 | Python / Torch | 3.11.2 / 2.4.1+cu121（CPU 执行） |
 | 基线（改动前） | `python -m unittest discover -s tests -v` → **Ran 35 tests in 123.6 s — OK (skipped=1)** |
-| 改动后 | **Ran 47 tests in 97.4 s — OK**（新增 12 项回归测试；装上 `onnx` 后 ONNX 导出测试不再 skip） |
+| 改动后 | **Ran 51 tests in 119 s — OK**（新增 16 项回归测试；装上 `onnx` 后 ONNX 导出测试不再 skip） |
 | 规模 | `jingwei_n` 6.36 M 参数 / 16.62 G MACs @1280；`jingwei_p` 2.93 M / 8.09 G MACs |
 
 只装 `requirements.txt` 时 `test_19_pico_onnx_export` 会被 skip（`onnx` 只是可选依赖），也就是说**导出路径在默认环境里其实从未被验证**，见 2.12。
@@ -136,6 +137,94 @@ python -m unittest tests.test_model.TestModel.test_47_fusion_calibration_ranks_b
 > 顺带解释你日志里的 `unknown_boxes=0`：stage A 用 `set_stage('detector')` 显式关掉了 normality 分支
 > （记忆库和重建器此时都未训练，其异常图近似常量），所以安全网在 stage A 不产生框——这是设计如此，
 > 不是 bug。安全网要等阶段 B/C 之后才会出现。
+
+---
+
+## 0.6 专题：precision 第二轮（v0.2.0）——「还是上不去」的其余三条通路
+
+v0.1.9 修掉了"一个缺陷 144 个框"之后，如果 precision 仍上不去，剩下的只可能是下面三条之一。
+这一版把三条都堵上，并且**给了一个一条命令定位到底是哪一条**的工具。
+
+### 通路 A：同一缺陷被 P3 和 P5 各报一次（跨尺度重复）
+
+峰值过滤是**逐尺度**的。一个真实缺陷在 P3 上是一个小框、在 P5 上是一个大框——
+两者是**嵌套**关系，IoU 只有 ~0.05（小框面积 / 大框面积），所以任何 IoU-based NMS 都不会删。
+结果：一个缺陷 = 2 个框 = 1 TP + 1 FP。
+
+实测（`tests/test_model.py::test_49`）：
+
+```
+dedup=True   -> 1 box     [476,476,492,492]
+dedup=False  -> 2 boxes   [476,476,492,492] + [400,400,656,656]      # 同一缺陷，两级尺度
+两个相距很远的缺陷 -> 2 boxes（不会被误删）
+```
+
+修复：`decode` 末尾加跨尺度去重（`model.dedup`，默认开）：
+复制判定 = `IoU > dedup_iou(0.70)` **或** `交/较小面积 > dedup_contain(0.85)`——
+后者专门抓"小框套在大框里"的嵌套重复。贪心按分数保留，框数 ≤ `top_k`，仍是固定上界、
+仍在导出图之外，**依然没有 NMS**。
+
+### 通路 B：92% 的像素从未学过「这是背景」
+
+`train.obj_o2o` 原来是 OHEM：只对最难的 `o2o_neg_ratio(2%)`，且有 `o2o_min_neg=2048` 兜底，
+即 P3 的 25600 个 cell 里只有 **2048 个（8%）** 拿到过梯度。实测（`test_50`）：
+
+```
+ohem   obj_o2o=0.0564  grad 非零 cell =  2049/25600   grad@远处背景 = +0.000e+00
+focal  obj_o2o=3.0260  grad 非零 cell = 25600/25600   grad@远处背景 = +1.301e-05
+```
+
+也就是说：一块**简单背景**（p≈0）的 cell 在 OHEM 下**永远拿不到"你是背景"的梯度**。
+如果它因为某次更新漂到 objectness ≈ 0.9，就再也没有东西把它拉回来 —— 这类误报**无法用阈值消除**
+（它和真缺陷的分数一样高），正是 `background` 类 FP 的来源之一。
+
+修复：`train.obj_o2o_mode: focal`（默认）—— 对**全部** cell 做 sigmoid focal loss（γ=2, α=0.25），
+按正样本数归一化，这就是 RetinaNet 的标准做法。`ohem` 保留用于 A/B。
+⚠️ focal 的绝对量级约为 ohem 的 ~50 倍，所以三个配置里的 `loss_weights.obj_o2o` 已从 **1.5 → 0.5**。
+
+### 通路 C：损失被 cls_o2m 吞掉，回归/objectness 几乎没在学
+
+新加的 `loss share` 行（每个 epoch 打印一次）在 smoke 上就直接暴露了问题：
+
+```
+epoch   1/1  cls_o2m=68.215 | box_o2m=17.290 | ... | obj_o2o=1.062 | ...
+      loss share: cls_o2m=50%  box_o2m=25%  box_o2o=23%
+```
+
+`obj_o2m` / `obj_o2o` 两项加起来不到 **1%**。objectness 就是部署时真正决定"这帧有没有东西"的量，
+它几乎没有梯度 —— 这与"precision 上不去、recall 却能涨"的现象完全吻合（框能出来，但置信度/背景区分没有在学）。
+
+**先看这一行**：如果 `obj_o2o` 占比 < 2%，就把 `train.loss_weights.obj_o2o` 抬高
+（focal 模式下建议 1.5–3.0），或者把 `cls_o2m` 从 1.0 降到 0.3–0.5 再看一轮。
+这一条是**超参问题，不需要改代码**，但以前没有任何地方能看见它。
+
+### 一条命令定位：`tools/diagnose_precision.py`
+
+```bash
+python tools/diagnose_precision.py --cfg configs/jingwei_p.yaml \
+    --ckpt runs/detector/best.pt --max-val 300
+```
+
+对给定 checkpoint 直接回答五个问题（每一节末尾给出"下一步改什么"）：
+
+1. **阈值扫描**：conf 0.05→0.60 的 boxes/img、precision、recall、F1、normal_FPR，
+   并给出 F1 最优阈值（这个值就该填进 `fusion.final_score_thresh`）；
+2. **FP 解剖**：duplicate / wrong_class / localization / background 各占多少；
+3. **按尺度**：P3(0) / P5(1) / 安全网(-1) 各自的 TP/FP —— 判断是不是某一级在刷框；
+4. **按类别**：每类 GT 数、TP、FP、precision、recall（19 类长尾里谁在拖后腿）；
+5. **混淆对**：`GT 类 -> 预测类` top-N（决定要不要上 `class_weights` 或 ROI 头）。
+
+工具打印的 verdict 直接对应动作：
+
+| 主导项 | verdict 给出的动作 |
+|---|---|
+| `duplicate` | 保持 peak_filter/dedup，把 `final_score_thresh` 提到 F1 最优点 |
+| `wrong_class` | 设 `train.class_weights`（按训练集逆频率）或打开 `fusion.roi_head` |
+| `localization` | 提高 `box_o2o/box_o2m` 权重，检查 `reg_scale` 与 GT 框质量 |
+| `background` | 阶段 A 混入正常图做 hard negative，保持 `obj_o2o_mode: focal` |
+
+实现细节：它先把 `fusion.final_score_thresh` 临时置 0 收集**未过滤**的候选框，再离线扫阈值；
+normal 集只前向一次（缓存后逐阈值统计 FPR），所以 300 张 val + 100 张 normal 在单卡上约几十秒。
 
 ---
 
@@ -391,6 +480,9 @@ AttributeError: module 'numpy' has no attribute 'trapz'. Did you mean: 'trace'?
 ```
 jingwei/head.py        decode 增加 3x3 局部极大值过滤（一个缺陷 144 框 → 1 框），
                        NMS-free / 静态延迟 / 可在图外执行；model.peak_filter 可回退
+                       跨尺度去重（嵌套小框套大框 containment>0.85）：model.dedup
+jingwei/losses.py      o2o objectness 支持 focal（全 cell，默认）/ ohem（旧行为）
+jingwei/fusion.py      scale_idx 透传：按 P3/P5/安全网分别统计 TP/FP
 jingwei/layers.py      LocalContrastNorm._box → 可分离 box（等价，-87% 算术）
 jingwei/data.py        list_images 单次遍历（+ 大小写/目录修正）；_seed_worker 增 random.seed
 jingwei/normality.py   AnomalyFusion(gate) → logit 空间混合，保标定
@@ -400,12 +492,14 @@ tools/predict.py       框坐标回投原图；视频流式解码（--dump-frame
 tools/calibrate_fusion.py  infer_labels_dir（Windows）+ normaltrain 回退；
                        候选按 val F1 排序 + --min-precision（不再只有 FPR 约束）
 tools/train_detector.py    best.pt 选择指标改为 best_f1（含 FPR 罚项）+ 每 epoch 打印
-                       boxes/img 与 FP 四分类（duplicate/wrong_class/localization/background）
+                       boxes/img 与 FP 四分类；新增 loss share 行（发现 cls 吞掉 50%）
+tools/diagnose_precision.py  **新增**：一条命令定位 precision 的五个来源 + verdict
 tools/evaluate.py      benchmark 在 cuda:N 上正确同步；average_precision 兼容 numpy 2 (np.trapezoid)
 tools/export.py        输出形状按 cfg 计算
 tools/_common.py       load_state_dict_report：missing/unexpected key 显式告警
-configs/*.yaml         coreset_ratio 标注为无效键；新增 peak_filter / peak_kernel
-tests/test_model.py    +12 项回归（37–48），test_24/34 适配新契约
+configs/*.yaml         新增 peak_filter / peak_kernel / dedup / obj_o2o_mode 等；
+                       obj_o2o 权重 1.5 → 0.5（focal 量级）；coreset_ratio 标注为无效
+tests/test_model.py    +16 项回归（37–52），test_24/34 适配新契约
 README.md / docs/*     测试数量与时长更正；新增本文件
 ```
 
