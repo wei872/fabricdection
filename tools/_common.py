@@ -84,6 +84,44 @@ def make_dataset(split, images_dir, labels_dir, img_size, args, *,
                               with_descriptor=with_descriptor)
 
 
+class NegativeMixDataset(Dataset):
+    """Yield defect-free frames as *pure negatives* for a fraction of samples.
+
+    Stage A used to see defect images only, so every frame it ever saw
+    contained at least one defect and every "background" cell it learned from
+    was fabric that happened to sit inside a defective frame.  The model
+    therefore learned "something is always here", which is exactly the
+    ``boxes/img = 55`` / ``normal_fpr = 1.0`` failure of the v0.2.1 run.
+
+    Mixing in ``normaltrain`` frames with **empty** targets fixes the prior
+    directly: a whole frame of normal texture now has to be scored as
+    background.  ``--normal-frac 0.25`` is the usual setting (one frame in
+    four); the length stays that of the positive split, so an epoch still
+    covers every defect image, just with fewer repeats.
+    """
+
+    def __init__(self, pos_ds, neg_ds, frac: float = 0.25, seed: int = 0):
+        self.pos_ds = pos_ds
+        self.neg_ds = neg_ds
+        self.frac = min(1.0, max(0.0, float(frac)))
+        self._rng = np.random.default_rng(int(seed))
+
+    def __len__(self) -> int:
+        return len(self.pos_ds)
+
+    def __getitem__(self, i):
+        if (self.neg_ds is not None and len(self.neg_ds) and
+                float(self._rng.random()) < self.frac):
+            d = dict(self.neg_ds[i % len(self.neg_ds)])
+            # every sample needs both keys: ``jingwei.data.collate`` only looks
+            # at ``batch[0]`` to decide, so a key missing from ONE sample means
+            # a KeyError from the others.
+            d["boxes"] = torch.zeros(0, 4)
+            d["labels"] = torch.zeros(0, dtype=torch.long)
+            return d
+        return self.pos_ds[i]
+
+
 def subset_indices(n: int, limit: int | None, seed: int = 0) -> list[int] | None:
     """Return a deterministic random subset of ``range(n)``.
 

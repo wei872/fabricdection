@@ -168,7 +168,8 @@ python tools/export.py    --cfg configs/jingwei_n.yaml --ckpt runs/bank/memory_b
   | `train.obj_o2o_mode / gamma / alpha` | focal / 2.0 / 0.5 | 正样本只占 0.1%–1%，alpha=0.25 是在压前景 |
   | `train.obj_o2o_neg_weight` | 2.5 | 背景项权重。平衡归一化给正负各 50% 份额，等于"输出 0.5 不亏"；>1 才有人为压低背景的梯度。**这是背景电平（`gate: p99`）的直接旋钮** |
   | `train.obj_o2m_neg_weight` / `cls_o2m_neg_weight` | 2.0 / 2.0 | 同上，作用在 o2m 分支与分类上；`score = obj·cls` 是乘积，两个因子都要低 |
-  | `loss_weights.obj_o2o` | 6.0 | 门控分支的份额。低于 1.0 时它在总 loss 里的占比会掉到 1% 以下 |
+  | `loss_weights.obj_o2o` | 10.0 | **门控分支的份额**。o2m 两项是训练专用的辅助分支，推理时一行都不跑；实测旧权重下它们拿走了 62% 的梯度、`obj_o2o` 只剩 2%，背景 objectness 于是永远压不下去。发布值让部署分支（`obj_o2o+cls_o2o+box_o2o`）占 ~58%（不含 fg 项） |
+  | `train.normal_image_frac` | 0.25 | 每个 batch 里来自 `normaltrain` 的**无框**图比例（`--normal-frac` 可覆盖）。阶段 A 以前一张正常布都没见过，"整帧无目标"是分布外输入——这是降 `normal_fpr` 最便宜的一招；数据集 yaml 没有 `normaltrain` 时会打印告警并跳过 |
 
 - 每个 epoch 的 val 块多两行：
 
@@ -181,7 +182,10 @@ python tools/export.py    --cfg configs/jingwei_n.yaml --ckpt runs/bank/memory_b
   * `p99` 是**背景电平**（全网 99 分位）：它不降，precision 不会涨。健康值 < 0.05；
   * `normal: boxes/img` 是"正常布上出几个框"，比 `normal_fpr` 这个 0/1 指标敏感得多；
   * `-> P=… R=…` 是 F1 最优点上的 precision/recall——下发阈值处偏低但这里已经很高，
-    说明该重标定阈值（`tools/calibrate_fusion.py`），而不是训练出了问题。
+    说明该重标定阈值（`tools/calibrate_fusion.py`），而不是训练出了问题；
+  * `obj_o2o` 的份额**恒定显示**；若出现 `[!] the branches that actually run at
+    inference own only N% of the loss`，说明有人把 `loss_weights.obj_o2o` 调小了
+    （或者 `configs/*.yaml` 没更新），部署分支会被饿住，precision 不会动。
 - **建议**：先用 `normaltrain` 里的图做"纯负样本"加入训练（无框），可显著降低 FPR。
 
 ### 3.2 阶段 B 细节（最容易出错）
@@ -269,7 +273,7 @@ python tools/train_normality.py --cfg configs/jingwei_n.yaml \
 ## 4. 快速自检（无真实数据）
 
 ```bash
-python -m unittest discover -s tests -v                 # 62 项，约 130 s（含验证指标 / 未知缺陷框 / 冷启动门控）
+python -m unittest discover -s tests -v                 # 64 项，约 145 s（含验证指标 / 未知缺陷框 / 冷启动门控）
 python tools/benchmark.py --all                         # p/n/s 参数量 / MACs / 延迟估算
 python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both  # 在你的 GPU 上实测
 python tools/train_detector.py   --smoke 2 --epochs 1 --batch 1 --device cpu --log-interval 1
@@ -288,7 +292,7 @@ python tools/export.py --check --out runs/export/jingwei_n.onnx
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | val 一直 `precision=0 recall=0 boxes/img=0.0`，且 `gate: max_score < conf` | 部署门没开：objectness 分支没有可用的特征（`obj_head_from: neck`）或质量目标塌陷 | v0.2.1/0.2.2 已修（[CODE_REVIEW.md §0.7](CODE_REVIEW.md) / §0.8）；确认 `model.obj_head_from: reg` 后重训。v0.2.2 之前保存的 checkpoint 与新 objectness 头**形状不同**：weight-only warm start（`dino_init.pt`）会自动跳过那 4 个张量并打印报告，完整 checkpoint 则降级为 weight-only（optimizer/LR schedule 重置） |
-| `boxes/img` 几十上百、`normal_fpr=1.0000`、`gate: max_score≈1` 但 `p99≈0.5` | 背景电平太高：`score = obj·cls` 在每个 cell 都过阈值 | 看 `gate: p99`；调 `train.obj_o2o_neg_weight`（2.5→4）、`obj_o2m_neg_weight` / `cls_o2m_neg_weight`；**不要**调高 `model.obj_bias_init`（那正是病因） |
+| `boxes/img` 几十上百、`normal_fpr=1.0000`、`gate: max_score≈1` 但 `p99≈0.5`（v0.2.2 之后仍然如此） | 背景电平太高：`score = obj·cls` 在每个 cell 都过阈值 | 看 `gate: p99`；调 `train.obj_o2o_neg_weight`（2.5→4）、`obj_o2m_neg_weight` / `cls_o2m_neg_weight`；**不要**调高 `model.obj_bias_init`（那正是病因） |
 | `precision`（下发阈值处）很低，但 `-> P=… R=…` 很高 | 阈值没标定，不是模型差 | 跑 `tools/calibrate_fusion.py`，把 `fusion.final_score_thresh` 回填（decode 用的是同一个值） |
 | val 一直 `precision=0` 但 `gate: max_score ≫ conf` | 框出来了但都是错框 | 跑 `tools/diagnose_precision.py` 看 FP 分解（duplicate / wrong_class / localization / background），再按 [CODE_REVIEW.md §0.5/§0.6](CODE_REVIEW.md) 的表格处理 |
 | `loss share` 里 `box_o2m` 长期 >60% | v0.2.1 之前像素 L1 没有归一化，量级随输入分辨率线性变化 | 已改成按图像边长归一化；若仍 >60%，说明 GT 框质量差或 `box_o2m` 权重过高 |

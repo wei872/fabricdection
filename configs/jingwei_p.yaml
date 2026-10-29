@@ -117,16 +117,20 @@ fusion:
   roi_prior_weight: 0.5
 
 train:
-  # 权重重新分配（v0.2.2）。实测 epoch 9 的 loss share：
-  #   box_o2m 39% / obj_o2m 24% / box_o2o 13% / fg 9% / cls_o2o 7% / cls_o2m 6%
-  #   / obj_o2o 1.3%
-  # 也就是说 63% 的梯度给了 o2m 训练分支（推理时**完全不跑**），而唯一决定
-  # "要不要出框"的 obj_o2o 只占 1.3% —— 它的背景电平因此停在 obj≈0.5，
-  # score=obj*cls 在每个 cell 都能过阈值（normal_fpr=1.0000, 55 框/图）。
-  # 现在大幅转向部署分支：cold-start smoke（320²）里 obj_o2o 单独就占 47%，
-  # 稳定后 o2m 两项合计从 63% 降到 ~35%（o2m 仍然要留够，否则共享特征学不好）。
-  loss_weights: {cls_o2m: 0.9, box_o2m: 1.2, obj_o2m: 0.7,
-                 cls_o2o: 3.0, box_o2o: 2.5, obj_o2o: 6.0, fg_align: 0.5}
+  # 按"推理时谁真的跑"分配权重（v0.2.3，见 CODE_REVIEW §0.9）。
+  # 实测（epoch 9，原始值）：box_o2m 1.31 / obj_o2m 1.66 / cls_o2m 0.46 /
+  #                         cls_o2o 0.30 / box_o2o 0.45 / obj_o2o 0.10
+  # 用旧权重（box_o2m 2.0, obj_o2m 1.0, obj_o2o 1.5）乘出来是
+  #   box_o2m 38% / obj_o2m 24% / box_o2o 9% / cls_o2m 7% / cls_o2o 5% / obj_o2o 2%
+  # —— **62% 的梯度给了推理时不跑的 o2m 分支**，而唯一决定"出不出框"的
+  # obj_o2o 只有 2%。它当然学不会"这块布上没有东西"，于是 55~85 框/图、
+  # normal_fpr=1.0、precision 0.3%。
+  # 下面这组把部署分支（obj_o2o+cls_o2o+box_o2o）拉到 ~40%（按上面原始值算：
+  # 13% + 12% + 14%），obj_o2o 从 2% 升到 ~13%。
+  # 注意 obj_o2o 的"值"天生很小（平衡 focal，背景学会后接近 0），所以权重必须大：
+  # 这是"权重 × 量级"的问题，不是损失本身有问题。
+  loss_weights: {cls_o2m: 0.9, box_o2m: 1.0, obj_o2m: 0.3,
+                 cls_o2o: 3.0, box_o2o: 2.5, obj_o2o: 10.0, fg_align: 0.5}
   class_weights: null
   o2o_candidates: 1200
   o2o_neg_ratio: 0.02       # per-scale hard negatives as a fraction of all cells
@@ -154,6 +158,11 @@ train:
   obj_o2m_pos_weight: 1.0     # 平衡归一化已经给正样本 50% 份额；再乘 4 会让
                               # 训练分支 objectness 占到总 loss 的 60%（实测）
   cls_o2m_pos_weight: 1.0
+  # 纯负样本混合（v0.2.3）：每个 batch 有这么大比例的图来自 normaltrain（**无框**）。
+  # 阶段 A 以前一张正常布都没见过，"整帧无目标"是没学过的样本；混进来以后
+  # "整帧都是正常纹理 => objectness 全 0" 才成为一条被显式监督的样本。
+  # 这是降 normal_fpr 最便宜的一招。0 = 关闭（--normal-frac 可临时覆盖）。
+  normal_image_frac: 0.25
   rec_p_final: 0.9
   rec_warmup: 1000
   rec_factor: 0.1

@@ -34,10 +34,11 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from _common import (ROOT, SyntheticNormalDataset, collect_rng_state, data_paths,
-                     format_eta, iter_speed, load_checkpoint, load_model, log,
-                     make_dataset, resolve, resume_checkpoint, save_checkpoint,
-                     set_global_seed, subset_indices)
+from _common import (ROOT, NegativeMixDataset, SyntheticNormalDataset,
+                     collect_rng_state, data_paths, format_eta, iter_speed,
+                     load_checkpoint, load_model, log, make_dataset, resolve,
+                     resume_checkpoint, save_checkpoint, set_global_seed,
+                     subset_indices)
 from evaluate import validate_detector
 from jingwei.data import collate, make_worker_init_fn
 from jingwei.utils import count_parameters
@@ -59,6 +60,10 @@ def main():
                     help="mixed precision: bf16 (default on CUDA, no scaler) / "
                          "off / fp16")
     ap.add_argument("--smoke", type=int, default=0, help="synthetic images for a dry run")
+    ap.add_argument("--normal-frac", type=float, default=None,
+                    help="fraction of each batch drawn from the defect-free "
+                         "split as pure negatives (default: "
+                         "train.normal_image_frac; 0 disables)")
     ap.add_argument("--max-batches", type=int, default=0,
                     help="stop each epoch after N batches (debug / benchmark only)")
     ap.add_argument("--resume", default=None,
@@ -126,6 +131,27 @@ def main():
         train_ds = make_dataset("train", resolve(paths["train"]), None,
                                 size, args, has_labels=True, augment=True,
                                 seed=args.seed)
+        # Defect-free frames as pure negatives (see NegativeMixDataset): the
+        # cheapest precision lever, because it turns "a whole frame with
+        # nothing in it" into a training example instead of an unseen case.
+        frac = (args.normal_frac if args.normal_frac is not None
+                else float(cfg.train.get("normal_image_frac", 0.0)))
+        if frac > 0:
+            nkey = "normaltrain" if "normaltrain" in paths else (
+                "normalval" if "normalval" in paths else None)
+            if nkey is None:
+                log("[!] train.normal_image_frac > 0 but the dataset yaml has "
+                    "no normaltrain/normalval split -> training on defect "
+                    "images only (normal-image FPR will stay high)")
+            else:
+                neg_ds = make_dataset(nkey, resolve(paths[nkey]), None, size,
+                                      args, has_labels=False, augment=True,
+                                      seed=args.seed + 7)
+                train_ds = NegativeMixDataset(train_ds, neg_ds, frac,
+                                              seed=args.seed)
+                log(f"negatives: {frac * 100:.0f}% of every batch is drawn "
+                    f"from {nkey} ({len(neg_ds)} defect-free frames, empty "
+                    "targets) -- this is what pulls obj_o2o on normal fabric down")
 
     nw = 0 if args.smoke else max(0, args.num_workers)
     loader_kw = dict(num_workers=nw, collate_fn=collate, drop_last=False,
@@ -328,9 +354,20 @@ def main():
             tot = sum(contrib.values())
             if tot > 0:
                 top = sorted(contrib.items(), key=lambda kv: -kv[1])
+                # ``obj_o2o`` is always shown: it sat at 2% in a real run and
+                # the 2% filter hid it, which is how "the branch that decides
+                # whether a box exists has no gradient budget" stayed invisible.
                 log("      loss share: " +
                     "  ".join(f"{k}={100.0 * v / tot:.0f}%" for k, v in top
-                              if v / tot >= 0.02))
+                              if v / tot >= 0.02 or k in ("obj_o2o", "cls_o2o")))
+                deployed = sum(contrib.get(k, 0.0)
+                               for k in ("obj_o2o", "cls_o2o", "box_o2o"))
+                if deployed / tot < 0.15:
+                    log(f"      [!] the branches that actually run at "
+                        f"inference own only {100.0 * deployed / tot:.0f}% of "
+                        "the loss (obj_o2o + cls_o2o + box_o2o); the o2m "
+                        "terms are training-only. Raise loss_weights.obj_o2o "
+                        "or lower the o2m weights (docs/CODE_REVIEW.md 0.9).")
         except Exception:
             pass
 

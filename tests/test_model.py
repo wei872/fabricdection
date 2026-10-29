@@ -10,7 +10,7 @@ invariance, memory-bank algebra, the dataset readers, Chinese / Unicode
 file paths, non-square fabric augmentation, training progress logs,
 full checkpoint resume, numpy RNG state checkpointing, dynamic
 local+global attention foreground context, validation metrics, and
-unknown-defect boxes / objectness gate cold start / warm start (62 tests).
+unknown-defect boxes / objectness gate cold start / warm start / negative mixing (64 tests).
 """
 from __future__ import annotations
 
@@ -1810,6 +1810,84 @@ class TestModel(unittest.TestCase):
                                        train=dict(stage="detector")),
                                   "detector", old, torch.optim.AdamW(old.parameters(), lr=1e-3), None)
         self.assertTrue(info2["full"])
+
+    # ------------------------------------------------ precision round 5 (v0.2.3)
+    def test_64_defect_free_frames_are_mixed_in_as_pure_negatives(self):
+        """A whole frame of normal fabric must be a training example.
+
+        Stage A used to see defect images only, so every "background" cell it
+        learned from was fabric inside a *defective* frame -- the model learned
+        "something is always here" (normal_fpr = 1.0, 55 boxes/img).  Mixing in
+        ``normaltrain`` frames with EMPTY targets fixes that prior directly.
+        """
+        from torch.utils.data import Dataset
+
+        from jingwei.data import collate
+        from _common import NegativeMixDataset
+
+        class Fake(Dataset):
+            def __init__(self, n, labelled):
+                self.n, self.labelled = n, labelled
+
+            def __len__(self):
+                return self.n
+
+            def __getitem__(self, i):
+                d = dict(image=torch.zeros(3, 8, 8) + i * 0.01)
+                if self.labelled:
+                    d["boxes"] = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+                    d["labels"] = torch.tensor([7])
+                return d
+
+        pos, neg = Fake(16, True), Fake(5, False)
+
+        only_neg = NegativeMixDataset(pos, neg, 1.0, seed=0)
+        self.assertEqual(len(only_neg), len(pos), "epoch length follows the positives")
+        for i in range(len(only_neg)):
+            d = only_neg[i]
+            self.assertEqual(tuple(d["boxes"].shape), (0, 4))
+            self.assertEqual(int(d["labels"].numel()), 0)
+
+        only_pos = NegativeMixDataset(pos, neg, 0.0, seed=0)
+        for i in range(len(only_pos)):
+            self.assertEqual(tuple(only_pos[i]["boxes"].shape), (1, 4))
+
+        mixed = NegativeMixDataset(pos, neg, 0.25, seed=0)
+        n_neg = sum(int(mixed[i]["boxes"].numel() == 0) for i in range(400))
+        self.assertTrue(0.15 <= n_neg / 400.0 <= 0.35, f"got {n_neg}/400 negatives")
+        # every sample carries both keys, or `collate` (which inspects batch[0])
+        # raises KeyError on the others
+        batch = collate([mixed[i] for i in range(4)])
+        self.assertEqual(len(batch["boxes"]), 4)
+        self.assertIn("labels", batch)
+        self.assertEqual(batch["image"].shape[0], 4)
+
+    def test_65_shipped_weights_fund_the_deployed_branches(self):
+        """The o2m terms are training-only; obj_o2o decides whether a box exists.
+
+        Measured on a real run (epoch 9, raw per-term losses).  With the weights
+        shipped before v0.2.3 the split was box_o2m 38% / obj_o2m 24% /
+        box_o2o 9% / cls_o2m 7% / cls_o2o 5% / **obj_o2o 2%** -- 62% of the
+        gradient went to machinery that does not run at inference, which is why
+        the background objectness never came down.
+        """
+        RAW = dict(cls_o2m=0.458, box_o2m=1.311, obj_o2m=1.663,
+                   cls_o2o=0.302, box_o2o=0.450, obj_o2o=0.101)
+        for name in ("jingwei_n", "jingwei_p", "jingwei_s"):
+            cfg = load_config(str(ROOT / f"configs/{name}.yaml"))
+            w = {k: float(v) for k, v in dict(cfg.train.loss_weights).items()}
+            contrib = {k: w[k] * v for k, v in RAW.items()}
+            tot = sum(contrib.values())
+            dep = sum(contrib[k] for k in ("obj_o2o", "cls_o2o", "box_o2o"))
+            self.assertGreaterEqual(contrib["obj_o2o"] / tot, 0.15,
+                                    f"{name}: obj_o2o is starved")
+            self.assertGreaterEqual(dep / tot, 0.45,
+                                    f"{name}: deployed branches own {dep / tot:.0%}")
+            self.assertGreaterEqual(float(cfg.train.obj_o2o_neg_weight), 1.5,
+                                    "background pressure must stay > 1")
+            self.assertGreater(float(cfg.train.obj_o2m_neg_weight), 1.0)
+            self.assertGreater(float(cfg.train.get("normal_image_frac", 0.0)), 0.0,
+                               "defect-free frames must be mixed in")
 
 
 if __name__ == "__main__":

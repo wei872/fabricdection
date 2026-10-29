@@ -1,4 +1,4 @@
-# 代码审查与优化建议（v0.2.2）
+# 代码审查与优化建议（v0.2.3）
 
 > 审查对象：`jingwei/`（推理库）+ `tools/`（训练/评估/部署 CLI）+ `tests/` + `configs/`。
 > 审查方式：逐文件静态审查 + 全部单元测试实跑 + 针对性探针脚本（下面每条结论都附复现方式或实测数字）。
@@ -526,8 +526,98 @@ bias 高只会让**第 0 步就淹没在 0.5 的背景里**，而这正是用户
 
 ---
 
+## 0.9 专题：precision 第五轮（v0.2.3）——门开了、框有了，但**布面上到处都算目标**
+
+v0.2.2 上线后用户重跑（同一份数据，440 张缺陷图，val ≈110 张）：
+
+```
+val   epoch   1/150  mAP50=0.0080 precision=0.0001 recall=0.0086 best_f1=0.0002@0.06
+                     normal_fpr=1.0000  boxes/img= 85.0  FP: background=8893 localization=454
+      gate: max_score=0.9997 obj_max=1.000 cls_max=1.000 cand>0.15=24607 -> out=9348
+      loss share: box_o2m=37%  obj_o2m=24%  cls_o2m=20%  box_o2o=12%  cls_o2o=3%
+...
+val   epoch   9/150  mAP50=0.0450 precision=0.0033 recall=0.1897 best_f1=0.0867@0.74
+      boxes/img= 55.0
+      loss share: box_o2m=38%  obj_o2m=24%  fg_context=10%  box_o2o=9%  cls_o2m=7%  cls_o2o=5%
+```
+
+好消息：**门从第 1 个 epoch 就开着**（`max_score=0.9997`，不再是 0.0025），
+`mAP50` 从 0 涨到 0.106，`recall` 从 0.0086 涨到 0.19 —— §0.7/§0.8 的两处冷启动修复确实生效了。
+
+坏消息：**`boxes/img = 85`、`normal_fpr = 1.0000`、`precision ≈ 0.003`**。
+检测器在 85% 的布面上都认为"这里有东西"，真正的缺陷（19% 召回）被 8893 个背景框埋掉。
+
+### 先看一个容易被忽略的事实：这次运行的**权重是旧的**
+
+日志里 `loss share` 的反解（`份额 × total ÷ 原始值`）：
+
+| 项 | 日志份额 | 反解出的权重 | v0.2.2 发布的权重 |
+|---|---|---|---|
+| `box_o2m` | 38% | ≈2.1 | 1.2 |
+| `obj_o2m` | 24% | ≈1.1 | 0.7 |
+| `box_o2o` | 9% | ≈1.5 | 2.5 |
+| `cls_o2o` | 5% | ≈1.2 | 3.0 |
+| `obj_o2o` | **2%** | ≈1.5 | **6.0** |
+
+也就是说：这次跑的是 **v0.2.1 的 `loss_weights`**（旧配置 2.0/1.0/1.5/1.5），
+而 head 是新的（否则门打不开）。**改代码后一定要确认 `configs/*.yaml` 也被拉下来了**：
+`git status` 有本地改动、或者只更新了 `jingwei/` 目录，就会得到"新头 + 旧权重"的组合，
+而这一组合恰好复现了"obj_o2o 只占 2%"的老毛病。
+
+### 这一轮的真正问题：部署分支仍然被饿着
+
+即便用 v0.2.2 的权重，按日志里的原始值算 `obj_o2o` 也只占 ~10%；
+而 o2m 两项（`box_o2m + obj_o2m`）合计 62%，**推理时一行都不跑**。
+`obj_o2o` 是唯一决定"这个 cell 要不要出框"的项，它拿不到梯度，就只能停在
+"布面上到处都是 0.2~0.5"这种平坦解——于是 224 个候选/图（`cand>0.15=24607`）里
+有 85 个最终落进输出。
+
+同时 `obj_o2o` 的**背景压力**（`obj_o2o_neg_weight`）和"整帧都是正常布"的样本
+这两个最直接的杠杆在 v0.2.2 里还不到位：
+
+* 平衡归一化把背景项的限制在 50% 份额，`neg_weight=1.5` 不足以把背景压到 0.02；
+* 阶段 A **一张正常布都没见过**（数据集里 `normaltrain` 一直没被用），
+  所以"整帧无目标"是一个分布外的输入——模型从没学过这种图应该全 0。
+
+### 修复（v0.2.3）
+
+| 位置 | v0.2.2 | v0.2.3 | 理由 |
+|---|---|---|---|
+| `loss_weights` | `box_o2m 1.2, obj_o2m 0.7, box_o2o 2.5, cls_o2o 3.0, obj_o2o 6.0` | `box_o2m 1.0, obj_o2m 0.3, box_o2o 2.5, cls_o2o 3.0, obj_o2o **10.0**` | 部署分支从 ~24% 提到 ~45%（按实测原始值），`obj_o2o` 2%→13-19% |
+| `train.normal_image_frac` | 无（阶段 A 只看缺陷图） | **0.25** | 每 4 张里混 1 张 `normaltrain` 的**无框**图：让"整帧正常"成为被监督的样本（`NegativeMixDataset`） |
+| `--normal-frac` | 无 | 新增 | 命令行临时覆盖 |
+| `obj_o2o_neg_weight` | 2.5 | 2.5（不变） | 已够；下面的权重才是瓶颈 |
+| `loss share` 行 | 只显示 ≥2% 的项 | **`obj_o2o` 恒定显示** + 部署分支 <15% 时告警 | 2% 的项被过滤掉了，这正是"分支饿着"没被发现的原因 |
+| `train_detector --smoke` | 合成 GT 固定写在 1280 尺度 | 按 `--size` 缩放 | 320² 冒烟时框全在图外，`obj_o2m` 等数值失真 |
+
+按实测原始值（`box_o2m 1.31, obj_o2m 1.66, cls_o2m 0.46, cls_o2o 0.30, box_o2o 0.45, obj_o2o 0.10`）
+算出的新份额（不含 fg 项）：`box_o2m 25% / box_o2o 21% / obj_o2o 19% / cls_o2o 17% / obj_o2m 9% / cls_o2m 8%`
+—— **部署分支 58%**，`obj_o2o` 19%，o2m 只剩 34%。`test_65` 把这条不变量钉住。
+
+### 重训后应该看到的
+
+| 指标 | v0.2.2 实测 | v0.2.3 预期 |
+|---|---|---|
+| `loss share: obj_o2o` | 2%（旧权重）/ ~10%（新权重） | 13–20%，且**稳定后不再掉回个位数** |
+| `normal: boxes/img` | 55–85 | 逐 epoch 单调下降（先降到 10 量级，再降到个位数） |
+| `gate: p99` | 与 `max_score` 几乎一样（都是 1.0 附近） | 与 `max_score` 拉开：p99 < 0.1 |
+| `precision`（下发阈值） | 0.003 | 与 `boxes/img` 反向变化；先看 `boxes/img`，它先动 |
+| `best_f1` | 0.0867@0.74 | 上升；若 `-> P=… R=…` 明显高于下发阈值处的 precision，说明该重标定阈值 |
+
+> ⚠️ 一定要确认 `configs/jingwei_p.yaml` 里的 `loss_weights` 是
+> `obj_o2o: 10.0, obj_o2m: 0.3`（`git status` 看一下有没有本地未拉取的改动）。
+> 用旧权重训出来的模型，`obj_o2o` 依然只有 2% 的梯度，precision 不会动。
+
+回归测试：`test_64`（正常帧作为纯负样本混合、epoch 长度不变、`collate` 契约）、
+`test_65`（发布的权重必须让部署分支拿到 ≥45%、`obj_o2o` ≥15%，且 `normal_image_frac > 0`）。
+
+---
+
 ## 1. 本轮已修复（按严重程度；0.5 / 0.6 / 0.7 三节专列的 precision 修复也在此列）
 
+> v0.2.3 的第五轮（部署分支的 loss 份额、正常帧作为纯负样本、`loss share` 告警）见 **§0.9**，
+> 回归测试 `test_64`–`test_65`。
+>
 > v0.2.2 的第四轮（objectness 读 reg stem、部署分支 loss 份额、背景压力、质量目标混合、单一阈值）见 **§0.8**，
 > 改动落在 `jingwei/losses.py` / `jingwei/head.py` / `tools/evaluate.py` / `tools/train_detector.py` / 三个 config，
 > 回归测试 `test_58`–`test_62`。
@@ -859,10 +949,21 @@ configs/*.yaml         obj_head_from / obj_o2m_neg_weight / cls_o2m_neg_weight�
 tests/test_model.py    +5 项回归（58–62）
 ```
 
+v0.2.3（第 5 轮，§0.9）增量：
+
+```
+tools/_common.py       NegativeMixDataset：按比例把 normaltrain 的无框图当纯负样本混进 batch
+tools/train_detector.py --normal-frac；loss share 恒显示 obj_o2o，部署分支 <15% 时告警
+                       --smoke 的合成 GT 按 --size 缩放（原来固定 1280 尺度）
+configs/*.yaml         loss_weights 重分配（obj_o2o 6.0 -> 10.0，obj_o2m 0.7 -> 0.3，
+                       box_o2m 1.2 -> 1.0）；新增 normal_image_frac: 0.25
+tests/test_model.py    +2 项回归（64–65）
+```
+
 ## 4. 复现命令
 
 ```bash
-# 全量测试（本机 62 项；装 requirements-dev.txt 后 onnx 用例不再 skip）
+# 全量测试（本机 64 项；装 requirements-dev.txt 后 onnx 用例不再 skip）
 python -m unittest discover -s tests -v
 
 # P0-1：融合门控是否破坏 0.5 标定点
