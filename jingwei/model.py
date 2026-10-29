@@ -44,7 +44,14 @@ class JingWei(nn.Module):
         self.img_size = tuple(int(v) for v in cfg.input_size)
         self.unknown_label = int(cfg.data.nc)          # extra class id = 19
 
-        self.backbone = WeaveCSP(cfg)
+        backbone_type = cfg.model.get("backbone", "weavecsp")
+        if backbone_type == "dinov2":
+            from .dinov2_backbone import DINOv2Backbone
+            self.backbone = DINOv2Backbone(cfg)
+        elif backbone_type == "weavecsp":
+            self.backbone = WeaveCSP(cfg)
+        else:
+            raise ValueError(f"unknown model.backbone: {backbone_type}")
         channels = self.backbone.out_channels          # (cd, c3, c4, c5)
         self.neck = DualScalePAN(cfg, channels)
         self.head = NMSFreeDetect(cfg, channels)

@@ -1,4 +1,7 @@
-"""Dual-scale, anchor-free, NMS-free detection head.
+"""Dual-scale, anchor-free detection head (NMS-free by default).
+
+The direct DINOv2 configuration explicitly enables optional class-aware NMS
+to diagnose/suppress duplicate predictions. It is not the NMS-free deployment path.
 
 The head is decoupled (cls / reg / obj), DFL-free (YOLO26/27 lineage) and has
 **two objectness branches that share the same cls/reg predictions**:
@@ -23,15 +26,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .layers import DWConv
-from .utils import boxes_from_distances
+from .utils import boxes_from_distances, classwise_nms
 
 
 class DecoupledHead(nn.Module):
-    def __init__(self, c: int, nc: int, width: float, training_branch: bool = True):
+    def __init__(self, c: int, nc: int, width: float, training_branch: bool = True,
+                 reg_activation: str = "relu"):
         super().__init__()
         h = max(16, int(c * width))
         stem = lambda: nn.Sequential(DWConv(c, h, 3), DWConv(h, h, 3))
         self.cls_stem, self.reg_stem = stem(), stem()
+        if reg_activation not in ("relu", "softplus"):
+            raise ValueError("reg_activation must be relu or softplus")
+        self.reg_activation = reg_activation
         self.cls_pred = nn.Conv2d(h, nc, 1)
         self.reg_pred = nn.Conv2d(h, 4, 1)
         self.obj_pred = nn.Conv2d(c, 1, 1)          # one-to-many (train only)
@@ -47,7 +54,8 @@ class DecoupledHead(nn.Module):
         f_cls, f_reg = self.cls_stem(x), self.reg_stem(x)
         out = {
             "cls": self.cls_pred(f_cls),
-            "reg": F.relu(self.reg_pred(f_reg)),
+            "reg": (F.softplus(self.reg_pred(f_reg)) if self.reg_activation == "softplus"
+                    else F.relu(self.reg_pred(f_reg))),
             "obj": self.obj_pred(x) if training else None,
             "obj_o2o": self.obj_o2o(x),
         }
@@ -65,9 +73,14 @@ class NMSFreeDetect(nn.Module):
         self.score_thresh = float(m.score_thresh)
         self.reg_scale = float(m.reg_scale)
         self.heads = nn.ModuleList([
-            DecoupledHead(channels[1], self.nc, m.head_width, m.fg_align),
-            DecoupledHead(channels[3], self.nc, m.head_width, m.fg_align),
+            DecoupledHead(channels[1], self.nc, m.head_width, m.fg_align,
+                          m.get("reg_activation", "relu")),
+            DecoupledHead(channels[3], self.nc, m.head_width, m.fg_align,
+                          m.get("reg_activation", "relu")),
         ])
+        self.nms_iou = float(m.get("detector_nms_iou", 0.0))
+        if not 0.0 <= self.nms_iou <= 1.0:
+            raise ValueError("detector_nms_iou must be between 0 and 1 (0 disables NMS)")
         self._points_cache: dict = {}
 
     def _points(self, h, w, stride, device):
@@ -87,8 +100,8 @@ class NMSFreeDetect(nn.Module):
     # ----------------------------------------------------------------------------------
     @torch.no_grad()
     def decode(self, preds, img_size, anomaly_boost: torch.Tensor | None = None):
-        """top-k + threshold over the one-to-one branch. No NMS, no post-hoc
-        data-dependent loops -> fixed, bounded latency.
+        """top-k + threshold over the one-to-one branch; optional class-aware NMS.
+        The original default skips NMS; enabling it adds data-dependent work.
 
         Returns list[B] of dict(boxes(N,4) xyxy px, scores(N,), labels(N,),
                                 obj(N,), points(N,2), scale_idx(N,)).
@@ -149,8 +162,12 @@ class NMSFreeDetect(nn.Module):
             si = torch.cat(cand_si)[sel]
             boxes[..., 0::2] = boxes[..., 0::2].clamp(0, img_size[1])
             boxes[..., 1::2] = boxes[..., 1::2].clamp(0, img_size[0])
-            results.append(dict(boxes=boxes, scores=scores[sel], labels=labels,
-                                obj=obj, points=pts, scale_idx=si))
+            result = dict(boxes=boxes, scores=scores[sel], labels=labels,
+                          obj=obj, points=pts, scale_idx=si)
+            if self.nms_iou > 0:
+                keep = classwise_nms(boxes, result["scores"], labels, self.nms_iou)
+                result = {key: value[keep] for key, value in result.items()}
+            results.append(result)
         return results
 
     @property

@@ -196,3 +196,22 @@ class GaussianSmooth(nn.Module):
         # through the opset-11+ Pad node, which would leave the exported
         # anomaly tensor with unknown dimensions for TensorRT.
         return F.conv2d(x, self.weight.to(x.dtype), padding=self.pad)
+
+
+@torch.no_grad()
+def classwise_nms(boxes, scores, labels, iou_threshold=0.5):
+    """Greedy class-aware NMS without a torchvision binary dependency.
+
+    Optional detector postprocessing, NOT part of the claimed NMS-free path.
+    Inputs are already bounded by detector top_k. Returns kept tensor indices.
+    """
+    order = scores.argsort(descending=True)
+    keep = []
+    while order.numel():
+        i = order[0]
+        keep.append(i)
+        rest = order[1:]
+        overlap = box_iou(boxes[i].unsqueeze(0), boxes[rest])[0]
+        suppress = (overlap > iou_threshold) & (labels[rest] == labels[i])
+        order = rest[~suppress]
+    return torch.stack(keep) if keep else labels.new_empty((0,))

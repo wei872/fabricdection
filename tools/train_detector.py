@@ -1,8 +1,10 @@
 """Stage A — supervised detector training on the YOLO-format defect data.
 
-    # recommended: warm-start from stage-0 DINOv2 distillation
+    # direct official pretrained DINOv2 backbone, no stage 0 / no old CNN checkpoint
+    python tools/train_detector.py --cfg configs/jingwei_dinov2.yaml --batch 2 --val-batch 2
+    # lightweight CNN: warm-start from stage-0 DINOv2 distillation
     python tools/train_detector.py --cfg configs/jingwei_n.yaml \
-        --resume runs/dino/dino_init.pt --epochs 150 --num-workers 4
+        --pretrained runs/dino/dino_init.pt --epochs 150 --num-workers 4
     # full resume after an interrupted run (optimizer / scheduler / RNG restored)
     python tools/train_detector.py --cfg configs/jingwei_n.yaml \
         --resume runs/detector/last.pt --epochs 150
@@ -14,6 +16,9 @@ The one-to-many head, the one-to-one (deployed) head and the foreground
 alignment auxiliary branch are trained together. The normality branch is
 skipped here (``set_stage('detector')``) and trained in stage B.
 
+``--pretrained`` explicitly loads weights only and starts a fresh optimizer /
+scheduler, even for a full checkpoint. Raw ViT weights must first be distilled
+with tools/pretrain_dino.py; they are not compatible with WeaveCSP.
 ``--resume`` auto-detects a full training checkpoint (``last.pt``) versus a
 weight-only warm start (``dino_init.pt``). Full checkpoints are written at
 every epoch; ``--save-interval N`` additionally keeps numbered snapshots.
@@ -59,10 +64,16 @@ def main():
                     help="mixed precision: bf16 (default on CUDA, no scaler) / "
                          "off / fp16")
     ap.add_argument("--smoke", type=int, default=0, help="synthetic images for a dry run")
+    ap.add_argument("--no-augment", action="store_true",
+                    help="disable training augmentation for controlled overfit/debug runs")
     ap.add_argument("--max-batches", type=int, default=0,
                     help="stop each epoch after N batches (debug / benchmark only)")
-    ap.add_argument("--resume", default=None,
-                    help="full training checkpoint (resume) or weight-only warm start")
+    init = ap.add_mutually_exclusive_group()
+    init.add_argument("--resume", default=None,
+                      help="resume full training state (legacy weight-only warm start also supported)")
+    init.add_argument("--pretrained", default=None,
+                      help="JingWei checkpoint for weight-only initialization; resets "
+                           "optimizer/scheduler/epoch. Direct raw DINOv2 weights go in model.dino_weights.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save-interval", type=int, default=0,
                     help="also keep epoch_XXXX.pt every N epochs (0 disables snapshots)")
@@ -93,7 +104,12 @@ def main():
         torch.set_float32_matmul_precision("high")
     # Weights are loaded by resume_checkpoint() below so a full checkpoint can
     # restore model + optimizer + scheduler + RNG in one place.
-    model, cfg = load_model(args.cfg, None, args.device)
+    model, cfg = load_model(args.cfg, None, args.device,
+                            initialize_pretrained=not bool(args.resume or args.pretrained))
+    direct_dino = cfg.model.get("backbone", "weavecsp") == "dinov2"
+    if direct_dino and not cfg.model.get("dino_pretrained", True) and not (args.resume or args.pretrained):
+        raise ValueError("Direct DINOv2 training requires pretrained weights; "
+                         "enable model.dino_pretrained or supply a direct-backbone checkpoint")
     paths = data_paths(cfg, args.data)
     epochs = args.epochs or int(cfg.train.detector_epochs)
     batch = args.batch or int(cfg.train.detector_batch)
@@ -102,7 +118,11 @@ def main():
 
     use_amp = args.amp != "off" and str(args.device).startswith("cuda")
     amp_dtype = torch.bfloat16 if args.amp == "bf16" else torch.float16
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and args.amp == "fp16")
+    scale_enabled = use_amp and args.amp == "fp16"
+    # torch.amp.GradScaler was added after the supported torch 2.0/2.2 releases.
+    scaler = (torch.amp.GradScaler("cuda", enabled=scale_enabled)
+              if hasattr(torch.amp, "GradScaler") else
+              torch.cuda.amp.GradScaler(enabled=scale_enabled))
 
     if args.smoke:
         ds = SyntheticNormalDataset(n=args.smoke, size=size)
@@ -113,12 +133,13 @@ def main():
                 d = ds[i]
                 d["boxes"] = torch.tensor([[100., 100., 260., 180.],
                                            [600., 700., 980., 740.]])
+                d["boxes"] *= size / 1280.0
                 d["labels"] = torch.tensor([1, 17])
                 return d
         train_ds = Wrapped()
     else:
         train_ds = make_dataset("train", resolve(paths["train"]), None,
-                                size, args, has_labels=True, augment=True,
+                                size, args, has_labels=True, augment=not args.no_augment,
                                 seed=args.seed)
 
     nw = 0 if args.smoke else max(0, args.num_workers)
@@ -147,6 +168,7 @@ def main():
                 def __getitem__(self, i):
                     d = base[i]
                     d["boxes"] = torch.tensor([[100., 100., 400., 300.]])
+                    d["boxes"] *= size / 1280.0
                     d["labels"] = torch.tensor([3])
                     return d
             vl = DataLoader(Wrap(), batch_size=1, shuffle=False,
@@ -182,14 +204,55 @@ def main():
     model.set_stage("detector")
     model.train()
     params = [p for p in model.parameter_groups("detector") if p.requires_grad]
-    opt = torch.optim.AdamW(params, lr=lr, weight_decay=float(cfg.train.weight_decay))
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=max(1, epochs * n_batches))
+    if direct_dino:
+        encoder = [p for p in model.backbone.encoder.parameters() if p.requires_grad]
+        encoder_ids = {id(p) for p in encoder}
+        groups = [{"params": [p for p in params if id(p) not in encoder_ids], "lr": lr}]
+        if encoder:
+            groups.append({"params": encoder,
+                           "lr": lr * float(cfg.model.get("dino_lr_mult", 0.1))})
+    else:
+        groups = params
+    opt = torch.optim.AdamW(groups, lr=lr, weight_decay=float(cfg.train.weight_decay))
+    warmup = int(float(cfg.train.get("warmup_epochs", 0)) * n_batches)
+    if warmup > 0:
+        import math
+        total_steps = max(warmup + 1, epochs * n_batches)
+        def lr_factor(step):
+            if step < warmup:
+                return float(step + 1) / warmup
+            progress = min(1., (step - warmup) / (total_steps - warmup))
+            return 0.05 + 0.95 * 0.5 * (1. + math.cos(math.pi * progress))
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_factor)
+    else:
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=max(1, epochs * n_batches))
 
     out = Path(args.out) if Path(args.out).is_absolute() else ROOT / args.out
     out.mkdir(parents=True, exist_ok=True)
 
-    resume_state = load_checkpoint(args.resume) if args.resume else None
+    init_path = args.resume or args.pretrained
+    resume_state = load_checkpoint(init_path) if init_path else None
+    if direct_dino and resume_state is not None:
+        sd = resume_state.get("model", resume_state)
+        # CNN distillation checkpoints are NOT direct ViT detector checkpoints.
+        # Require complete matching weights, particularly every frozen encoder tensor.
+        model.load_state_dict(sd, strict=True)
+    if args.pretrained:
+        # A raw ViT state_dict cannot initialize the CNN backbone: distil it
+        # with pretrain_dino.py first. Do not silently accept unrelated weights.
+        sd = resume_state.get("model", resume_state)
+        model_sd = model.state_dict()
+        if not any(k.startswith("backbone.") and k in model_sd
+                   and torch.is_tensor(v) and v.shape == model_sd[k].shape
+                   for k, v in sd.items()):
+            raise ValueError("--pretrained requires compatible JingWei backbone weights. "
+                             "Raw DINOv2/YOLO weights cannot be loaded directly; "
+                             "run tools/pretrain_dino.py to produce dino_init.pt.")
+        resume_state = dict(resume_state)
+        # Even a full last.pt is a fresh run when --pretrained is explicit.
+        for key in ("optimizer", "scheduler", "rng"):
+            resume_state.pop(key, None)
     info = (resume_checkpoint(resume_state, "detector", model, opt, sched,
                               train_ds, device=args.device)
             if resume_state is not None else None)
@@ -199,12 +262,34 @@ def main():
     best_score = float(meta.get("best_score", -1.0)) if info and info["full"] else -1.0
     resume_mode = ("full" if info and info["full"] else
                    "weights-only" if info else "none")
+    teacher = ((resume_state.get("teacher") or meta.get("teacher"))
+               if resume_state is not None else None)
 
     trainable = sum(p.numel() for p in params) / 1e6
     log("=" * 72)
     log("JingWei stage A - supervised detector training")
     log(f"cfg={args.cfg}  data={args.data or cfg.data.dataset_yaml}  device={args.device}")
-    log(f"resume={args.resume or 'none'}  mode={resume_mode}  out={out}")
+    log(f"resume={args.resume or 'none'}  pretrained={args.pretrained or 'none'}  "
+        f"mode={resume_mode}  out={out}")
+    if direct_dino:
+        log(f"DIRECT pretrained DINOv2 backbone={model.backbone.name} "
+            f"frozen={model.backbone.frozen} encoder_input={model.backbone.encoder_size}; "
+            "stage 0 is NOT required; encoder also runs at inference")
+    else:
+        log("DINOv2 teacher: NOT loaded in stage A (offline distillation is stage 0 only)")
+    if direct_dino and resume_state is None:
+        log("initialization=official pretrained DINOv2; pyramid adapters / detector head=new")
+    elif resume_state is None:
+        log("[!] initialization=random: no checkpoint supplied; dino: config alone "
+            "does not enable DINOv2 pretraining")
+    else:
+        if direct_dino:
+            log("initialization=direct DINOv2 detector checkpoint (encoder/adapters/head restored)")
+        elif teacher:
+            log(f"initialization checkpoint teacher={teacher} "
+                "(synthetic means smoke-only, not pretrained DINOv2)")
+        else:
+            log("initialization=checkpoint; DINOv2 provenance not recorded in this file")
     if args.device.startswith("cuda") and torch.cuda.is_available():
         log(f"gpu={torch.cuda.get_device_name(0)}")
     log(f"model={count_parameters(model) / 1e6:.2f} M params  "
@@ -214,6 +299,9 @@ def main():
         f"seed={args.seed}")
     log(f"start_epoch={start_epoch + 1}/{epochs}  global_iter={it}  "
         f"save_interval={args.save_interval}  log_interval={args.log_interval}")
+    log(f"best_metric={cfg.train.get('best_metric', 'recall_mix')}  "
+        f"warmup_epochs={cfg.train.get('warmup_epochs', 0)}  "
+        f"augment={not args.no_augment}  detector_nms_iou={model.head.nms_iou}")
     log(f"val_interval={args.val_interval}  val_batch={val_batch}  "
         f"val_workers={0 if args.smoke else args.val_workers}  "
         f"val_max={args.val_max}  normal_max={args.normal_max}  "
@@ -233,7 +321,9 @@ def main():
                 log(f"[!] resume mismatch: {key} checkpoint={old!r}, now={now!r}; "
                     "continuing with current CLI values")
     elif info:
-        log(f"[!] {args.resume}: {info['reason']}; starting from epoch 1")
+        log(f"[!] {init_path}: {info['reason']}; starting from epoch 1")
+        if args.pretrained:
+            log("--pretrained: fresh optimizer / scheduler; using current --lr / --epochs")
 
     if start_epoch >= epochs:
         log(f"checkpoint already reached epoch {start_epoch}/{epochs}; nothing to do")
@@ -327,16 +417,27 @@ def main():
                 f"recall={val_metrics['recall']:.4f}  "
                 f"f1={val_metrics['f1']:.4f}  "
                 f"best_f1={val_metrics['best_f1']:.4f}@{val_metrics['best_f1_thr']:.2f}  "
+                f"TP={val_metrics['tp']} FP={val_metrics['fp']} FN={val_metrics['fn']}  "
                 f"large_recall={val_metrics['large_recall']:.4f}  "
                 f"normal_fpr={val_metrics['normal_fpr']:.4f}  "
                 f"unknown_boxes={val_metrics['unknown_boxes']}  "
                 f"({val_metrics['seconds']:.1f}s)")
-            score = 0.5 * val_metrics["mAP50"] + 0.5 * val_metrics["large_recall"]
+            metric = str(cfg.train.get("best_metric", "recall_mix"))
+            if metric == "recall_mix":
+                score = 0.5 * val_metrics["mAP50"] + 0.5 * val_metrics["large_recall"]
+            elif metric in ("mAP50", "f1", "best_f1"):
+                score = float(val_metrics[metric])
+            else:
+                raise ValueError(f"unsupported train.best_metric: {metric}")
             if score > best_score:
                 best_score = score
                 save_checkpoint({"model": model.state_dict(),
                                  "metrics": val_metrics,
                                  "train": {"stage": "detector",
+                                           "teacher": teacher,
+                                           "backbone": cfg.model.get("backbone", "weavecsp"),
+                                           "dino_name": cfg.model.get("dino_name") if direct_dino else None,
+                                           "best_metric": metric,
                                            "epoch": ep + 1,
                                            "best_score": best_score}},
                                 out / "best.pt")
@@ -350,6 +451,11 @@ def main():
             "metrics": val_metrics,
             "train": {
                 "stage": "detector",
+                "backbone": cfg.model.get("backbone", "weavecsp"),
+                "dino_name": cfg.model.get("dino_name") if direct_dino else None,
+                "best_metric": cfg.train.get("best_metric", "recall_mix"),
+                "teacher": teacher,
+                "initialization_checkpoint": str(init_path) if init_path else None,
                 "format_version": 3,
                 "epoch": ep + 1,          # next epoch to run on resume
                 "iter": it,

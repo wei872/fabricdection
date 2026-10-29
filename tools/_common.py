@@ -305,13 +305,24 @@ def resume_checkpoint(state_or_path, stage: str, model, optimizer=None,
     }
 
 
-def load_model(cfg_path: str, ckpt: str | None = None, device="cpu"):
+def load_model(cfg_path: str, ckpt: str | None = None, device="cpu",
+               initialize_pretrained: bool = True):
     cfg = load_config(cfg_path)
-    model = build_model(cfg)
+    # A complete direct-backbone checkpoint contains encoder weights already.
+    # Construct architecture only; do not download/load official weights again.
+    direct = cfg.model.get("backbone", "weavecsp") == "dinov2"
+    original = cfg.model.get("dino_pretrained", True)
+    if direct and (ckpt or not initialize_pretrained):
+        cfg.model.dino_pretrained = False
+    try:
+        model = build_model(cfg)
+    finally:
+        if direct:
+            cfg.model.dino_pretrained = original
     if ckpt:
         state = load_checkpoint(ckpt)
         sd = state.get("model", state)
-        model.load_state_dict(sd, strict=False)
+        model.load_state_dict(sd, strict=direct)
     return model.to(device), cfg
 
 

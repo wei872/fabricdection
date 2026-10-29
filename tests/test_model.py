@@ -663,6 +663,8 @@ class TestModel(unittest.TestCase):
                        "--batch", "1", "--device", "cpu", "--num-workers", "0",
                        "--log-interval", "1", "--out", str(out / "det")])
             for token in ("JingWei stage A", "batches/epoch", "log_interval",
+                          "DINOv2 teacher: NOT loaded in stage A",
+                          "initialization=random",
                           "epoch   1/1  iter", "eta=", "checkpoint ->", "saved ->"):
                 self.assertIn(token, det)
 
@@ -789,6 +791,48 @@ class TestModel(unittest.TestCase):
                               "--out", str(out / "warm")))
             self.assertIn("mode=weights-only", warm)
             self.assertIn("starting from epoch 1", warm)
+            self.assertIn("teacher=synthetic", warm)
+            warm_ckpt = out / "warm" / "last.pt"
+            self.assertEqual(torch_load(warm_ckpt, map_location="cpu")
+                             ["train"]["teacher"], "synthetic")
+
+            # Explicit pretraining must ignore even a FULL checkpoint's old
+            # epoch, optimizer and cosine schedule, preserving teacher metadata.
+            fresh = run(common("tools/train_detector.py", "--smoke", "1",
+                               "--epochs", "1", "--batch", "1",
+                               "--num-workers", "0", "--val-interval", "0",
+                               "--pretrained", str(warm_ckpt), "--lr", "0.0003",
+                               "--out", str(out / "fresh")))
+            self.assertIn("mode=weights-only", fresh)
+            self.assertIn("start_epoch=1/1", fresh)
+            self.assertIn("global_iter=0", fresh)
+            self.assertIn("fresh optimizer / scheduler", fresh)
+            self.assertIn("teacher=synthetic", fresh)
+            fresh_state = torch_load(out / "fresh" / "last.pt", map_location="cpu")
+            self.assertEqual(fresh_state["train"]["iter"], 1)
+            self.assertEqual(fresh_state["train"]["teacher"], "synthetic")
+            self.assertEqual(fresh_state["scheduler"]["base_lrs"], [0.0003])
+
+            # Reject a raw teacher instead of accepting zero compatible keys.
+            raw = out / "raw_teacher.pt"
+            torch.save({"patch_embed.proj.weight": torch.zeros(1)}, raw)
+            bad = subprocess.run(common("tools/train_detector.py", "--smoke", "1",
+                                 "--epochs", "1", "--val-interval", "0",
+                                 "--pretrained", str(raw),
+                                 "--out", str(out / "bad")),
+                                 cwd=str(ROOT), env=env, capture_output=True,
+                                 text=True, timeout=180)
+            self.assertNotEqual(bad.returncode, 0)
+            self.assertIn("requires compatible JingWei backbone weights", bad.stderr)
+            self.assertFalse((out / "bad" / "last.pt").exists())
+
+            conflict = subprocess.run(common("tools/train_detector.py",
+                                      "--pretrained", str(raw),
+                                      "--resume", str(warm_ckpt)),
+                                      cwd=str(ROOT), env=env, capture_output=True,
+                                      text=True, timeout=180)
+            self.assertNotEqual(conflict.returncode, 0)
+            self.assertIn("not allowed with argument", conflict.stderr)
 
     # ------------------------------------------------------- numpy RNG state
     def test_28_numpy_rng_state_checkpoint(self):

@@ -8,7 +8,7 @@
 | [Ultralytics YOLO27](https://docs.ultralytics.com/models/yolo27) | 双尺度检测、加宽浅层、NMS-free、前景对齐监督、深层注意力 → 实时骨架 |
 | [PatchCore](https://github.com/amazon-science/patchcore-inspection) | 局部聚合块特征、正常特征记忆库、coreset 压缩 → **布种条件记忆库** |
 | [Dinomaly (CVPR 2025)](https://github.com/guojiajeremy/Dinomaly) | 冻结基础特征 + 噪声瓶颈 + 线性注意力 + 宽松重建 → **轻量重建残差** |
-| [DINOv2 (TMLR 2024)](https://github.com/facebookresearch/dinov2) | 自监督密集 patch 特征 → **阶段 0 离线 teacher 蒸馏**，训练后丢弃，不进推理图 |
+| [DINOv2 (TMLR 2024)](https://github.com/facebookresearch/dinov2) | 两条独立路径：轻量 CNN 的阶段 0 蒸馏；或 **直接用官方预训练 ViT 做检测主干**（保留在推理图） |
 
 **核心思路**：一个共享 CNN 主干同时喂给「有监督 19 类检测头」和「无监督正常性双信号」，
 再用一个**确定性安全网**把异常图上任何未被覆盖的大连通域强制输出成框 ——
@@ -28,6 +28,7 @@
 | **[docs/DESIGN.md](docs/DESIGN.md)** | **完整设计说明**（需求/架构/公式/训练/实时预算/风险/路线图），主交付物 |
 | [docs/TRAINING.md](docs/TRAINING.md) | 数据准备、阶段 0 + 五阶段训练命令、调参与故障排查 |
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | ONNX/TensorRT 导出、延迟预算、流水线、上线清单 |
+| **[docs/DINOV2_DETECTOR.md](docs/DINOV2_DETECTOR.md)** | **直接用官方预训练 DINOv2 ViT-B/14 训练阶段 A，不跑蒸馏脚本；冻结主干、NMS 与迁移学习说明** |
 | **[docs/DINO_PRETRAIN.md](docs/DINO_PRETRAIN.md)** | **用 DINOv2 做阶段 0 离线蒸馏预训练：为什么需要、命令、许可证、A/B 验证** |
 | **[docs/FOREGROUND.md](docs/FOREGROUND.md)** | **局部+全局注意力前景/背景分离、动态布幅跟随、边缘正常折入误报抑制** |
 | **[docs/CACHE_AND_VALIDATION.md](docs/CACHE_AND_VALIDATION.md)** | **每 epoch 精确率/召回率/mAP、未知疵点框、1660S 实时预测命令，以及大数据集训练速度实测** |
@@ -49,6 +50,23 @@ python -m unittest discover -s tests -v     # 应输出 OK (31 tests，含验证
 python tools/benchmark.py --both            # 参数量 / MACs / 延迟估算
 ```
 
+### 直接使用已预训练的 DINOv2（不跑阶段 0）
+
+如果目标是直接利用现成大模型特征，而不是先蒸馏一个轻量 CNN，使用新配置：
+
+```bat
+python tools/train_detector.py --cfg configs/jingwei_dinov2.yaml --data configs/fabric19.yaml --epochs 50 --batch 2 --val-batch 2 --num-workers 4 --amp bf16 --out runs/detector_dinov2
+```
+
+首次运行**不传旧 `dino_init.pt` 或 CNN 的 `last.pt`**。这条路径自动加载官方
+`dinov2_vitb14(pretrained=True)`，默认冻结 ViT，训练适配层 / PAN / 检测头。
+加载失败会报错，不会静默回退随机主干。支持本地源码和已下载的官方 `.pth`。
+默认包含 warmup、Softplus 回归输出、同类 NMS，按 best F1 选 checkpoint。
+**大模型也参与推理，不承诺原 pico 的实时速度；检测头仍需标注训练，未承诺真实指标提升。**
+详见 [直接 DINOv2 检测训练指南](docs/DINOV2_DETECTOR.md)。
+
+### 原轻量 CNN + 离线蒸馏路径
+
 接入真实数据：把 `configs/fabric19.yaml` 的 `train / val / normaltrain / normalval`
 指向你的目录（原 `dataset/dataset.yaml` 里是 `D:/tyhn/yolo/...`），然后按
 [docs/TRAINING.md](docs/TRAINING.md) 跑**阶段 0（推荐）+ 五阶段**。
@@ -59,7 +77,7 @@ python tools/benchmark.py --both            # 参数量 / MACs / 延迟估算
 # 多 worker 读图 + uint8 增强（大数据集请务必保留 --num-workers > 0）
 python tools/pretrain_dino.py     --cfg configs/jingwei_n.yaml --num-workers 4 --teacher dinov2_vits14 --log-interval 100
 # 每 epoch 输出 val 精确率/召回率/mAP50/大缺陷召回，并保存 best.pt
-python tools/train_detector.py    --cfg configs/jingwei_n.yaml --resume runs/dino/dino_init.pt --num-workers 4 --amp bf16 --log-interval 20 --val-interval 1
+python tools/train_detector.py    --cfg configs/jingwei_n.yaml --pretrained runs/dino/dino_init.pt --num-workers 4 --amp bf16 --log-interval 20 --val-interval 1
 python tools/train_normality.py   --cfg configs/jingwei_n.yaml --num-workers 4 --ckpt runs/detector/best.pt --log-interval 100
 python tools/build_memory_bank.py --cfg configs/jingwei_n.yaml --ckpt runs/normality/normality.pt
 python tools/calibrate_fusion.py  --cfg configs/jingwei_n.yaml --ckpt runs/bank/memory_bank.pt
