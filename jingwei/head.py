@@ -28,47 +28,80 @@ from .utils import boxes_from_distances
 
 class DecoupledHead(nn.Module):
     def __init__(self, c: int, nc: int, width: float, training_branch: bool = True,
-                 obj_bias_init: float = -4.0, cls_bias_init: float = -2.0):
+                 obj_bias_init: float = -4.0, cls_bias_init: float = -2.0,
+                 obj_from: str = "reg", obj_pred_bias_init: float = -4.0):
         super().__init__()
         h = max(16, int(c * width))
         stem = lambda: nn.Sequential(DWConv(c, h, 3), DWConv(h, h, 3))
         self.cls_stem, self.reg_stem = stem(), stem()
         self.cls_pred = nn.Conv2d(h, nc, 1)
         self.reg_pred = nn.Conv2d(h, 4, 1)
-        self.obj_pred = nn.Conv2d(c, 1, 1)          # one-to-many (train only)
-        self.obj_o2o = nn.Conv2d(c, 1, 1)           # one-to-one  (deployed)
+        # WHERE the objectness heads read from (v0.2.2).
+        #
+        # They used to be a bare 1x1 conv on the *raw neck feature* ``x`` while
+        # cls / reg each get two 3x3 DWConvs.  A 1x1 conv cannot turn a smooth
+        # neck map into a one-cell peak, so the objectness field settled on a
+        # flat compromise -- measured from a real run: ``obj_o2o`` ~0.5 and
+        # ``obj_o2m`` ~0.78 *on background*, which at ``score = obj*cls`` makes
+        # every 3x3 peak clear the 0.15 gate => 55 boxes/img, precision 0.3%,
+        # normal-image FPR 1.0, and the flood is what caps precision.
+        #
+        # ``obj_from: "reg"`` (default) reads the regression stem, which is
+        # localisation-aware and *already computed* (the 1x1 convs even get
+        # narrower, h < c); the extra objectness stem below costs +0.17 G MACs
+        # at 1280 px on pico, i.e. +2.1% (8.086 -> 8.257 G).  Ablation with the
+        # shipped knobs and this stem removed (`obj_head_from: neck`): the
+        # deployed score is still 0.033 after 300 Adam steps -- the gate never
+        # opens at all.  ``"neck"`` therefore stays only for A/B.
+        self.obj_from = str(obj_from).lower()
+        if self.obj_from == "reg":
+            # A defect is a *local contrast* event ("this patch does not look
+            # like the fabric around it"), so the objectness head needs a
+            # receptive field of several cells, not one.  3x3 then 5x5 depthwise
+            # convs take it to 9 cells ~ 72 px at stride 8, for ~0.1 G MACs at
+            # 1280 px (< 1.5% of the pico budget).  This is the head that was a
+            # bare 1x1 conv on the neck -- the layer that produced a flat
+            # objectness field (obj ~ 0.5 on background).
+            self.obj_stem = nn.Sequential(DWConv(h, h, 3), DWConv(h, h, 5))
+            src = h
+        else:
+            self.obj_stem = nn.Identity()
+            src = c
+        self.obj_pred = nn.Conv2d(src, 1, 1)        # one-to-many (train only)
+        self.obj_o2o = nn.Conv2d(src, 1, 1)         # one-to-one  (deployed)
         self.fg_pred = nn.Conv2d(h, 1, 1) if training_branch else None
         self.fg_stem = stem() if training_branch else None
 
         # Objectness / classification priors.
         #
-        # ``-4.0`` (p = 0.018) keeps the initial score
-        # ``sigmoid(obj)*sigmoid(cls) ~ 0.02`` -- below both the decode gate
-        # (``model.score_thresh``) and the fusion gate
-        # (``fusion.final_score_thresh``), so the first iterations emit no
-        # boxes.  That is normal *if the branch then learns*: measured on a
-        # head-only cold start (400 Adam steps, lr 2e-3) the deployed score
-        # crosses 0.05 at step 7 and reaches 0.6 by step 20 -- the 1x1 conv
-        # moves its logits through the *weights*, so the bias is not the
-        # bottleneck and must not be pre-loaded to a high prior: with -2.0 the
-        # very first step already emits 99 boxes (top_k saturated), i.e.
-        # precision ~0 and a normal-image FPR spike in epoch 1.
+        # ``obj_bias_init`` is NOT the cold-start bottleneck -- do not raise it
+        # to "get boxes sooner".  Measured (head-only probe, frozen real
+        # backbone features, 320 px, AdamW lr 2e-3): with ``-4`` the deployed
+        # branch's positive objectness goes 0.06 -> 0.98 in **9 steps**, because
+        # the 1x1 conv raises the logit through its *weights*, not through the
+        # bias.  What a high prior does buy is a *higher background level* that
+        # then has to be pressed back down (background p99 after 200 steps):
+        # ``-4 -> 0.063``, ``-2 -> 0.119``, ``-1 -> 0.146`` (and occasionally a
+        # positive cell collapses).  Since ``score = obj * cls`` and a flat
+        # background is exactly the v0.2.1 failure (55 boxes/img, precision
+        # 0.3%, normal_fpr 1.0), the low prior is the right default.
         #
-        # They stay configurable (``model.obj_bias_init`` /
-        # ``model.cls_bias_init``, logit space) purely as debugging knobs: if
-        # the val line keeps reporting ``gate: max_score < conf`` for more than
-        # a few epochs, drop obj_bias_init to -2.0 and compare.
-        nn.init.constant_(self.obj_pred.bias, -4.0)   # train-only branch
+        # The cold start is fixed structurally instead: the objectness heads
+        # read the regression stem (``obj_head_from``), carry a real share of
+        # the loss (``train.loss_weights.obj_o2o``) and get explicit background
+        # pressure (``train.obj_o2o_neg_weight``).
+        nn.init.constant_(self.obj_pred.bias, float(obj_pred_bias_init))
         nn.init.constant_(self.obj_o2o.bias, float(obj_bias_init))
         nn.init.constant_(self.cls_pred.bias, float(cls_bias_init))
 
     def forward(self, x, training: bool = False):
         f_cls, f_reg = self.cls_stem(x), self.reg_stem(x)
+        obj_src = self.obj_stem(f_reg) if self.obj_from == "reg" else x
         out = {
             "cls": self.cls_pred(f_cls),
             "reg": F.relu(self.reg_pred(f_reg)),
-            "obj": self.obj_pred(x) if training else None,
-            "obj_o2o": self.obj_o2o(x),
+            "obj": self.obj_pred(obj_src) if training else None,
+            "obj_o2o": self.obj_o2o(obj_src),
         }
         out["fg"] = self.fg_pred(self.fg_stem(x)) if (training and self.fg_stem is not None) else None
         return out
@@ -100,13 +133,18 @@ class NMSFreeDetect(nn.Module):
         self.dedup_contain = float(m.get("dedup_contain", 0.85))
         obj_bias_init = float(m.get("obj_bias_init", -4.0))
         cls_bias_init = float(m.get("cls_bias_init", -2.0))
+        obj_from = str(m.get("obj_head_from", "reg"))
+        obj_pred_bias_init = float(m.get("obj_pred_bias_init", -4.0))
         self.obj_bias_init = obj_bias_init
         self.cls_bias_init = cls_bias_init
+        self.obj_from = obj_from
         self.heads = nn.ModuleList([
             DecoupledHead(channels[1], self.nc, m.head_width, m.fg_align,
-                          obj_bias_init=obj_bias_init, cls_bias_init=cls_bias_init),
+                          obj_bias_init=obj_bias_init, cls_bias_init=cls_bias_init,
+                          obj_from=obj_from, obj_pred_bias_init=obj_pred_bias_init),
             DecoupledHead(channels[3], self.nc, m.head_width, m.fg_align,
-                          obj_bias_init=obj_bias_init, cls_bias_init=cls_bias_init),
+                          obj_bias_init=obj_bias_init, cls_bias_init=cls_bias_init,
+                          obj_from=obj_from, obj_pred_bias_init=obj_pred_bias_init),
         ])
         # Diagnostics for "is the deployed gate open?" (see train_detector's
         # val line).  decode() is graph-external, so bookkeeping here is free.
@@ -182,8 +220,17 @@ class NMSFreeDetect(nn.Module):
         B = preds[0]["cls"].shape[0]
         device = preds[0]["cls"].device
         results = []
-        stats = dict(score_max=0.0, obj_max=0.0, cls_max=0.0,
-                     n_peak=0, n_above=0, n_out=0, score_thresh=self.score_thresh)
+        # ``score_p99`` is the *background* level: the 99th percentile of
+        # ``obj*cls`` over EVERY cell of the map.  ``score_max`` alone cannot
+        # tell "the detector found a defect" from "the field is flat but one
+        # cell won the lottery": in the v0.2.1 run ``score_max`` sat at 0.9997
+        # (one lucky cell per frame, logits are unbounded) while the median
+        # cell sat at ~0.5 -> every 3x3 peak cleared the gate -> 55 boxes/img
+        # and normal_fpr = 1.0.  A healthy frame has p99 near the gate's
+        # *background* side (<= 0.02); a flat field shows p99 ~ obj_p99.
+        stats = dict(score_max=0.0, score_p99=0.0, obj_max=0.0, obj_mean=0.0,
+                     cls_max=0.0, n_peak=0, n_above=0, n_out=0,
+                     score_thresh=self.score_thresh)
 
         for b in range(B):
             cand_boxes, cand_scores, cand_labels, cand_obj, cand_pts, cand_si = [], [], [], [], [], []
@@ -236,7 +283,17 @@ class NMSFreeDetect(nn.Module):
                 # identically 0 whatever else is tuned.
                 stats["score_max"] = max(stats["score_max"],
                                         float(top.values.max()) if top.values.numel() else 0.0)
+                # ``quantile`` has no half/bfloat16 kernel and validation
+                # may run under autocast -> always quantile in float32.
+                sf = score.float()
+                sel_q = peak_mask if peak_mask is not None and bool(peak_mask.any()) else None
+                stats["score_p99"] = max(stats["score_p99"],
+                                         float((sf[sel_q] if sel_q is not None
+                                                else sf).quantile(0.99)))
                 stats["obj_max"] = max(stats["obj_max"], float(prob_obj.max()))
+                # accumulated, then divided by (#scales * B) before returning
+                stats["obj_mean"] = stats["obj_mean"] + float(prob_obj.mean())
+                stats["_obj_n"] = stats.get("_obj_n", 0) + 1
                 stats["cls_max"] = max(stats["cls_max"], float(cscore.max()))
                 stats["n_peak"] += int(peak_mask.sum()) if peak_mask is not None else score.numel()
                 stats["n_above"] += int((top.values > self.score_thresh).sum())
@@ -280,6 +337,7 @@ class NMSFreeDetect(nn.Module):
                                 labels=labels[box_keep], obj=obj[box_keep],
                                 points=pts[box_keep], scale_idx=si[box_keep]))
             stats["n_out"] += int(box_keep.sum())
+        stats["obj_mean"] = stats["obj_mean"] / max(1, stats.pop("_obj_n", 1))
         self.last_stats = stats
         return results
 

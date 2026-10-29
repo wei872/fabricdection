@@ -46,17 +46,27 @@ def _flatten_records(records):
     return flat
 
 
-def _best_f1(records, n_gt):
-    """Best global F1 over the detector's own PR curve."""
+def _best_f1(records, n_gt, with_pr: bool = False):
+    """Best global F1 over the detector's own PR curve.
+
+    The *reported* precision uses the shipped confidence threshold, which can be
+    far below the detector's own optimum: a real run printed ``precision=0.0026``
+    at conf 0.15 while ``best_f1=0.0867@0.74`` -- i.e. 0.3% vs ~5.5% precision
+    at the threshold the model actually wants.  Returning P/R at that operating
+    point (``with_pr=True``) keeps "precision is not rising" from being confused
+    with "the shipped threshold is wrong".
+    """
     flat = _flatten_records(records)
     if not flat or n_gt <= 0:
-        return 0.0, 0.0
+        return (0.0, 0.0, 0.0, 0.0) if with_pr else (0.0, 0.0)
     cum_tp = np.cumsum([1.0 if t else 0.0 for _, t in flat])
     cum_fp = np.cumsum([0.0 if t else 1.0 for _, t in flat])
     precision = cum_tp / np.maximum(cum_tp + cum_fp, 1.0)
     recall = cum_tp / float(n_gt)
     f1 = 2.0 * precision * recall / np.maximum(precision + recall, 1e-12)
     i = int(np.argmax(f1))
+    if with_pr:
+        return float(f1[i]), float(flat[i][0]), float(precision[i]), float(recall[i])
     return float(f1[i]), float(flat[i][0])
 
 
@@ -114,13 +124,16 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
     # head.decode): ``gate_max`` below the confidence threshold means the model
     # is not producing detections at all, which is a *different* failure from
     # "detections are wrong" and must not be debugged as a precision problem.
-    liveness = {"gate_max": 0.0, "obj_max": 0.0, "cls_max": 0.0,
+    liveness = {"gate_max": 0.0, "gate_p99": 0.0, "obj_max": 0.0,
+                "obj_mean": 0.0, "cls_max": 0.0,
                 "n_above": 0, "n_out": 0}
     for batch in loader:
         dets = model(batch["image"].to(device))
         st = getattr(getattr(model, "head", None), "last_stats", None) or {}
         if st:
             liveness["gate_max"] = max(liveness["gate_max"], float(st.get("score_max", 0.0)))
+            liveness["gate_p99"] = max(liveness["gate_p99"], float(st.get("score_p99", 0.0)))
+            liveness["obj_mean"] = max(liveness["obj_mean"], float(st.get("obj_mean", 0.0)))
             liveness["obj_max"] = max(liveness["obj_max"], float(st.get("obj_max", 0.0)))
             liveness["cls_max"] = max(liveness["cls_max"], float(st.get("cls_max", 0.0)))
             liveness["n_above"] += int(st.get("n_above", 0))
@@ -199,7 +212,7 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
     precision = tp / max(tp + fp, 1)
     recall = tp / max(tp + fn, 1)
     f1 = 2 * precision * recall / max(precision + recall, 1e-9)
-    best_f1, best_f1_thr = _best_f1(records, total_gt)
+    best_f1, best_f1_thr, best_p, best_r = _best_f1(records, total_gt, with_pr=True)
     pr_at = _pr_at_thresholds(records, total_gt, pr_thresholds or ())
     pr = {"precision": float(precision), "recall": float(recall),
           "f1": float(f1), "tp": int(tp), "fp": int(fp), "fn": int(fn),
@@ -207,6 +220,7 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
           "unknown_boxes": int(unknown_boxes),
           "dets_per_image": float(n_det) / max(1.0, float(n_images)),
           "best_f1": best_f1, "best_f1_thr": best_f1_thr,
+          "best_precision": best_p, "best_recall": best_r,
           "fp_breakdown": fp_breakdown, "pr_at": pr_at}
     pr.update(liveness)
     if large_min_area is not None:
@@ -217,13 +231,31 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
 
 
 @torch.no_grad()
-def normal_fpr(model, loader, device):
-    n = fp = 0
+def normal_fpr(model, loader, device, return_extra: bool = False):
+    """Fraction of normal frames with >=1 box, plus *how many* boxes and how high.
+
+    ``normal_fpr`` alone saturates at 1.0 as soon as the detector emits a single
+    box per normal frame, which hides an order-of-magnitude difference between
+    "one stray box" and "55 boxes on every normal frame" (the v0.2.1 run
+    reported ``normal_fpr = 1.0000`` from epoch 1 to 9 while
+    ``boxes/img`` was 42-97).  ``boxes/img`` and the *pre-gate* peak score on
+    normal fabric are the two numbers that actually say whether the
+    objectness field is selective, so they are returned as well.
+    """
+    n = fp = nbox = 0
+    smax = 0.0
     for batch in loader:
         dets = model(batch["image"].to(device))
         n += len(dets)
         fp += sum(len(d["boxes"]) > 0 for d in dets)
-    return fp / max(1, n), fp, n
+        nbox += sum(len(d["boxes"]) for d in dets)
+        st = getattr(getattr(model, "head", None), "last_stats", None)
+        if st:
+            smax = max(smax, float(st.get("score_max", 0.0)))
+    base = (fp / max(1, n), fp, n)
+    if not return_extra:
+        return base
+    return base + (nbox / max(1, n), smax)
 
 
 @torch.no_grad()
@@ -241,9 +273,10 @@ def validate_detector(model, val_loader, norm_loader, device, cfg,
                                   pr_thresholds=pr_thresholds)
     rec = pr.pop("large_recall", 0.0)
     if norm_loader is not None:
-        fpr, nfp, nn = normal_fpr(model, norm_loader, device)
+        fpr, nfp, nn, nbpi, smax = normal_fpr(model, norm_loader, device,
+                                              return_extra=True)
     else:
-        fpr, nfp, nn = 0.0, 0, 0
+        fpr, nfp, nn, nbpi, smax = 0.0, 0, 0, 0.0, 0.0
     out = {
         "mAP50": float(map50),
         "AP50": [float(a) for a in aps],
@@ -251,6 +284,8 @@ def validate_detector(model, val_loader, norm_loader, device, cfg,
         "normal_fpr": float(fpr),
         "normal_fp": int(nfp),
         "normal_n": int(nn),
+        "normal_boxes_per_image": float(nbpi),
+        "normal_score_max": float(smax),
         "conf_thresh": conf,
         "iou_thr": float(iou_thr),
     }

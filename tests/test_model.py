@@ -10,7 +10,7 @@ invariance, memory-bank algebra, the dataset readers, Chinese / Unicode
 file paths, non-square fabric augmentation, training progress logs,
 full checkpoint resume, numpy RNG state checkpointing, dynamic
 local+global attention foreground context, validation metrics, and
-unknown-defect boxes (31 tests).
+unknown-defect boxes / objectness gate cold start (61 tests).
 """
 from __future__ import annotations
 
@@ -1591,6 +1591,160 @@ class TestModel(unittest.TestCase):
                         "gate_max below conf == nothing emitted, not bad boxes")
         self.assertEqual(pr["n_above"], 0)
 
+    # ------------------------------------------------ precision round 4 (v0.2.2)
+    def test_58_background_weight_pushes_the_field_down(self):
+        """`neg_weight` must actually move the background side of a term.
+
+        The v0.2.1 run ended at ``obj_o2o = 0.086`` with ``obj ~ 0.5`` *on
+        background*: a 50/50 balanced term has no "switch off" pressure, so the
+        deployed score ``obj*cls`` cleared the 0.15 gate on ordinary fabric
+        (55 boxes/img, precision 0.3%, normal_fpr 1.0).
+        """
+        from jingwei.losses import _balanced_bce
+
+        bce = torch.ones(1, 4)
+        is_pos = torch.tensor([[True, False, False, False]])
+        base = float(_balanced_bce(bce, is_pos))                 # 1 (pos) + 1 (neg)
+        heavier = float(_balanced_bce(bce, is_pos, neg_weight=2.5))
+        self.assertAlmostEqual(base, 2.0, places=6)
+        self.assertAlmostEqual(heavier, 1.0 + 2.5, places=6)
+        self.assertGreater(heavier, base)
+        # and it must not touch the positive side
+        self.assertAlmostEqual(
+            float(_balanced_bce(bce, is_pos, pos_weight=2.0)), 3.0, places=6)
+
+    def test_59_objectness_reads_the_regression_stem(self):
+        """The deployed objectness head may not be a bare 1x1 conv on the neck.
+
+        A 1x1 conv cannot turn a smooth neck map into a one-cell peak, and the
+        measured field was flat (obj ~ 0.5 on background).  ``obj_head_from``
+        now defaults to ``reg``: two more depthwise convs give it a 9-cell
+        receptive field (~72 px at stride 8) with no extra backbone work.
+        """
+        from jingwei.head import NMSFreeDetect
+
+        cfg = load_config(CFG_P)
+        cfg = cfg.copy()
+        cfg.model.obj_head_from = "reg"
+        head = NMSFreeDetect(cfg, [0, 96, 0, 288])
+        for hd in head.heads:
+            self.assertEqual(hd.obj_from, "reg")
+            self.assertIsInstance(hd.obj_stem, torch.nn.Sequential)
+            h = hd.obj_stem[0].pw.out_channels
+            self.assertEqual(hd.obj_o2o.weight.shape[1], h,
+                             "objectness must read the stem, not the neck")
+            self.assertEqual(hd.obj_pred.weight.shape[1], h)
+        # A/B path stays available.
+        cfg.model.obj_head_from = "neck"
+        head_n = NMSFreeDetect(cfg, [0, 96, 0, 288])
+        self.assertIsInstance(head_n.heads[0].obj_stem, torch.nn.Identity)
+        self.assertEqual(head_n.heads[0].obj_o2o.weight.shape[1], 96)
+
+    def test_60_decode_reports_the_background_level(self):
+        """`score_p99` separates "found a defect" from "the field is flat"."""
+        from jingwei.head import NMSFreeDetect
+
+        cfg = load_config(CFG_P)
+        head = NMSFreeDetect(cfg, [0, 96, 0, 288]).eval()
+        flat = 0.25                                     # sigmoid(0) * sigmoid(0)
+        preds = [dict(cls=torch.zeros(1, cfg.data.nc, 40, 40),
+                      reg=torch.ones(1, 4, 40, 40),
+                      obj_o2o=torch.zeros(1, 1, 40, 40), obj=None),
+                 dict(cls=torch.zeros(1, cfg.data.nc, 10, 10),
+                      reg=torch.ones(1, 4, 10, 10),
+                      obj_o2o=torch.zeros(1, 1, 10, 10), obj=None)]
+        dets = head.decode(preds, (320, 320))
+        st = head.last_stats
+        self.assertAlmostEqual(st["score_max"], flat, places=3)
+        self.assertAlmostEqual(st["score_p99"], flat, places=3)
+        self.assertAlmostEqual(st["obj_mean"], 0.5, places=3)
+        self.assertGreater(len(dets[0]["boxes"]), 0,
+                           "score 0.25 > gate 0.15 -> boxes must be emitted")
+        self.assertGreater(st["n_above"], 0)
+
+    def test_61_the_deployed_gate_opens_on_the_shipped_config(self):
+        """End-to-end cold start: >=1 box above the gate within 120 Adam steps.
+
+        This is the regression for the real run that logged ``boxes/img = 0.0``
+        for two epochs.  Measured with the shipped knobs: the gate is open by
+        step ~25; with the v0.2.1 knobs (``obj_bias_init=-4``, neck 1x1
+        objectness) it is *still shut after 300 steps* (score 0.03).
+        """
+        from jingwei.model import build_model
+        from jingwei.losses import DetectionLoss
+
+        cfg = load_config(CFG_P)
+        torch.manual_seed(0)
+        model = build_model(cfg).eval()
+        imgs = torch.rand(2, 3, 320, 320)
+        with torch.no_grad():
+            feats = model.neck(model.backbone(imgs))
+        head = model.head
+        head.train()
+        loss_fn = DetectionLoss(cfg)
+        tgt = [dict(boxes=torch.tensor([[100., 100., 160., 160.]]),
+                    labels=torch.tensor([3])),
+               dict(boxes=torch.zeros(0, 4), labels=torch.zeros(0, dtype=torch.long))]
+        opt = torch.optim.AdamW(head.parameters(), lr=float(cfg.train.detector_lr))
+        thresh = float(cfg.fusion.final_score_thresh)
+        self.assertAlmostEqual(thresh, float(cfg.model.score_thresh), places=9,
+                               msg="one absolute threshold (CODE_REVIEW §2.13)")
+        opened_at = None
+        for it in range(120):
+            opt.zero_grad(set_to_none=True)
+            out = loss_fn(head(feats, training=True), tgt, (320, 320))
+            out["total"].backward()
+            opt.step()
+            if it % 10 == 9:
+                with torch.no_grad():
+                    p = head(feats, training=False)
+                    sc = torch.cat([(q["obj_o2o"].sigmoid() *
+                                     q["cls"].sigmoid().max(1, keepdim=True).values).reshape(-1)
+                                    for q in p])
+                    if float(sc.max()) > thresh:
+                        opened_at = it + 1
+                        break
+        self.assertIsNotNone(opened_at, "the deployed gate never opened in 120 steps")
+        with torch.no_grad():
+            dets = head.decode(head(feats, training=False), (320, 320))
+        st = head.last_stats
+        self.assertGreater(float(st["score_p99"]), 0.0)
+        self.assertLessEqual(float(st["score_p99"]), float(st["score_max"]) + 1e-6)
+        self.assertGreater(sum(len(d["boxes"]) for d in dets), 0,
+                           "an open gate must produce boxes")
+
+    def test_62_best_f1_reports_its_operating_point_precision(self):
+        """precision must be reported at the F1-optimal conf, not only at the
+        shipped one (the real run printed P=0.0026 at conf 0.15 while the model's
+        own optimum was ``0.0867@0.74`` -- 0.3% vs ~5.5%)."""
+        import numpy as np
+        from evaluate import _best_f1, normal_fpr
+
+        records = [[(0.9, True), (0.8, True), (0.7, False), (0.6, False)]]
+        best_f1, thr, p, r = _best_f1(records, 2, with_pr=True)
+        self.assertAlmostEqual(p, 1.0, places=6)
+        self.assertAlmostEqual(r, 1.0, places=6)
+        self.assertAlmostEqual(thr, 0.8, places=6)
+        self.assertAlmostEqual(best_f1, 1.0, places=6)
+        self.assertEqual(len(_best_f1(records, 2)), 2)
+
+        class Stub(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head = torch.nn.Module()
+                self.head.last_stats = dict(score_max=0.31, score_p99=0.28)
+
+            def forward(self, x):
+                return [dict(boxes=torch.ones(3, 4), scores=torch.ones(3)),
+                        dict(boxes=torch.zeros(0, 4), scores=torch.zeros(0))]
+
+        fpr, nfp, n, bpi, smax = normal_fpr(
+            Stub(), [dict(image=torch.zeros(2, 3, 64, 64))], "cpu", return_extra=True)
+        self.assertAlmostEqual(fpr, 0.5, places=6)
+        self.assertAlmostEqual(bpi, 1.5, places=6)
+        self.assertAlmostEqual(smax, 0.31, places=6)
+        self.assertEqual((nfp, n), (1, 2))
+        self.assertTrue(np.isfinite(bpi))
 
 
 if __name__ == "__main__":

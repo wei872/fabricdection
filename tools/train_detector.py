@@ -363,7 +363,9 @@ def main():
                 f"wrong_class={fb.get('wrong_class', 0)} "
                 f"localization={fb.get('localization', 0)} "
                 f"background={fb.get('background', 0)}  "
-                f"(best operating point: conf>={val_metrics['best_f1_thr']:.2f})")
+                f"(best operating point: conf>={val_metrics['best_f1_thr']:.2f} "
+                f"-> P={val_metrics.get('best_precision', 0.0):.3f} "
+                f"R={val_metrics.get('best_recall', 0.0):.3f})")
             # Is the deployed gate open at all?  ``gate`` is the maximum
             # ``sigmoid(obj)*sigmoid(cls)`` over every decoded peak *before* the
             # threshold is applied, so it separates the two very different
@@ -371,12 +373,21 @@ def main():
             #   gate < conf  -> the model emits nothing (objectness/classification
             #                   cold-start problem, not a threshold problem);
             #   gate >> conf -> the model emits boxes but they are wrong.
+            # ``p99`` is the decisive number of the v0.2.1 run: ``max_score``
+            # was 0.9997 on *every* frame (one unbounded logit wins somewhere)
+            # while the 99th percentile -- i.e. the background level -- sat at
+            # ~0.5, so every 3x3 peak cleared the gate.  A selective model has
+            # ``max_score`` high AND ``p99`` low; a flat one has both high.
             log(f"      gate: max_score={val_metrics.get('gate_max', 0.0):.4f} "
+                f"p99={val_metrics.get('gate_p99', 0.0):.4f} "
                 f"(conf={val_metrics['conf_thresh']:.2f})  "
-                f"obj_max={val_metrics.get('obj_max', 0.0):.3f}  "
+                f"obj_max={val_metrics.get('obj_max', 0.0):.3f} "
+                f"obj_mean={val_metrics.get('obj_mean', 0.0):.3f}  "
                 f"cls_max={val_metrics.get('cls_max', 0.0):.3f}  "
                 f"cand>{val_metrics['conf_thresh']:.2f}={val_metrics.get('n_above', 0)} "
-                f"-> out={val_metrics.get('n_out', 0)}")
+                f"-> out={val_metrics.get('n_out', 0)}  "
+                f"normal: boxes/img={val_metrics.get('normal_boxes_per_image', 0.0):.1f} "
+                f"max_score={val_metrics.get('normal_score_max', 0.0):.3f}")
             # Model selection must be precision-aware.  The old objective
             # (0.5*mAP50 + 0.5*large_recall) ignored precision completely and
             # is maximised by flooding the frame with boxes: recall rises,
@@ -393,9 +404,11 @@ def main():
                     log(f"[!] the deployed gate is SHUT: max score {gate:.4f} < "
                         f"conf {val_metrics['conf_thresh']:.2f}, so the model "
                         "cannot emit a single box. This is a training-signal "
-                        "problem (objectness/classification cold start), not a "
-                        "threshold problem: see train.obj_quality_floor / "
-                        "model.obj_bias_init / train.obj_o2o_alpha.")
+                        "problem, not a threshold problem. Check, in order: "
+                        "model.obj_head_from (must be 'reg'; 'neck' leaves the "
+                        "objectness field flat), loss_weights.obj_o2o, and "
+                        "train.obj_bias_init (do NOT raise it). See "
+                        "docs/CODE_REVIEW.md §0.8.")
                 else:
                     log("[!] no usable detections this epoch (precision = recall = 0); "
                         "best.pt only becomes meaningful once boxes clear the "

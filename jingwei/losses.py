@@ -156,7 +156,22 @@ def build_dense_targets(pred, targets, stride, nc, reg_scale, radius=1.5,
         # while still ranking positives by quality once the regression works.
         qmax = float(qual.max()) if qual.numel() else 0.0
         if qmax > 1e-6:
-            t_qual[b, 0, idx] = (qual / qmax).clamp(min=float(quality_floor))
+            # Blend "binary target" and "IoU-aware target" by the scale's own
+            # best IoU (v0.2.2).
+            #
+            # ``qual / qmax`` alone is *noise amplification* at cold start:
+            # every IoU is ~0.02, they differ only by noise, yet the largest
+            # of them is mapped to 1.0 and the rest clamped -- so an arbitrary
+            # positive cell is taught "objectness 1.0" while its neighbour is
+            # taught 0.5, and which is which flips every batch.  Using the
+            # best IoU itself as the blend weight removes that: if the
+            # regression cannot localise (qmax ~ 0) the target is the uniform
+            # 1.0 -- exactly the "there is an object here" signal objectness
+            # needs -- and the quality ranking fades in only once the boxes
+            # start matching (qmax -> 1).
+            rel = qual / qmax
+            w = min(1.0, max(0.0, qmax))
+            t_qual[b, 0, idx] = (w * rel + (1.0 - w)).clamp(min=float(quality_floor))
         else:
             t_qual[b, 0, idx] = 1.0
         pos[b, 0, idx] = True
@@ -276,6 +291,14 @@ class DetectionLoss(nn.Module):
         self.cls_quality_target = bool(cfg.train.get("cls_quality_target", False))
         self.o2m_pos_weight = float(cfg.train.get("obj_o2m_pos_weight", 1.0))
         self.cls_o2m_pos_weight = float(cfg.train.get("cls_o2m_pos_weight", 1.0))
+        # Background pressure (v0.2.2).  A balanced 50/50 term lets the
+        # objectness/classification field settle on a *flat* mid value: with
+        # ``obj_o2o`` = 0.086 (a real run) the implied mean background
+        # objectness is ~0.5, and at ``score = obj*cls`` every 3x3 peak then
+        # clears the 0.15 gate -> 55 boxes/img, precision 0.3%.  >1 pushes the
+        # background side down so the field becomes selective.
+        self.o2m_neg_weight = float(cfg.train.get("obj_o2m_neg_weight", 1.0))
+        self.cls_o2m_neg_weight = float(cfg.train.get("cls_o2m_neg_weight", 1.0))
 
     def forward(self, preds, targets, img_size):
         device = preds[0]["cls"].device
@@ -290,7 +313,6 @@ class DetectionLoss(nn.Module):
         img_ref = float(max(float(img_size[0]), float(img_size[1])))
         losses = {k: torch.zeros((), device=device) for k in
                   ("cls_o2m", "box_o2m", "obj_o2m", "cls_o2o", "box_o2o", "obj_o2o", "fg_align")}
-
         # ---------- one-to-many dense branch ----------
         for si, p in enumerate(preds):
             stride = self.strides[si]
@@ -309,18 +331,22 @@ class DetectionLoss(nn.Module):
             mod = (cls.sigmoid() - target).abs().pow(2)
             cw = self.class_weights[None, :, None]
             # "positive" means "this (cell, class) entry carries a label".
-            # Using ``pos.expand(B, nc, HW)`` instead would count the 19 classes
-            # of every positive cell as positive and dilute the positive term
-            # 19x -- and it silently stays "balanced" while the positives are
-            # being outvoted again.
+            # Deliberately NOT ``pos.expand(B, nc, HW)`` (that counts the 19
+            # classes of every positive cell as positive and dilutes the
+            # positive mean 19x, so the term silently drifts back to
+            # background-dominated), and not ``target > 0.5`` either (with
+            # ``cls_quality_target`` the target is soft -- a well-localised box
+            # would read 0.6 and its class would be counted as background).
             losses["cls_o2m"] = losses["cls_o2m"] + _balanced_bce(
                 ce * mod * cw, t_cls > 0.5,
-                pos_weight=self.cls_o2m_pos_weight)
+                pos_weight=self.cls_o2m_pos_weight,
+                neg_weight=self.cls_o2m_neg_weight)
 
             bce_obj = F.binary_cross_entropy_with_logits(p["obj"].reshape(B, 1, HW), t_qual,
                                                          reduction="none")
             losses["obj_o2m"] = losses["obj_o2m"] + _balanced_bce(
-                bce_obj, pos, pos_weight=self.o2m_pos_weight)
+                bce_obj, pos, pos_weight=self.o2m_pos_weight,
+                neg_weight=self.o2m_neg_weight)
 
             pm = pos.expand(B, 4, HW)
             pred_d = (p["reg"].float() * self.reg_scale * stride).reshape(B, 4, HW)[pm].reshape(-1, 4)
@@ -329,6 +355,8 @@ class DetectionLoss(nn.Module):
             if pred_d.numel():
                 pb = boxes_from_distances(p_sel, pred_d)
                 gb = boxes_from_distances(p_sel, tgt_d)
+                # CIoU is already scale-free; the L1 auxiliary is on pixel
+                # distances and therefore divided by the image side.
                 losses["box_o2m"] = losses["box_o2m"] + \
                     (1.0 - box_ciou(pb, gb)).mean() + \
                     0.1 * F.l1_loss(pred_d / img_ref, tgt_d / img_ref)

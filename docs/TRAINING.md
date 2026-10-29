@@ -155,22 +155,33 @@ python tools/export.py    --cfg configs/jingwei_n.yaml --ckpt runs/bank/memory_b
   + 局部+全局注意力前景上下文损失（见 FOREGROUND.md）；
 - 优化器 AdamW + cosine，梯度裁剪 5.0；
 - 若某类 AP 特别低，在 `train.class_weights` 里填 19 个权重（如按 `1/sqrt(样本数)` 归一化）；
-- 冷启动（v0.2.1 起）：部署分数 `sigmoid(obj)·sigmoid(cls)` 必须越过
-  `model.score_thresh`（0.05）和 `fusion.final_score_thresh`（0.15）才会出框，
-  所以这几项不要随手改：
+- 出框门槛（v0.2.2 起只有 **一个** 绝对阈值）：部署分数
+  `sigmoid(obj_o2o)·sigmoid(cls)` 越过 `fusion.final_score_thresh`（0.15）才出框，
+  `model.score_thresh` 必须与它相等（`test_61` 会检查）。所以这几项不要随手改：
 
   | 配置 | 默认 | 作用 |
   |---|---|---|
-  | `model.obj_bias_init` / `cls_bias_init` | -4.0 / -2.0（σ≈0.018 / 0.119） | 初始分数 ≈0.002，前几十步不出框是正常的（实测第 7 步越过 0.05）。把它们调高到 -2.0 **不会**更快学会，只会让第 0 步就吐出上百个框（见 CODE_REVIEW §0.7） |
-  | `train.obj_quality_floor` | 0.5 | objectness/质量目标的下限；0 会让"预测 IoU≈0"的冷启动把正样本目标也压成 0 |
+  | `model.obj_head_from` | `reg` | **objectness 读哪层特征**。`reg` = 回归 stem + 自带 3×3→5×5 DWConv（9 cell ≈72 px 感受野）；`neck` = 旧的裸 1×1 卷积——实测用 `neck` 时 `score` 300 步只有 0.033，门**永远打不开**（见 CODE_REVIEW §0.8）。除非做 A/B，不要改成 `neck` |
+  | `model.obj_bias_init` / `cls_bias_init` | -4.0 / -2.0（σ≈0.018 / 0.119） | 初始分数 ≈0.002，前几十步不出框是正常的（实测第 7 步越过 0.15）。调高到 -2.0 **不会**更快学会，只会让第 0 步就吐出 99~150 个框、背景电平停在 0.5（见 CODE_REVIEW §0.8） |
+  | `train.obj_quality_floor` | 0.0 | 质量目标下限。目标是 `w·(qual/qmax)+(1-w)`、`w=qmax`：回归没学时自动恒为 1.0，不需要再垫底线；设成 0.5 会把"定位很差的匹配"教成 objectness 0.5 |
   | `train.cls_quality_target` | false | true 时分类目标是 `one-hot × 质量`，冷启动会把缺陷的分类学成 ~0.02 |
   | `train.obj_o2o_mode / gamma / alpha` | focal / 2.0 / 0.5 | 正样本只占 0.1%–1%，alpha=0.25 是在压前景 |
-  | `train.obj_o2o_neg_weight` | 1.0 | 背景项权重，>1 更抑制背景误报 |
-  | `loss_weights.obj_o2o` | 1.5 | 门控分支；低于 1.0 时它在总 loss 里的占比会掉到 1% 以下 |
+  | `train.obj_o2o_neg_weight` | 2.5 | 背景项权重。平衡归一化给正负各 50% 份额，等于"输出 0.5 不亏"；>1 才有人为压低背景的梯度。**这是背景电平（`gate: p99`）的直接旋钮** |
+  | `train.obj_o2m_neg_weight` / `cls_o2m_neg_weight` | 2.0 / 2.0 | 同上，作用在 o2m 分支与分类上；`score = obj·cls` 是乘积，两个因子都要低 |
+  | `loss_weights.obj_o2o` | 6.0 | 门控分支的份额。低于 1.0 时它在总 loss 里的占比会掉到 1% 以下 |
 
-- 每个 epoch 的 val 块多一行 `gate: max_score=… obj_max=… cls_max=…`：
-  `max_score < conf` 表示**模型一个框都没出**（训练信号问题，不是阈值问题），
-  `max_score ≫ conf` 而 precision 低才是"框错了"，去跑 `tools/diagnose_precision.py`。
+- 每个 epoch 的 val 块多两行：
+
+  ```
+        gate: max_score=0.9312 p99=0.0431 (conf=0.15)  obj_max=0.98 obj_mean=0.061  ...
+        normal: boxes/img=0.4 max_score=0.079
+  ```
+
+  * `max_score < conf` ⇒ **一个框都没出**（训练信号问题，不是阈值问题）；
+  * `p99` 是**背景电平**（全网 99 分位）：它不降，precision 不会涨。健康值 < 0.05；
+  * `normal: boxes/img` 是"正常布上出几个框"，比 `normal_fpr` 这个 0/1 指标敏感得多；
+  * `-> P=… R=…` 是 F1 最优点上的 precision/recall——下发阈值处偏低但这里已经很高，
+    说明该重标定阈值（`tools/calibrate_fusion.py`），而不是训练出了问题。
 - **建议**：先用 `normaltrain` 里的图做"纯负样本"加入训练（无框），可显著降低 FPR。
 
 ### 3.2 阶段 B 细节（最容易出错）
@@ -258,7 +269,7 @@ python tools/train_normality.py --cfg configs/jingwei_n.yaml \
 ## 4. 快速自检（无真实数据）
 
 ```bash
-python -m unittest discover -s tests -v                 # 56 项，约 129 s（含验证指标 / 未知缺陷框 / 冷启动门控）
+python -m unittest discover -s tests -v                 # 61 项，约 126 s（含验证指标 / 未知缺陷框 / 冷启动门控）
 python tools/benchmark.py --all                         # p/n/s 参数量 / MACs / 延迟估算
 python tools/bench_device.py --cfg configs/jingwei_p.yaml --precision both  # 在你的 GPU 上实测
 python tools/train_detector.py   --smoke 2 --epochs 1 --batch 1 --device cpu --log-interval 1
@@ -276,7 +287,9 @@ python tools/export.py --check --out runs/export/jingwei_n.onnx
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| val 一直 `precision=0 recall=0 boxes/img=0.0`，且 `gate: max_score < conf` | 部署门没开：objectness/分类冷启动（质量目标塌陷 / bias 初值过低 / `obj_o2o` 权重过小） | v0.2.1 已修（见 [CODE_REVIEW.md §0.7](CODE_REVIEW.md)）；重训即可。自己改过 `model.obj_bias_init` / `train.obj_quality_floor` / `loss_weights.obj_o2o` 的话先恢复默认 |
+| val 一直 `precision=0 recall=0 boxes/img=0.0`，且 `gate: max_score < conf` | 部署门没开：objectness 分支没有可用的特征（`obj_head_from: neck`）或质量目标塌陷 | v0.2.1/0.2.2 已修（[CODE_REVIEW.md §0.7](CODE_REVIEW.md) / §0.8）；确认 `model.obj_head_from: reg` 后重训。旧的 detector checkpoint 与新结构**不兼容**，不能 `--resume` |
+| `boxes/img` 几十上百、`normal_fpr=1.0000`、`gate: max_score≈1` 但 `p99≈0.5` | 背景电平太高：`score = obj·cls` 在每个 cell 都过阈值 | 看 `gate: p99`；调 `train.obj_o2o_neg_weight`（2.5→4）、`obj_o2m_neg_weight` / `cls_o2m_neg_weight`；**不要**调高 `model.obj_bias_init`（那正是病因） |
+| `precision`（下发阈值处）很低，但 `-> P=… R=…` 很高 | 阈值没标定，不是模型差 | 跑 `tools/calibrate_fusion.py`，把 `fusion.final_score_thresh` 回填（decode 用的是同一个值） |
 | val 一直 `precision=0` 但 `gate: max_score ≫ conf` | 框出来了但都是错框 | 跑 `tools/diagnose_precision.py` 看 FP 分解（duplicate / wrong_class / localization / background），再按 [CODE_REVIEW.md §0.5/§0.6](CODE_REVIEW.md) 的表格处理 |
 | `loss share` 里 `box_o2m` 长期 >60% | v0.2.1 之前像素 L1 没有归一化，量级随输入分辨率线性变化 | 已改成按图像边长归一化；若仍 >60%，说明 GT 框质量差或 `box_o2m` 权重过高 |
 | `no images under ...` | 路径没改 / 图片扩展名不在列表 | 检查 `configs/fabric19.yaml`；支持 jpg/jpeg/png/bmp/tif/tiff/webp（含大写） |

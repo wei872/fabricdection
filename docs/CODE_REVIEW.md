@@ -1,4 +1,4 @@
-# 代码审查与优化建议（v0.2.1）
+# 代码审查与优化建议（v0.2.2）
 
 > 审查对象：`jingwei/`（推理库）+ `tools/`（训练/评估/部署 CLI）+ `tests/` + `configs/`。
 > 审查方式：逐文件静态审查 + 全部单元测试实跑 + 针对性探针脚本（下面每条结论都附复现方式或实测数字）。
@@ -362,8 +362,164 @@ head 在 300 步 Adam 内必须把分数推过 `score_thresh`、验证集必须�
 
 ---
 
+## 0.8 专题：precision 第四轮（v0.2.2）——门是开了，但**整块布面都在门里**
+
+第四轮来自用户重跑 stage A 后贴回的日志。对比 §0.7 的旧日志，`boxes/img` 已经不再是 0
+（第三轮"门打不开"确实修好了），但出现了**下一个失败模式**：
+
+```
+val   epoch   1/150  mAP50=0.0000 precision=0.0001 recall=0.0086 best_f1=0.0002@0.06
+                     normal_fpr=1.0000  boxes/img= 85.0
+      FP: background=8893 localization=454
+      gate: max_score=0.9997 (conf=0.15) obj_max=1.000 cls_max=1.000 cand>0.15=24607 -> out=9348
+...
+val   epoch   9/150  mAP50=0.1060 precision=0.0033 recall=0.1900 best_f1=0.0867@0.74
+      boxes/img= 55.0   FP: background=4026 localization=555
+loss  cls_o2m=0.371 box_o2m=1.264 obj_o2m=1.568 cls_o2o=0.286 box_o2o=0.429 obj_o2o=0.086 total=6.485
+      loss share: box_o2m=39%  obj_o2m=24%  box_o2o=13%  fg_context=9%  cls_o2o=7%  cls_o2m=6%
+```
+
+`normal_fpr = 1.0000`（每张正常布都出框）、`boxes/img = 42~97`、`precision = 0.003`、
+`best_f1` 九个 epoch 只从 0.0083 涨到 0.0867。`mAP50` 在涨（**定位**在学会），
+但"这个位置到底是不是缺陷"的判别没有收敛。
+
+### 诊断：用日志反推背景 objectness
+
+`obj_o2o` 是平衡 focal（`alpha=0.5, gamma=2`），负样本项的解析值与预测概率一一对应：
+
+| 背景 obj 预测 p | 单格负样本项 |
+|---|---|
+| 0.02 | 0.000 |
+| 0.10 | 0.001 |
+| 0.20 | 0.004 |
+| 0.50 | **0.087** |
+| 0.70 | 0.295 |
+
+日志 `obj_o2o = 0.086` ⇒ **背景 cell 的平均 objectness ≈ 0.5**（正样本项在 p≈0.9 时只有 1e-3 量级）。
+`obj_o2m = 1.568` 同理 ⇒ 训练分支的背景 objectness ≈ 0.78。
+
+再看部署门（`score = obj · cls ≥ 0.15`）：
+
+| obj | cls | score | 是否出框 |
+|---|---|---|---|
+| 0.02 | 0.40 | 0.008 | 否（正确） |
+| **0.50** | **0.40** | **0.200** | **是（误报）** |
+| 0.78 | 0.60 | 0.468 | 是（误报） |
+
+⇒ `precision ≈ 0.003`、`normal_fpr = 1.0`、`boxes/img = 55`、`FP: background = 4026`
+**全是同一个数**：背景电平 0.5。不是检测能力问题，是 objectness 场的**校准/选择性**问题。
+
+### 为什么背景停在 0.5：四条结构性原因（+2 条观测盲区）
+
+**原因 1（决定性）：objectness 是 neck 上的一个裸 1×1 卷积。**
+
+`cls` / `reg` 各有两层 3×3 DWConv 的 stem，objectness 却直接在 neck 特征上做 1×1。
+"这里有没有缺陷"本质是**局部对比**判断（这块和周围不一样），1×1 卷积没有邻域可比，
+只能输出一张随特征平滑变化的图；而 o2o 分支要求"每个 GT 只有一个正 cell"（单峰），
+1×1 卷积在结构上做不到，于是它收敛到最省力的平坦解 0.5。
+
+受控 A/B（head-only，冻结**真实 backbone** 的特征，320²，batch 4 = 2 缺陷 + 2 空图，
+AdamW 2e-3，300 步；`def`/`norm` 分别是缺陷图/正常图上 decode 出的框数）：
+
+| 配置 | 100 步 smax / p99 | 300 步 smax / p99 | def / **norm**（300 步） |
+|---|---|---|---|
+| `neck` 1×1 + 旧权重 + neg1.0 | 0.012 / 0.011 | **0.033 / 0.028** | 0 / 0（**门根本没开**） |
+| `reg` stem + 旧权重 + neg1.0 | 0.573 / 0.571 | **0.947 / 0.535** | 4 / **2** |
+| `neck` 1×1 + 新权重 + neg2.5 | 0.010 / 0.010 | **0.034 / 0.031** | 0 / 0（**门根本没开**） |
+| `reg` stem + 新权重 + neg2.5（**v0.2.2 发布值**） | 0.523 / 0.520 | **0.525 / 0.521** | 2 / **2** |
+
+也就是说：**调权重救不了 1×1 的 objectness**（换权重后仍然 0.033 = 门永不开），
+换成回归 stem 才把 `score` 从 0.03 抬到 0.5 以上。这是本轮唯一"非它不可"的改动。
+
+**原因 2：唯一决定出框的分支只分到 1.3% 的 loss。**
+epoch 9 的 `loss share` 里 `box_o2m + obj_o2m = 63%` —— 这两项属于 o2m 训练分支，
+**推理时完全不跑**；而 `obj_o2o` 连 1% 都不到（`1.5 × 0.086 / 6.485 = 2%`，share 表里四舍五入为 0）。
+梯度绝大部分花在不会部署的机器上。（注意：这一项是**必要条件而非充分条件**——
+单独改权重（上表第 3 行）并没有把门打开，但它决定了背景电平能不能被压下去。）
+
+**原因 3：平衡归一化 = 50/50 份额，没有"关闭背景"的压力。**
+`_balanced_bce` 给正负各 50% 份额，这与图尺寸无关（这是第三轮的正确修复），
+但它同时也意味着：一个只会输出 0.5 的分支在损失上**不亏**。`obj_o2o_neg_weight = 1.0`
+时背景项的极小值就在 p≈0.5 附近；要给"压低背景"付钱，这个权重必须 > 1。
+（`obj_o2m` / `cls_o2m` 同理；`score = obj·cls` 是乘积，两个因子都要低。）
+
+**原因 4：质量目标的 `qmax` 归一化在冷启动时是噪声放大。**
+第三轮把目标改成 `qual / qmax`（下限 0.5）以避免"目标恒为 0"。但当所有 IoU 都是 ~0.02 时，
+它们之间的差别**只是噪声**：最大的一格被映射成 1.0、邻居被 clamp 到 0.5，谁大谁小每个
+batch 都翻转。现在改成 `w·(qual/qmax) + (1-w)`，`w = qmax`：回归还没学时目标恒为 1.0
+（"这里确实有目标"），回归学好之后质量排序再平滑淡入。
+
+**观测盲区 1：`normal_fpr` 是 0/1 指标。** 55 框/图和 1 框/图都报 `1.0000`——
+上一轮"以为修好了"就因为这一行。
+
+**观测盲区 2：`gate: max_score` 会被单个走运的 cell 骗到 0.9997。**
+logits 无界，25600 个 cell 里总有一个大值；真正要看的是 **p99（背景电平）**。
+本轮新增 `gate: p99=… obj_mean=…` 与 `normal: boxes/img=… max_score=…`。
+
+**已排除的错误猜想：`obj_bias_init` 不是瓶颈（实测）。**
+§0.7 的探针说"bias=-4 时第 7 步就开"，本轮再测同一个问题（冻结真实特征、320²、AdamW 2e-3）：
+
+| `obj_bias_init` | 首次越过 0.15 | 第 0 步框数 | 100 步 p99 | 300 步 p99 |
+|---|---|---|---|---|
+| -4.0（**保持不动**） | it 7 | 0 | 0.011 | 0.028 |
+| -2.0 | it 0 | **99**（`top_k` 拉满） | 0.52 | 0.51 |
+| 0.0 | it 0 | 150（`top_k` 拉满） | 0.5 | 0.5 |
+
+bias 高只会让**第 0 步就淹没在 0.5 的背景里**，而这正是用户看到的现象。
+所以 `obj_bias_init` 保持 **-4.0**（继续作为调试开关暴露），不要为了"快点出框"调高它。
+
+### 修复（v0.2.2）
+
+| 位置 | v0.2.1 | v0.2.2 | 理由 |
+|---|---|---|---|
+| `model.obj_head_from` | 无（写死 neck 1×1） | **`reg`**（+3×3→5×5 DWConv stem） | 原因 1，唯一"非它不可"的改动 |
+| `train.loss_weights` | `obj_o2o 1.5, cls_o2o 1.5, box_o2o 2.0, box_o2m 2.0, obj_o2m 1.0, cls_o2m 1.0` | `obj_o2o 6.0, cls_o2o 3.0, box_o2o 2.5, box_o2m 1.2, obj_o2m 0.7, cls_o2m 0.9` | 部署分支从 ~2% 提到 ~35-40%，o2m 让位（原因 2） |
+| `train.obj_o2o_neg_weight` | 1.0 | **2.5** | 给"压低背景"付钱（原因 3） |
+| `train.obj_o2m_neg_weight` | 无（写死 1.0） | **2.0** | o2m 的背景电平（0.78）会通过共享特征/e2e 传给部署分支 |
+| `train.cls_o2m_neg_weight` | 无（写死 1.0） | **2.0** | `score = obj·cls` 是乘积，两个因子都要低 |
+| `train.obj_quality_floor` | 0.5 | **0.0** | 0.5 等于把"定位很差的匹配"教成 objectness 0.5，比背景还像目标 |
+| `build_dense_targets` | `qual/qmax` + 下限 | `w·(qual/qmax) + (1-w)`，`w = qmax` | 原因 4 |
+| `model.obj_bias_init` | -4.0 | **-4.0（不变）** | 见上表：调高只会制造 99~150 个初始框 |
+| `model.score_thresh` | 0.05 | **0.15（= `fusion.final_score_thresh`）** | 只保留一个绝对阈值（§2.13） |
+| 日志 | `gate: max_score obj_max cls_max` | 增加 `p99 / obj_mean / normal: boxes-img, max_score` | 观测盲区 1、2 |
+| val 日志 | `precision=…` | 增加 `-> P=… R=…`（F1 最优点） | 下发阈值处的 precision 会长期偏低，而"模型自己的最优点"才是真实水平（实测 0.0026 vs 5.5%） |
+
+代价（1280²，pico）：**8.086 → 8.257 G MACs（+2.1%）**，参数 2.928 → 2.979 M，仍低于 9 G 预算。
+
+### 兼容性：旧 checkpoint 不能 `--resume`
+
+`obj_pred` / `obj_o2o` 的输入通道从 `c`（neck）改成 `h`（reg stem），并新增 `obj_stem`，
+旧 `.pt` 会 `size mismatch`。**必须重训 stage A**（可以从 `runs/dino/dino_init.pt` 起——
+那里没有检测头）。若想 A/B，`model.obj_head_from: neck` 可回退到旧结构（但那样门就是关的）。
+
+### 重训后应该看到的
+
+| 指标 | v0.2.1 实测 | v0.2.2 预期 |
+|---|---|---|
+| `normal: boxes/img`（新增） | 55（老日志只有 `normal_fpr=1.0` 一个 bit） | 首 epoch 可能仍偏高，但应**逐 epoch 单调下降** |
+| `gate: p99`（新增） | 未打印（`max_score`=0.9997 会骗人） | 从 ~0.5 降到 < 0.1；`max_score` 与 p99 应**拉开** |
+| `gate: obj_mean`（新增） | 未打印 | 0.3 → 0.05 以下 |
+| `loss share: obj_o2o` | 1.3% | 随 `p99` 下降而变小（分支被解掉后损失自然小），不要反过来当目标 |
+| `-> P=… R=…`（新增） | — | F1 最优点的 precision 是真实水平，应逐 epoch 上升 |
+| `precision`（下发阈值 0.15 处） | 0.003 | 与 `normal: boxes/img` 反向变化；仍低则说明阈值需要重标定（`calibrate_fusion.py`） |
+
+一句话：**先看 `p99` 和 `normal: boxes/img`，再看 precision。** p99 不降，precision 不会涨。
+
+### 回归测试
+
+`test_58`（`neg_weight` 真的能压低背景项）、`test_59`（objectness 读 reg stem；`neck` 可回退）、
+`test_60`（`score_p99`/`obj_mean` 语义：平坦场 p99 = score_max）、
+`test_61`（用**发布的 config** 端到端：120 步内门必须开，且两个阈值必须相等）、
+`test_62`（`_best_f1` 返回最优点 P/R；`normal_fpr` 返回 boxes/img 与 max_score）。
+
+---
+
 ## 1. 本轮已修复（按严重程度；0.5 / 0.6 / 0.7 三节专列的 precision 修复也在此列）
 
+> v0.2.2 的第四轮（objectness 读 reg stem、部署分支 loss 份额、背景压力、质量目标混合、单一阈值）见 **§0.8**，
+> 改动落在 `jingwei/losses.py` / `jingwei/head.py` / `tools/evaluate.py` / `tools/train_detector.py` / 三个 config，
+> 回归测试 `test_58`–`test_62`。
+>
 > v0.2.1 的四项冷启动修复（质量目标塌陷、平衡归一化、像素 L1 未归一化、objectness 分支权重）见 **§0.7**，改动落在 `jingwei/losses.py` / `jingwei/head.py` / `tools/evaluate.py` / `tools/train_detector.py` / 三个 config，回归测试 `test_53`–`test_57`。
 
 ### P0-1 `AnomalyFusion(mode="gate")` 对概率做了第二次 sigmoid → 标定阈值失效
@@ -597,7 +753,7 @@ AttributeError: module 'numpy' has no attribute 'trapz'. Did you mean: 'trace'?
 `anomaly=(1,1,128,128)`、`context=(1,3,128,128)` 全为静态形状，`onnx.checker` 通过）。
 建议把「`pip install -r requirements-dev.txt` + 全量测试 + `tools/export.py --check`」作为 CI 的最小门禁。
 
-### 2.13 P1 · 两个绝对阈值耦合在同一条分数上
+### 2.13 ~~P1~~ 已修（v0.2.2）· 两个绝对阈值耦合在同一条分数上
 
 `decode` 用 `model.score_thresh`（0.05）截断候选，融合路径再用 `fusion.final_score_thresh`（0.15）
 截断最终框，两者都作用在 `sigmoid(obj)·sigmoid(cls)`（融合后只增不减）上。0.05 因此几乎不起作用，
@@ -605,6 +761,10 @@ AttributeError: module 'numpy' has no attribute 'trapz'. Did you mean: 'trace'?
 建议：把 decode 的阈值改成"融合阈值的下界 + 安全余量"（例如 `score_thresh = min(score_thresh, 0.5*final)`），
 或者干脆让 decode 只做 top-k + 峰值，把唯一的绝对阈值留给融合/标定链路，
 这样"调阈值"就只有一个旋钮，`calibrate_fusion.py` 的搜索结果也能直接用于部署。
+
+> **v0.2.2 已处理**：`model.score_thresh` 从 0.05 改成 **0.15（= `fusion.final_score_thresh`）**，
+> 两个键在三个 config 里显式相等；`test_61` 断言这一点。日志里的 `cand>conf` 与 `out`
+> 因此可以直接比较。
 
 ### 2.14 P3 · 其它（低风险、可择机处理）
 
@@ -668,10 +828,29 @@ configs/*.yaml         obj_bias_init / cls_bias_init / obj_quality_floor / cls_q
 tests/test_model.py    +5 项回归（53–57），test_50 的"focal > ohem"改成"错误背景必须被罚"
 ```
 
+v0.2.2（第 4 轮，§0.8）增量：
+
+```
+jingwei/head.py        obj_head_from="reg"：objectness 读回归 stem + 自带 3x3->5x5 DWConv stem
+                       （原来是 neck 上的裸 1x1，背景电平永远 0.5；+2.1% MACs / +0.05 M 参数）
+                       decode.last_stats 增加 score_p99（背景电平）与 obj_mean
+jingwei/losses.py      obj_o2m_neg_weight / cls_o2m_neg_weight（默认 2.0，把背景压低）
+                       build_dense_targets 的质量目标改成 w*rel+(1-w)，w=qmax（冷启动=全 1.0）
+tools/evaluate.py      best_precision / best_recall（F1 最优点上的 P/R）
+                       normal_fpr(return_extra=True)：normal boxes/img + max_score
+                       liveness 增加 gate_p99 / obj_mean
+tools/train_detector.py gate 行增加 p99 / obj_mean / normal boxes-img；boxes/img 行增加最优点 P/R
+tools/diagnose_precision.py  [0] 门控存活检查
+configs/*.yaml         obj_head_from / obj_o2m_neg_weight / cls_o2m_neg_weight；
+                       loss_weights 重分配（obj_o2o 1.5->6.0，o2m 让位）；obj_o2o_neg_weight 1.0->2.5；
+                       obj_quality_floor 0.5->0.0；score_thresh 0.05->0.15
+tests/test_model.py    +5 项回归（58–62）
+```
+
 ## 4. 复现命令
 
 ```bash
-# 全量测试（本机 56 项 / 129 s；装 requirements-dev.txt 后 onnx 用例不再 skip）
+# 全量测试（本机 61 项；装 requirements-dev.txt 后 onnx 用例不再 skip）
 python -m unittest discover -s tests -v
 
 # P0-1：融合门控是否破坏 0.5 标定点
