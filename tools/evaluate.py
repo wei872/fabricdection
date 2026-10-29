@@ -1,26 +1,17 @@
-"""Evaluation: precision / recall / F1 / mAP50 / large recall / FPR / FPS.
-
-    python tools/evaluate.py --cfg configs/jingwei_n.yaml --ckpt runs/bank/memory_bank.pt
-    python tools/evaluate.py --cfg configs/jingwei_n.yaml --smoke
-    python tools/evaluate.py --cfg configs/jingwei_p.yaml --max-val 200
-
-``validate_detector()`` is also called from ``tools/train_detector.py`` so every
-training epoch prints val metrics instead of only loss.
-"""
+"""Evaluate DINOv2 defect detection: mAP50, precision/recall and optional normal FPR."""
 from __future__ import annotations
 
 import argparse
-import time
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from _common import (ROOT, SyntheticNormalDataset, data_paths, load_model,
+from _common import (data_paths, load_model,
                      make_dataset, resolve, subset_indices)
 from jingwei.data import collate, make_worker_init_fn
 from jingwei.image_io import ascii_safe, console_safe
-from jingwei.utils import box_iou, count_parameters, profile_macs
+from jingwei.utils import box_iou, count_parameters
 
 PR_THRESHOLDS = (0.05, 0.10, 0.15, 0.25, 0.40)
 
@@ -58,7 +49,7 @@ def _pr_at_thresholds(records, n_gt, thresholds):
     """Global precision/recall at fixed score thresholds."""
     flat = _flatten_records(records)
     out = {}
-    if not flat or n_gt <= 0:
+    if not flat:
         for t in thresholds:
             out[float(t)] = {"precision": 0.0, "recall": 0.0, "f1": 0.0,
                              "tp": 0, "fp": 0, "ndet": 0}
@@ -87,10 +78,6 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
                  large_min_area=None, pr_thresholds=PR_THRESHOLDS):
     """mAP50 + global precision/recall/F1 at ``conf_thresh``.
 
-    Unknown-class boxes (label >= nc) are counted separately: they are the
-    deterministic safety net / normality fallback and must NOT be scored as a
-    normal class, but they still count for large-defect recall.
-
     When ``large_min_area`` is given, large-defect recall (a GT box counts as
     hit when *any* prediction has IoU > 0.5) is computed in the SAME pass, so
     validation no longer decodes every image twice.
@@ -98,7 +85,6 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
     records = [[] for _ in range(nc)]
     n_gt = np.zeros(nc, np.int64)
     tp = fp = 0
-    unknown_boxes = 0
     n_det = 0
     large_hit = large_total = 0
     fp_breakdown = {"duplicate_same_gt": 0, "wrong_class": 0,
@@ -115,16 +101,13 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
             for i in order.tolist():
                 score = float(d["scores"][i])
                 c = int(d["labels"][i])
-                if c >= nc:            # 未知异常 is not one of the 19 classes
-                    if score >= conf_thresh:
-                        unknown_boxes += 1
-                        n_det += 1
-                    continue
+                if not 0 <= c < nc:
+                    raise ValueError(f"prediction label {c} outside configured classes")
                 box = d["boxes"][i:i + 1]
                 if len(gt_boxes):
                     iou = box_iou(box, gt_boxes)[0]
                     masked = iou.clone()
-                    masked[used] = -1
+                    masked[used | (gt_labels != c)] = -1
                     j = int(masked.argmax())
                     is_tp = bool(masked[j] >= iou_thr and gt_labels[j] == c and
                                  not used[j])
@@ -183,7 +166,6 @@ def evaluate_map(model, loader, device, nc, iou_thr=0.5, conf_thresh=0.0,
     pr = {"precision": float(precision), "recall": float(recall),
           "f1": float(f1), "tp": int(tp), "fp": int(fp), "fn": int(fn),
           "n_gt": total_gt, "n_det": int(n_det),
-          "unknown_boxes": int(unknown_boxes),
           "best_f1": best_f1, "best_f1_thr": best_f1_thr,
           "fp_breakdown": fp_breakdown, "pr_at": pr_at}
     if large_min_area is not None:
@@ -209,9 +191,9 @@ def validate_detector(model, val_loader, norm_loader, device, cfg,
                       pr_thresholds=PR_THRESHOLDS):
     """One validation pass returning all acceptance metrics as a plain dict."""
     conf = float(conf_thresh if conf_thresh is not None
-                 else cfg.fusion.final_score_thresh)
+                 else cfg.inference.final_score_thresh)
     h, w = (int(v) for v in cfg.input_size[:2])
-    large_area = float(cfg.fusion.large_area_ratio) * h * w
+    large_area = float(cfg.inference.large_area_ratio) * h * w
     map50, aps, pr = evaluate_map(model, val_loader, device, int(cfg.data.nc),
                                   iou_thr=iou_thr, conf_thresh=conf,
                                   large_min_area=large_area,
@@ -220,7 +202,7 @@ def validate_detector(model, val_loader, norm_loader, device, cfg,
     if norm_loader is not None:
         fpr, nfp, nn = normal_fpr(model, norm_loader, device)
     else:
-        fpr, nfp, nn = 0.0, 0, 0
+        fpr, nfp, nn = float("nan"), 0, 0
     out = {
         "mAP50": float(map50),
         "AP50": [float(a) for a in aps],
@@ -235,137 +217,59 @@ def validate_detector(model, val_loader, norm_loader, device, cfg,
     return out
 
 
-@torch.no_grad()
-def benchmark(model, device, size, iters=5, warmup=2):
-    x = torch.randn(1, 3, size, size, device=device)
-    if device == "cuda":
-        torch.cuda.synchronize()
-    for _ in range(warmup):
-        model(x)
-    if device == "cuda":
-        torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        model(x)
-    if device == "cuda":
-        torch.cuda.synchronize()
-    return (time.perf_counter() - t0) / iters * 1000.0
-
-
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--cfg", default="configs/jingwei_n.yaml")
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--cfg", default="configs/jingwei_dinov2.yaml")
     ap.add_argument("--data", default=None)
-    ap.add_argument("--ckpt", default=None)
+    ap.add_argument("--ckpt", required=True, help="trained DINOv2 detector checkpoint")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--max-val", type=int, default=0)
     ap.add_argument("--normal-max", type=int, default=0)
-    ap.add_argument("--subset-seed", type=int, default=0,
-                    help="fixed seed for random --max-val / --normal-max subsets")
-    ap.add_argument("--detector-only", action="store_true",
-                    help="skip normality/fusion for stage-A detector metrics")
-    ap.add_argument("--diag", action="store_true",
-                    help="print multi-threshold PR and FP breakdown")
-    ap.add_argument("--batch", type=int, default=8,
-                    help="validation batch size")
-    ap.add_argument("--workers", type=int, default=2,
-                    help="DataLoader workers for image decoding")
-    ap.add_argument("--val-conf", type=float, default=None,
-                    help="score threshold for precision/recall "
-                         "(default: fusion.final_score_thresh)")
+    ap.add_argument("--subset-seed", type=int, default=0)
+    ap.add_argument("--diag", action="store_true")
+    ap.add_argument("--batch", type=int, default=2)
+    ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--val-conf", type=float, default=None)
     ap.add_argument("--val-iou", type=float, default=0.5)
-    ap.add_argument("--smoke", action="store_true")
-    ap.add_argument("--names", default=None)
-    ap.add_argument("--emit-unknown", action="store_true",
-                    help="force unknown-defect boxes on")
-    ap.add_argument("--no-unknown", action="store_true",
-                    help="force unknown-defect boxes off")
     args = ap.parse_args()
-
     model, cfg = load_model(args.cfg, args.ckpt, args.device)
-    if args.emit_unknown:
-        cfg.fusion.emit_unknown_boxes = True
-    if args.no_unknown:
-        cfg.fusion.emit_unknown_boxes = False
-    if args.detector_only:
-        model.set_stage("detector")
-    paths = data_paths(cfg, args.data)
     model.eval()
+    paths = data_paths(cfg, args.data)
     size = int(cfg.input_size[0])
-    names = list(cfg.data.names) if not args.names else args.names.split(",")
-
-    if args.smoke:
-        ds = SyntheticNormalDataset(n=8, size=size)
-        class Wrap(torch.utils.data.Dataset):
-            def __len__(self): return len(ds)
-            def __getitem__(self, i):
-                d = ds[i]
-                d["boxes"] = torch.tensor([[100., 100., 400., 300.]])
-                d["labels"] = torch.tensor([3])
-                return d
-        val_loader = DataLoader(Wrap(), batch_size=1, collate_fn=collate)
-        norm_loader = DataLoader(SyntheticNormalDataset(n=8, size=size, seed=42),
-                                 batch_size=1, collate_fn=collate)
-    else:
-        vds = make_dataset("val", resolve(paths["val"]), None, size, args,
-                           has_labels=True, augment=False, seed=0)
-        n_key = "normalval" if "normalval" in paths else "normaltrain"
-        nds = make_dataset(n_key, resolve(paths[n_key]), None, size, args,
-                           has_labels=False, augment=False, seed=0)
-        vidx = subset_indices(len(vds), args.max_val, args.subset_seed)
-        if vidx is not None:
-            vds = Subset(vds, vidx)
-        nidx = subset_indices(len(nds), args.normal_max, args.subset_seed + 1)
-        if nidx is not None:
-            nds = Subset(nds, nidx)
-        kw = dict(num_workers=max(0, args.workers), collate_fn=collate,
-                  pin_memory=True)
-        if args.workers > 0:
-            kw["worker_init_fn"] = make_worker_init_fn(args.subset_seed)
-            kw["prefetch_factor"] = 2
-        val_loader = DataLoader(vds, batch_size=max(1, args.batch),
-                                shuffle=False, **kw)
-        norm_loader = DataLoader(nds, batch_size=max(1, args.batch),
-                                 shuffle=False, **kw)
-
-    m = validate_detector(model, val_loader, norm_loader, args.device, cfg,
+    kw = dict(num_workers=max(0, args.workers), collate_fn=collate, pin_memory=True)
+    if args.workers > 0:
+        kw.update(worker_init_fn=make_worker_init_fn(args.subset_seed), prefetch_factor=2)
+    def loader(split, labeled, limit, seed):
+        ds = make_dataset(resolve(paths[split]), size,
+                          has_labels=labeled, augment=False, seed=seed)
+        idx = subset_indices(len(ds), limit, seed)
+        return DataLoader(Subset(ds, idx) if idx is not None else ds,
+                          batch_size=max(1, args.batch), shuffle=False, **kw)
+    vl = loader("val", True, args.max_val, args.subset_seed)
+    nl = (loader("normalval", False, args.normal_max, args.subset_seed + 1)
+          if paths.get("normalval") else None)
+    m = validate_detector(model, vl, nl, args.device, cfg,
                           conf_thresh=args.val_conf, iou_thr=args.val_iou)
-    dev = next(model.parameters()).device
-    macs = profile_macs(model, [torch.zeros(1, 3, size, size, device=dev)])
-
-    print("\n================ JingWei evaluation ================")
-    print(f"params            : {count_parameters(model) / 1e6:.2f} M")
-    print(f"MACs @ {size}     : {macs['total'] / 1e9:.2f} G "
-          f"(conv {macs.get('conv', 0)/1e9:.2f} / linear {macs.get('linear', 0)/1e9:.2f} "
-          f"/ attention {macs.get('attention', 0)/1e9:.2f})")
-    print(f"conf / IoU        : {m['conf_thresh']:.3f} / {m['iou_thr']:.2f}")
-    print(f"stage             : {'detector-only' if args.detector_only else 'full pipeline'}")
-    print(f"mAP50             : {m['mAP50']:.4f}")
-    print(f"precision         : {m['precision']:.4f}  (TP={m['tp']} FP={m['fp']})")
-    print(f"recall            : {m['recall']:.4f}  (FN={m['fn']} GT={m['n_gt']})")
-    print(f"F1                : {m['f1']:.4f}")
-    print(f"best F1           : {m['best_f1']:.4f} @ conf={m['best_f1_thr']:.2f}")
-    print(f"large-defect recall: {m['large_recall']:.4f}   <-- primary acceptance metric")
-    print(f"normal image FPR  : {m['normal_fpr']:.4f}  "
-          f"({m['normal_fp']}/{m['normal_n']})")
-    print(f"unknown boxes     : {m['unknown_boxes']}  "
-          f"(label={int(cfg.data.nc)} / 未知异常)")
+    print("\n================ DINOv2 detector evaluation ================")
+    print(f"params    : {count_parameters(model) / 1e6:.2f} M")
+    print(f"conf / IoU: {m['conf_thresh']:.3f} / {m['iou_thr']:.2f}")
+    print(f"mAP50     : {m['mAP50']:.4f}")
+    print(f"precision : {m['precision']:.4f} (TP={m['tp']} FP={m['fp']})")
+    print(f"recall    : {m['recall']:.4f} (FN={m['fn']} GT={m['n_gt']})")
+    print(f"F1        : {m['f1']:.4f}")
+    print(f"best F1   : {m['best_f1']:.4f} @ conf={m['best_f1_thr']:.2f}")
+    print(f"large localization recall: {m['large_recall']:.4f}")
+    if nl is None:
+        print("normal FPR: N/A (normalval not configured)")
+    else:
+        print(f"normal FPR: {m['normal_fpr']:.4f} ({m['normal_fp']}/{m['normal_n']})")
     if args.diag:
-        print("P/R at fixed conf :")
-        for t, v in sorted(m.get("pr_at", {}).items(), key=lambda kv: float(kv[0])):
-            print(f"  conf {float(t):.2f}     : "
-                  f"P={v['precision']:.4f} R={v['recall']:.4f} "
-                  f"F1={v['f1']:.4f} (TP={v['tp']} FP={v['fp']})")
-        fb = m.get("fp_breakdown", {})
-        print("FP breakdown      : " +
-              " ".join(f"{k}={v}" for k, v in fb.items()))
-    for i, a in enumerate(m["AP50"]):
-        label = ascii_safe(names[i], f"cls{i}") if i < len(names) else str(i)
-        print(console_safe(f"  AP50[{i:2d}] {label:<8.8s}: {a:.4f}"))
-    if not args.smoke:
-        ms = benchmark(model, args.device, size)
-        print(f"latency (full pipeline, {args.device}): {ms:.2f} ms -> {1000 / ms:.1f} FPS")
-    print("====================================================\n")
+        for t, v in sorted(m['pr_at'].items()):
+            print(f"conf {t:.2f}: P={v['precision']:.4f} R={v['recall']:.4f} "
+                  f"F1={v['f1']:.4f} TP={v['tp']} FP={v['fp']}")
+        print("FP breakdown:", m['fp_breakdown'])
+    for i, a in enumerate(m['AP50']):
+        print(console_safe(f"AP50[{i}] {cfg.data.names[i]}: {a:.4f}"))
 
 
 if __name__ == "__main__":

@@ -1,40 +1,21 @@
-"""Shared tensor / box utilities and a small dependency-free MACs profiler."""
+"""Checkpoint, box geometry and class-aware NMS utilities."""
 from __future__ import annotations
 
 import math
-import pickle
-import warnings
-from typing import Iterable
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 def torch_load(file, map_location="cpu", **kwargs):
-    """Load a checkpoint with ``weights_only=True`` by default (torch >= 2.0).
+    """Load tensors / primitive checkpoint state without unsafe pickle fallback.
 
-    Silences the PyTorch ``FutureWarning`` about ``weights_only=False`` for our
-    own checkpoints, which contain only tensors / primitives / containers.
-    Third-party DINOv1 weights sometimes store an ``argparse.Namespace``; for
-    those we fall back to ``weights_only=False`` with a warning — only load
-    checkpoints you trust.
+    Both official backbone state dicts and this project's detector checkpoints
+    use weights_only-safe data. Arbitrary Python-object checkpoints are not
+    part of the supported format.
     """
     kwargs.setdefault("weights_only", True)
-    try:
-        return torch.load(file, map_location=map_location, **kwargs)
-    except TypeError:
-        # torch < 2.0 has no weights_only argument.
-        kwargs.pop("weights_only", None)
-        return torch.load(file, map_location=map_location, **kwargs)
-    except (pickle.UnpicklingError, RuntimeError, AttributeError) as exc:
-        kwargs.pop("weights_only", None)
-        warnings.warn(
-            f"torch.load(weights_only=True) failed ({exc}); "
-            "retrying with weights_only=False. Only load trusted checkpoints.",
-            RuntimeWarning,
-        )
-        return torch.load(file, map_location=map_location, **kwargs)
+    return torch.load(file, map_location=map_location, **kwargs)
 
 
 # --------------------------------------------------------------------------------------
@@ -100,99 +81,27 @@ def scale_boxes(boxes: torch.Tensor, from_wh, to_wh) -> torch.Tensor:
 
 
 # --------------------------------------------------------------------------------------
-# MACs / parameter profiler
+# Parameter count
 # --------------------------------------------------------------------------------------
 def count_parameters(model: nn.Module, trainable_only: bool = False) -> int:
     return sum(p.numel() for p in model.parameters()
                if (p.requires_grad or not trainable_only))
 
 
-def profile_macs(model: nn.Module, inputs: Iterable[torch.Tensor]) -> dict:
-    """Count multiply-accumulates for Conv2d / Linear plus custom-attention hooks.
+@torch.no_grad()
+def classwise_nms(boxes, scores, labels, iou_threshold=0.5):
+    """Greedy class-aware NMS without a torchvision binary dependency.
 
-    This is an *estimate*: it ignores element-wise ops, normalisation, softmax and
-    pooling (all <1% of the total here). It is deliberately dependency-free so the
-    design's compute budget can be reproduced without thop/fvcore/torchprofile.
+    Optional class-aware detector postprocessing.
+    Inputs are already bounded by detector top_k. Returns kept tensor indices.
     """
-    inputs = tuple(inputs)
-    breakdown: dict[str, int] = {}
-
-    def conv_hook(module: nn.Conv2d, inp, out):
-        # out: (B, Cout, *spatial)
-        macs = out.shape[0] * out.shape[1] * math.prod(out.shape[2:]) * \
-            (module.in_channels // module.groups) * math.prod(module.kernel_size)
-        breakdown["conv"] = breakdown.get("conv", 0) + macs
-
-    def linear_hook(module: nn.Linear, inp, out):
-        macs = out.numel() * module.in_features
-        breakdown["linear"] = breakdown.get("linear", 0) + macs
-
-    def custom_hook(module, inp, out):
-        # modules may expose macs(input, output) -> int
-        breakdown["attention"] = breakdown.get("attention", 0) + module.macs(inp[0], out)
-
-    handles = []
-    for m in model.modules():
-        if isinstance(m, nn.Conv2d):
-            handles.append(m.register_forward_hook(conv_hook))
-        elif isinstance(m, nn.Linear):
-            handles.append(m.register_forward_hook(linear_hook))
-        elif hasattr(m, "macs") and callable(m.macs) and not isinstance(m, (nn.Conv2d, nn.Linear)):
-            handles.append(m.register_forward_hook(custom_hook))
-
-    was_training = model.training
-    model.eval()
-    try:
-        with torch.no_grad():
-            model(*inputs)
-    finally:
-        for h in handles:
-            h.remove()
-        model.train(was_training)
-
-    breakdown["total"] = sum(breakdown.values())
-    return breakdown
-
-
-def human_macs(x: float) -> str:
-    if x >= 1e9:
-        return f"{x / 1e9:.2f} G"
-    if x >= 1e6:
-        return f"{x / 1e6:.1f} M"
-    return f"{x:.0f}"
-
-
-# --------------------------------------------------------------------------------------
-# Misc
-# --------------------------------------------------------------------------------------
-def gaussian2d(kernel_size: int, sigma: float, device=None, dtype=None) -> torch.Tensor:
-    ax = torch.arange(kernel_size, device=device, dtype=dtype or torch.float32) - (kernel_size - 1) / 2
-    xx, yy = torch.meshgrid(ax, ax, indexing="ij")
-    k = torch.exp(-(xx ** 2 + yy ** 2) / (2 * sigma ** 2))
-    return k / k.sum()
-
-
-def smooth_anomaly(score: torch.Tensor, k: int = 7, sigma: float = 2.0) -> torch.Tensor:
-    """Gaussian smoothing of anomaly maps (PatchCore-style reweighting).
-
-    Functional convenience version. For export use :class:`GaussianSmooth`,
-    whose kernel is a registered buffer (static ONNX shape inference).
-    """
-    w = gaussian2d(k, sigma, score.device, score.dtype).reshape(1, 1, k, k)
-    pad = k // 2
-    return F.conv2d(F.pad(score, (pad, pad, pad, pad), mode="reflect"), w, padding=0)
-
-
-class GaussianSmooth(nn.Module):
-    """Deployment-friendly Gaussian smoother with a constant (buffer) kernel."""
-
-    def __init__(self, k: int = 7, sigma: float = 2.0):
-        super().__init__()
-        self.pad = k // 2
-        self.register_buffer("weight", gaussian2d(k, sigma).reshape(1, 1, k, k))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # plain conv padding (no F.pad): ONNX shape inference cannot propagate
-        # through the opset-11+ Pad node, which would leave the exported
-        # anomaly tensor with unknown dimensions for TensorRT.
-        return F.conv2d(x, self.weight.to(x.dtype), padding=self.pad)
+    order = scores.argsort(descending=True)
+    keep = []
+    while order.numel():
+        i = order[0]
+        keep.append(i)
+        rest = order[1:]
+        overlap = box_iou(boxes[i].unsqueeze(0), boxes[rest])[0]
+        suppress = (overlap > iou_threshold) & (labels[rest] == labels[i])
+        order = rest[~suppress]
+    return torch.stack(keep) if keep else labels.new_empty((0,))

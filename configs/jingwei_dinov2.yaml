@@ -1,0 +1,77 @@
+# Direct official pretrained DINOv2 detector. No offline distillation.
+# dino_input_size must be a multiple of 14. Encoder remains at inference.
+name: jingwei_dinov2
+input_size:
+- 1280
+- 1280
+data:
+  nc: 19
+  dataset_yaml: configs/fabric19.yaml
+  names:
+  - 纬线杂质
+  - 断纬
+  - 多股线
+  - 纬线不直
+  - 包边不重叠
+  - 捻接器接头
+  - 小尾巴
+  - 经线毛球
+  - 包边不良
+  - 手工接头
+  - 纬斜
+  - 短废纱线
+  - 单根包不进
+  - 棉团
+  - 蚊虫小黑点
+  - 小布头
+  - 稀缝
+  - 油点线
+  - 飘絮
+model:
+  backbone: dinov2
+  dino_name: dinov2_vitb14
+  dino_repo: facebookresearch/dinov2
+  dino_weights: null
+  dino_pretrained: true
+  dino_freeze: true
+  dino_input_size: 448
+  dino_lr_mult: 0.1
+  reg_activation: softplus
+  detector_nms_iou: 0.5
+  width: 0.75
+  depth: 1.0
+  detail_ch: 48
+  p3_ch: 96
+  p4_ch: 192
+  p5_ch: 384
+  neck_blocks: 1
+  head_width: 0.5
+  dwconv: true
+  balance_p3: 1.0
+  balance_p5: 1.0
+  top_k: 150
+  score_thresh: 0.05
+  reg_scale: 1.0
+  fg_align: true
+train:
+  loss_weights:
+    cls_o2m: 1.0
+    box_o2m: 2.0
+    obj_o2m: 1.0
+    cls_o2o: 1.5
+    box_o2o: 2.0
+    obj_o2o: 1.5
+    fg_align: 0.5
+  class_weights: null
+  o2o_candidates: 1200
+  o2o_neg_ratio: 0.02
+  o2o_min_neg: 2048
+  best_metric: best_f1
+  warmup_epochs: 1
+  detector_epochs: 50
+  detector_batch: 2
+  detector_lr: 0.0005
+  weight_decay: 0.0005
+inference:
+  final_score_thresh: 0.15
+  large_area_ratio: 0.001

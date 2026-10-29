@@ -1,29 +1,9 @@
-"""Stage A — supervised detector training on the YOLO-format defect data.
+"""Train the direct pretrained DINOv2 detector on YOLO annotations.
 
-    # recommended: warm-start from stage-0 DINOv2 distillation
-    python tools/train_detector.py --cfg configs/jingwei_n.yaml \
-        --resume runs/dino/dino_init.pt --epochs 150 --num-workers 4
-    # full resume after an interrupted run (optimizer / scheduler / RNG restored)
-    python tools/train_detector.py --cfg configs/jingwei_n.yaml \
-        --resume runs/detector/last.pt --epochs 150
-    # or from scratch / smoke
-    python tools/train_detector.py --cfg configs/jingwei_n.yaml --epochs 150
-    python tools/train_detector.py --cfg configs/jingwei_n.yaml --smoke 4 --epochs 1
-
-The one-to-many head, the one-to-one (deployed) head and the foreground
-alignment auxiliary branch are trained together. The normality branch is
-skipped here (``set_stage('detector')``) and trained in stage B.
-
-``--resume`` auto-detects a full training checkpoint (``last.pt``) versus a
-weight-only warm start (``dino_init.pt``). Full checkpoints are written at
-every epoch; ``--save-interval N`` additionally keeps numbered snapshots.
-``best.pt`` is saved when validation mAP50 + large-defect recall improves.
-
-Data loading runs in parallel workers (``--num-workers``); set it to 0 only
-when debugging. On Ada/Ampere GPUs ``--amp bf16`` (the default on CUDA) cuts
-step time noticeably, especially at batch 8. Every epoch still prints val
-precision / recall / F1 / mAP50 / large recall. Use ``--val-interval 0`` to
-disable validation and ``--val-max 200`` to validate on a subset for speed.
+First run: python tools/train_detector.py --data configs/fabric19.yaml
+Resume:    python tools/train_detector.py --resume runs/detector_dinov2/last.pt
+Warm start a NEW schedule: --pretrained runs/detector_dinov2/last.pt
+Raw foundation weights belong in model.dino_weights, not --pretrained.
 """
 from __future__ import annotations
 
@@ -34,7 +14,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from _common import (ROOT, SyntheticNormalDataset, collect_rng_state, data_paths,
+from _common import (ROOT, SyntheticFabricDataset, collect_rng_state, data_paths,
                      format_eta, iter_speed, load_checkpoint, load_model, log,
                      make_dataset, resolve, resume_checkpoint, save_checkpoint,
                      set_global_seed, subset_indices)
@@ -45,13 +25,13 @@ from jingwei.utils import count_parameters
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cfg", default="configs/jingwei_n.yaml")
+    ap.add_argument("--cfg", default="configs/jingwei_dinov2.yaml")
     ap.add_argument("--data", default=None, help="override dataset yaml")
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--batch", type=int, default=None)
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--out", default="runs/detector")
+    ap.add_argument("--out", default="runs/detector_dinov2")
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--prefetch", type=int, default=2,
                     help="batches prefetched per worker (0 uses the torch default)")
@@ -59,10 +39,16 @@ def main():
                     help="mixed precision: bf16 (default on CUDA, no scaler) / "
                          "off / fp16")
     ap.add_argument("--smoke", type=int, default=0, help="synthetic images for a dry run")
+    ap.add_argument("--no-augment", action="store_true",
+                    help="disable training augmentation for controlled overfit/debug runs")
     ap.add_argument("--max-batches", type=int, default=0,
                     help="stop each epoch after N batches (debug / benchmark only)")
-    ap.add_argument("--resume", default=None,
-                    help="full training checkpoint (resume) or weight-only warm start")
+    init = ap.add_mutually_exclusive_group()
+    init.add_argument("--resume", default=None,
+                      help="resume complete detector training state; use --pretrained for weights only")
+    init.add_argument("--pretrained", default=None,
+                      help="JingWei checkpoint for weight-only initialization; resets "
+                           "optimizer/scheduler/epoch. Direct raw DINOv2 weights go in model.dino_weights.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save-interval", type=int, default=0,
                     help="also keep epoch_XXXX.pt every N epochs (0 disables snapshots)")
@@ -76,13 +62,13 @@ def main():
                     help="limit normalval images for FPR (0 = all)")
     ap.add_argument("--val-seed", type=int, default=0,
                     help="fixed seed for the --val-max / --normal-max subsets")
-    ap.add_argument("--val-batch", type=int, default=8,
+    ap.add_argument("--val-batch", type=int, default=2,
                     help="validation batch size (0 = batch 1)")
     ap.add_argument("--val-workers", type=int, default=2,
                     help="DataLoader workers for validation")
     ap.add_argument("--val-conf", type=float, default=None,
                     help="score threshold for val precision/recall "
-                         "(default: fusion.final_score_thresh)")
+                         "(default: inference.final_score_thresh)")
     ap.add_argument("--val-iou", type=float, default=0.5,
                     help="IoU threshold for val TP matching")
     args = ap.parse_args()
@@ -93,7 +79,11 @@ def main():
         torch.set_float32_matmul_precision("high")
     # Weights are loaded by resume_checkpoint() below so a full checkpoint can
     # restore model + optimizer + scheduler + RNG in one place.
-    model, cfg = load_model(args.cfg, None, args.device)
+    model, cfg = load_model(args.cfg, None, args.device,
+                            initialize_pretrained=not bool(args.resume or args.pretrained))
+    if not cfg.model.get("dino_pretrained", True) and not (args.resume or args.pretrained):
+        raise ValueError("Direct DINOv2 training requires pretrained weights; "
+                         "enable model.dino_pretrained or supply a direct-backbone checkpoint")
     paths = data_paths(cfg, args.data)
     epochs = args.epochs or int(cfg.train.detector_epochs)
     batch = args.batch or int(cfg.train.detector_batch)
@@ -102,10 +92,14 @@ def main():
 
     use_amp = args.amp != "off" and str(args.device).startswith("cuda")
     amp_dtype = torch.bfloat16 if args.amp == "bf16" else torch.float16
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and args.amp == "fp16")
+    scale_enabled = use_amp and args.amp == "fp16"
+    # torch.amp.GradScaler was added after the supported torch 2.0/2.2 releases.
+    scaler = (torch.amp.GradScaler("cuda", enabled=scale_enabled)
+              if hasattr(torch.amp, "GradScaler") else
+              torch.cuda.amp.GradScaler(enabled=scale_enabled))
 
     if args.smoke:
-        ds = SyntheticNormalDataset(n=args.smoke, size=size)
+        ds = SyntheticFabricDataset(n=args.smoke, size=size)
         # fake YOLO targets so the whole loss graph is exercised
         class Wrapped(torch.utils.data.Dataset):
             def __len__(self): return len(ds)
@@ -113,12 +107,12 @@ def main():
                 d = ds[i]
                 d["boxes"] = torch.tensor([[100., 100., 260., 180.],
                                            [600., 700., 980., 740.]])
+                d["boxes"] *= size / 1280.0
                 d["labels"] = torch.tensor([1, 17])
                 return d
         train_ds = Wrapped()
     else:
-        train_ds = make_dataset("train", resolve(paths["train"]), None,
-                                size, args, has_labels=True, augment=True,
+        train_ds = make_dataset(resolve(paths["train"]), size, has_labels=True, augment=not args.no_augment,
                                 seed=args.seed)
 
     nw = 0 if args.smoke else max(0, args.num_workers)
@@ -138,60 +132,69 @@ def main():
 
     def build_val_loaders():
         if args.smoke:
-            base = SyntheticNormalDataset(n=max(2, min(args.smoke, 4)), size=size,
-                                          seed=args.seed + 1)
-
+            base = SyntheticFabricDataset(n=max(2, min(args.smoke, 4)), size=size,
+                                           seed=args.seed + 1)
             class Wrap(torch.utils.data.Dataset):
                 def __len__(self): return len(base)
-
                 def __getitem__(self, i):
                     d = base[i]
-                    d["boxes"] = torch.tensor([[100., 100., 400., 300.]])
+                    d["boxes"] = torch.tensor([[100., 100., 400., 300.]]) * size / 1280.
                     d["labels"] = torch.tensor([3])
                     return d
-            vl = DataLoader(Wrap(), batch_size=1, shuffle=False,
-                            collate_fn=collate)
-            nl = DataLoader(SyntheticNormalDataset(n=4, size=size,
-                                                   seed=args.seed + 2),
-                            batch_size=1, shuffle=False, collate_fn=collate)
-            return vl, nl
-        vds = make_dataset("val", resolve(paths["val"]), None, size, args,
-                           has_labels=True, augment=False, seed=args.seed)
-        n_key = "normalval" if "normalval" in paths else "normaltrain"
-        nds = make_dataset(n_key, resolve(paths[n_key]), None, size, args,
-                           has_labels=False, augment=False, seed=args.seed)
-        vidx = subset_indices(len(vds), args.val_max, args.val_seed)
-        if vidx is not None:
-            vds = Subset(vds, vidx)
-        nidx = subset_indices(len(nds), args.normal_max, args.val_seed + 1)
-        if nidx is not None:
-            nds = Subset(nds, nidx)
+            return (DataLoader(Wrap(), batch_size=1, collate_fn=collate),
+                    DataLoader(SyntheticFabricDataset(n=4, size=size, seed=args.seed + 2),
+                               batch_size=1, collate_fn=collate))
         vw = max(0, args.val_workers)
         kw = dict(num_workers=vw, collate_fn=collate, pin_memory=True)
-        if vw > 0:
-            kw["worker_init_fn"] = make_worker_init_fn(args.seed + 1)
-            kw["prefetch_factor"] = 2
-        vl = DataLoader(vds, batch_size=val_batch, shuffle=False, **kw)
-        nl = DataLoader(nds, batch_size=val_batch, shuffle=False, **kw)
+        if vw:
+            kw.update(worker_init_fn=make_worker_init_fn(args.seed + 1), prefetch_factor=2)
+        def make_val(split, limit, seed, labeled):
+            ds = make_dataset(resolve(paths[split]), size,
+                              has_labels=labeled, augment=False, seed=args.seed)
+            idx = subset_indices(len(ds), limit, seed)
+            return DataLoader(Subset(ds, idx) if idx is not None else ds,
+                              batch_size=val_batch, shuffle=False, **kw)
+        vl = make_val("val", args.val_max, args.val_seed, True)
+        nl = (make_val("normalval", args.normal_max, args.val_seed + 1, False)
+              if paths.get("normalval") else None)
         return vl, nl
 
     val_loader = norm_loader = None
     if args.val_interval:
         val_loader, norm_loader = build_val_loaders()
 
-    model.set_stage("detector")
     model.train()
-    params = [p for p in model.parameter_groups("detector") if p.requires_grad]
-    opt = torch.optim.AdamW(params, lr=lr, weight_decay=float(cfg.train.weight_decay))
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=max(1, epochs * n_batches))
+    params = [p for p in model.parameters() if p.requires_grad]
+    encoder = [p for p in model.backbone.encoder.parameters() if p.requires_grad]
+    encoder_ids = {id(p) for p in encoder}
+    groups = [{"params": [p for p in params if id(p) not in encoder_ids], "lr": lr}]
+    if encoder:
+        groups.append({"params": encoder,
+                       "lr": lr * float(cfg.model.get("dino_lr_mult", 0.1))})
+    opt = torch.optim.AdamW(groups, lr=lr, weight_decay=float(cfg.train.weight_decay))
+    warmup = int(float(cfg.train.get("warmup_epochs", 0)) * n_batches)
+    if warmup > 0:
+        import math
+        total_steps = max(warmup + 1, epochs * n_batches)
+        def lr_factor(step):
+            if step < warmup:
+                return float(step + 1) / warmup
+            progress = min(1., (step - warmup) / (total_steps - warmup))
+            return 0.05 + 0.95 * 0.5 * (1. + math.cos(math.pi * progress))
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_factor)
+    else:
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=max(1, epochs * n_batches))
 
     out = Path(args.out) if Path(args.out).is_absolute() else ROOT / args.out
     out.mkdir(parents=True, exist_ok=True)
 
-    resume_state = load_checkpoint(args.resume) if args.resume else None
-    info = (resume_checkpoint(resume_state, "detector", model, opt, sched,
-                              train_ds, device=args.device)
+    init_path = args.resume or args.pretrained
+    resume_state = load_checkpoint(init_path) if init_path else None
+    info = (resume_checkpoint(resume_state, model,
+                              optimizer=opt if args.resume else None,
+                              scheduler=sched, dataset=train_ds,
+                              device=args.device, scaler=scaler)
             if resume_state is not None else None)
     start_epoch = min(info["epoch"], epochs) if info and info["full"] else 0
     it = info["iter"] if info and info["full"] else 0
@@ -202,9 +205,15 @@ def main():
 
     trainable = sum(p.numel() for p in params) / 1e6
     log("=" * 72)
-    log("JingWei stage A - supervised detector training")
+    log("JingWei - pretrained DINOv2 detector training")
     log(f"cfg={args.cfg}  data={args.data or cfg.data.dataset_yaml}  device={args.device}")
-    log(f"resume={args.resume or 'none'}  mode={resume_mode}  out={out}")
+    log(f"resume={args.resume or 'none'}  pretrained={args.pretrained or 'none'}  "
+        f"mode={resume_mode}  out={out}")
+    log(f"DIRECT pretrained DINOv2 backbone={model.backbone.name} "
+        f"frozen={model.backbone.frozen} encoder_input={model.backbone.encoder_size}")
+    log("initialization=" + ("detector checkpoint (encoder/adapters/head restored)"
+        if resume_state is not None else
+        "official pretrained DINOv2; pyramid adapters / detector head=new"))
     if args.device.startswith("cuda") and torch.cuda.is_available():
         log(f"gpu={torch.cuda.get_device_name(0)}")
     log(f"model={count_parameters(model) / 1e6:.2f} M params  "
@@ -214,6 +223,9 @@ def main():
         f"seed={args.seed}")
     log(f"start_epoch={start_epoch + 1}/{epochs}  global_iter={it}  "
         f"save_interval={args.save_interval}  log_interval={args.log_interval}")
+    log(f"best_metric={cfg.train.get('best_metric', 'best_f1')}  "
+        f"warmup_epochs={cfg.train.get('warmup_epochs', 0)}  "
+        f"augment={not args.no_augment}  detector_nms_iou={model.head.nms_iou}")
     log(f"val_interval={args.val_interval}  val_batch={val_batch}  "
         f"val_workers={0 if args.smoke else args.val_workers}  "
         f"val_max={args.val_max}  normal_max={args.normal_max}  "
@@ -231,9 +243,11 @@ def main():
             old = meta.get(key)
             if old is not None and old != now:
                 log(f"[!] resume mismatch: {key} checkpoint={old!r}, now={now!r}; "
-                    "continuing with current CLI values")
+                    "optimizer/scheduler state is restored; use --pretrained for a fresh schedule")
     elif info:
-        log(f"[!] {args.resume}: {info['reason']}; starting from epoch 1")
+        log(f"[!] {init_path}: {info['reason']}; starting from epoch 1")
+        if args.pretrained:
+            log("--pretrained: fresh optimizer / scheduler; using current --lr / --epochs")
 
     if start_epoch >= epochs:
         log(f"checkpoint already reached epoch {start_epoch}/{epochs}; nothing to do")
@@ -256,7 +270,7 @@ def main():
                        for b, l in zip(batch_data["boxes"], batch_data["labels"])]
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                result = model(images, targets=targets, it=it)
+                result = model(images, targets=targets)
                 loss = result["losses"]["total"]
             do_log = bool(args.log_interval and (it == 0 or
                                                  (bi + 1) % args.log_interval == 0 or
@@ -312,14 +326,12 @@ def main():
                 ((ep + 1) % args.val_interval == 0 or ep + 1 == epochs)):
             tv = time.time()
             model.eval()
-            model.set_stage("detector")
             try:
                 val_metrics = validate_detector(
                     model, val_loader, norm_loader, args.device, cfg,
                     conf_thresh=args.val_conf, iou_thr=args.val_iou)
             finally:
                 model.train()
-                model.set_stage("detector")
             val_metrics["seconds"] = round(time.time() - tv, 2)
             log(f"val   epoch {ep + 1:3d}/{epochs}  "
                 f"mAP50={val_metrics['mAP50']:.4f}  "
@@ -327,16 +339,22 @@ def main():
                 f"recall={val_metrics['recall']:.4f}  "
                 f"f1={val_metrics['f1']:.4f}  "
                 f"best_f1={val_metrics['best_f1']:.4f}@{val_metrics['best_f1_thr']:.2f}  "
+                f"TP={val_metrics['tp']} FP={val_metrics['fp']} FN={val_metrics['fn']}  "
                 f"large_recall={val_metrics['large_recall']:.4f}  "
                 f"normal_fpr={val_metrics['normal_fpr']:.4f}  "
-                f"unknown_boxes={val_metrics['unknown_boxes']}  "
                 f"({val_metrics['seconds']:.1f}s)")
-            score = 0.5 * val_metrics["mAP50"] + 0.5 * val_metrics["large_recall"]
+            metric = str(cfg.train.get("best_metric", "best_f1"))
+            if metric not in ("mAP50", "precision", "f1", "best_f1"):
+                raise ValueError(f"unsupported train.best_metric: {metric}")
+            score = float(val_metrics[metric])
             if score > best_score:
                 best_score = score
                 save_checkpoint({"model": model.state_dict(),
                                  "metrics": val_metrics,
                                  "train": {"stage": "detector",
+                                           "backbone": "dinov2",
+                                           "dino_name": cfg.model.dino_name,
+                                           "best_metric": metric,
                                            "epoch": ep + 1,
                                            "best_score": best_score}},
                                 out / "best.pt")
@@ -346,10 +364,15 @@ def main():
             "model": model.state_dict(),
             "optimizer": opt.state_dict(),
             "scheduler": sched.state_dict(),
+            "scaler": scaler.state_dict(),
             "rng": collect_rng_state(train_ds),
             "metrics": val_metrics,
             "train": {
                 "stage": "detector",
+                "backbone": "dinov2",
+                "dino_name": cfg.model.dino_name,
+                "best_metric": cfg.train.get("best_metric", "best_f1"),
+                "initialization_checkpoint": str(init_path) if init_path else None,
                 "format_version": 3,
                 "epoch": ep + 1,          # next epoch to run on resume
                 "iter": it,

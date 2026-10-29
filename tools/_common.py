@@ -23,13 +23,11 @@ import cv2
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
 from jingwei import build_model, load_config
-from jingwei.data import (NormalImageDataset, YOLODefectDataset, collate,
-                          infer_labels_dir, list_images, make_worker_init_fn)
-from jingwei.fabric import fabric_descriptor, fit_fabric_prototypes
-from jingwei.image_io import console_safe, imread_unicode
+from jingwei.data import NormalImageDataset, YOLODefectDataset, infer_labels_dir
+from jingwei.image_io import console_safe
 from jingwei.utils import torch_load
 
 
@@ -70,9 +68,8 @@ def iter_speed(done: int, elapsed: float, interval_n: int,
     return 0.85 * avg + 0.15 * inst
 
 
-def make_dataset(split, images_dir, labels_dir, img_size, args, *,
-                 has_labels: bool, augment: bool, seed: int,
-                 with_descriptor: bool = False, log_fn=log):
+def make_dataset(images_dir, img_size, *, has_labels: bool, augment: bool,
+                 seed: int, labels_dir=None):
     """Return the YOLO / normal-image dataset for a split."""
     images_dir = Path(images_dir)
     if has_labels:
@@ -80,8 +77,7 @@ def make_dataset(split, images_dir, labels_dir, img_size, args, *,
         return YOLODefectDataset(images_dir, labels_dir, img_size=img_size,
                                  augment=augment, seed=seed)
     return NormalImageDataset(images_dir, img_size=img_size,
-                              augment=augment, seed=seed,
-                              with_descriptor=with_descriptor)
+                              augment=augment, seed=seed)
 
 
 def subset_indices(n: int, limit: int | None, seed: int = 0) -> list[int] | None:
@@ -145,10 +141,6 @@ def load_checkpoint(path) -> dict:
 def checkpoint_meta(state: dict) -> dict:
     return dict(state.get("train", {}) or {})
 
-
-def is_resumable(state: dict, stage: str) -> bool:
-    meta = checkpoint_meta(state)
-    return "optimizer" in state and meta.get("stage") == stage
 
 
 # --------------------------------------------------------------------------------------
@@ -220,6 +212,7 @@ def collect_rng_state(dataset=None) -> dict:
     out = {
         "torch": torch.get_rng_state(),
         "python": random.getstate(),
+        "numpy_global": _to_plain(np.random.get_state()),
         "cuda": (torch.cuda.get_rng_state_all()
                  if torch.cuda.is_available() else []),
     }
@@ -239,6 +232,8 @@ def restore_rng_state(state: dict, dataset=None) -> None:
             random.setstate(tuple(state["python"]))
         except (TypeError, ValueError):
             pass
+    if "numpy_global" in state:
+        np.random.set_state(tuple(_from_plain(state["numpy_global"])))
     if state.get("cuda") and torch.cuda.is_available():
         try:
             torch.cuda.set_rng_state_all(state["cuda"])
@@ -254,28 +249,30 @@ def restore_rng_state(state: dict, dataset=None) -> None:
                     "training continues with the seeded generator")
 
 
-def resume_checkpoint(state_or_path, stage: str, model, optimizer=None,
-                      scheduler=None, dataset=None, extra_modules=None,
-                      device="cpu") -> dict:
-    """Load weights; additionally restore full training state when available.
+def resume_checkpoint(state_or_path, model, optimizer=None, scheduler=None,
+                      dataset=None, device="cpu", scaler=None) -> dict:
+    """Strict detector restore. Passing an optimizer requires full train state.
 
-    ``state_or_path`` may be a path or an already-loaded state dict.  A full
-    checkpoint contains ``optimizer`` and ``train.stage == stage``; otherwise
-    the file is treated as a weight-only warm start (e.g. ``dino_init.pt``).
+    Weight-only initialization is explicit: omit the optimizer. Never silently
+    convert an incomplete --resume into a new training schedule.
     """
     state = (state_or_path if isinstance(state_or_path, dict)
              else load_checkpoint(state_or_path))
     meta = checkpoint_meta(state)
-    full = bool(optimizer is not None and "optimizer" in state and
-                meta.get("stage") == stage)
+    full = optimizer is not None
+    if full:
+        required = ["model", "optimizer", "rng", "train"]
+        if scheduler is not None:
+            required.append("scheduler")
+        missing = [key for key in required if key not in state]
+        if missing or not all(key in meta for key in ("epoch", "iter")):
+            raise ValueError("Incomplete training checkpoint for --resume; "
+                             "use --pretrained for weight-only initialization. "
+                             f"Missing state: {missing or ['epoch/iter']}")
+        if meta.get("backbone") != "dinov2":
+            raise ValueError("--resume requires a direct DINOv2 detector checkpoint")
 
-    sd = state.get("model", state)
-    model.load_state_dict(sd, strict=False)
-    if extra_modules:
-        for key, module in extra_modules.items():
-            if key in state:
-                module.load_state_dict(state[key], strict=False)
-
+    model.load_state_dict(state.get("model", state), strict=True)
     if full:
         optimizer.load_state_dict(state["optimizer"])
         for st in optimizer.state.values():
@@ -283,39 +280,44 @@ def resume_checkpoint(state_or_path, stage: str, model, optimizer=None,
                 for k, v in st.items():
                     if torch.is_tensor(v):
                         st[k] = v.to(device)
-        if scheduler is not None and "scheduler" in state:
+        if scheduler is not None:
             scheduler.load_state_dict(state["scheduler"])
-        restore_rng_state(state.get("rng", {}), dataset)
+        if scaler is not None and scaler.is_enabled():
+            if state.get("scaler"):
+                scaler.load_state_dict(state["scaler"])
+            else:
+                log("[!] checkpoint has no FP16 scaler state; using a fresh loss scale")
+        restore_rng_state(state["rng"], dataset)
 
-    if full:
-        reason = "ok"
-    elif meta.get("stage") and meta.get("stage") != stage:
-        reason = f"stage mismatch: checkpoint is {meta.get('stage')!r}, expected {stage!r}"
-    elif "optimizer" not in state:
-        reason = "weight-only checkpoint (no optimizer / scheduler state)"
-    else:
-        reason = "missing optimizer"
     return {
         "full": full,
-        "reason": reason,
+        "reason": "ok" if full else "explicit weight-only initialization",
         "meta": meta,
-        "epoch": int(meta.get("epoch", 0)) if full else 0,
-        "iter": int(meta.get("iter", 0)) if full else 0,
+        "epoch": int(meta["epoch"]) if full else 0,
+        "iter": int(meta["iter"]) if full else 0,
         "state": state,
     }
 
 
-def load_model(cfg_path: str, ckpt: str | None = None, device="cpu"):
+def load_model(cfg_path: str, ckpt: str | None = None, device="cpu",
+               initialize_pretrained: bool = True):
     cfg = load_config(cfg_path)
-    model = build_model(cfg)
+    # Complete detector checkpoints include the encoder: construct architecture
+    # without downloading foundation weights, then restore all tensors strictly.
+    original = cfg.model.get("dino_pretrained", True)
+    if ckpt or not initialize_pretrained:
+        cfg.model.dino_pretrained = False
+    try:
+        model = build_model(cfg)
+    finally:
+        cfg.model.dino_pretrained = original
     if ckpt:
         state = load_checkpoint(ckpt)
-        sd = state.get("model", state)
-        model.load_state_dict(sd, strict=False)
+        model.load_state_dict(state.get("model", state), strict=True)
     return model.to(device), cfg
 
 
-class SyntheticNormalDataset(Dataset):
+class SyntheticFabricDataset(Dataset):
     """On-the-fly woven-texture images for smoke tests (no files needed)."""
 
     def __init__(self, n=32, size=1280, seed=0):
@@ -335,51 +337,4 @@ class SyntheticNormalDataset(Dataset):
         img = np.clip(np.stack([g + field] * 3, -1), 0, 255).astype(np.uint8)
         img = cv2.resize(img, (self.size, self.size), interpolation=cv2.INTER_LINEAR)
         return dict(image=torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0,
-                    descriptor=torch.from_numpy(fabric_descriptor(img[:, :, 0])),
                     path=f"synthetic_{idx:05d}")
-
-
-@torch.no_grad()
-def descriptors_for_folder(folder, k_prototypes, limit=None):
-    files = list_images(folder)
-    if limit:
-        files = files[:limit]
-    readable, descs = [], []
-    for f in files:
-        img = imread_unicode(f, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            continue
-        readable.append(f)
-        descs.append(fabric_descriptor(img))
-    if not descs:
-        raise FileNotFoundError(f"no readable images in {console_safe(folder)}")
-    d = np.stack(descs)
-    proto, labels = fit_fabric_prototypes(d, k=k_prototypes)
-    return readable, d, proto, labels
-
-
-@torch.no_grad()
-def extract_patch_features(model, files, proto_labels, device, cfg, batch_size=1, limit=None):
-    """Return {prototype_id: (N, D) L2-normalised patch features}."""
-    model.eval()
-    g = int(cfg.normality.grid)
-    size = int(cfg.input_size[0])
-    out = {}
-    n = min(len(files), limit) if limit else len(files)
-    for i in range(0, n, batch_size):
-        chunk = files[i:i + batch_size]
-        imgs = []
-        for f in chunk:
-            im = imread_unicode(f, cv2.IMREAD_COLOR)
-            if im is None:
-                raise FileNotFoundError(f"cannot read image: {console_safe(f)}")
-            im = cv2.cvtColor(cv2.resize(im, (size, size)), cv2.COLOR_BGR2RGB)
-            imgs.append(torch.from_numpy(im.transpose(2, 0, 1)).float() / 255.0)
-        x = torch.stack(imgs).to(device)
-        feats = model.neck(model.backbone(x))
-        q = model.normality.patch(feats)                  # (B, D, g, g)
-        q = q.permute(0, 2, 3, 1).reshape(-1, q.shape[1]).cpu().numpy()
-        for j in range(len(chunk)):
-            k = int(proto_labels[i + j])
-            out.setdefault(k, []).append(q[j * g * g:(j + 1) * g * g])
-    return {k: np.concatenate(v, 0) for k, v in out.items()}

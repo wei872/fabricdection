@@ -1,14 +1,13 @@
-"""Losses: supervised detection + foreground alignment + loose reconstruction.
+"""Losses: supervised dual-assignment detection and box alignment.
 
-Detection training uses a **dual assignment** (YOLOv10 / YOLO27 lineage):
+Detection training uses two assignments:
   - one-to-many dense assignment (IoU-aware varifocal targets) supervises the
     shared cls/reg features;
   - one-to-one Hungarian matching supervises the deployed objectness branch,
-    which is what makes inference genuinely NMS-free.
+    inference may additionally apply configurable class-aware NMS.
 """
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,35 +15,6 @@ import torch.nn.functional as F
 from .utils import box_ciou, box_iou, boxes_from_distances
 
 
-# --------------------------------------------------------------------------------------
-# 1. Dinomaly loose reconstruction loss
-# --------------------------------------------------------------------------------------
-class HardMiningCosineLoss(nn.Module):
-    """Global cosine loss on the hardest ``p`` fraction of patches.
-
-    Dinomaly's "Loose Reconstruction": no layer-to-layer / point-by-point MSE,
-    just a cosine dissimilarity concentrated on hard patches. ``p`` is ramped
-    from 0 -> p_final over ``warmup`` iterations so training starts stable.
-    """
-
-    def __init__(self, p_final: float = 0.9, warmup: int = 1000, factor: float = 0.1):
-        super().__init__()
-        self.p_final, self.warmup, self.factor = p_final, max(1, warmup), factor
-
-    def forward(self, target: torch.Tensor, reconstructed: torch.Tensor, it: int = 0):
-        t = F.normalize(target.detach(), dim=-1)
-        r = F.normalize(reconstructed, dim=-1)
-        loss_map = 1.0 - (t * r).sum(-1)                # (B, N)
-        flat = loss_map.reshape(loss_map.shape[0], -1)
-        p = min(self.p_final, self.p_final * it / self.warmup)
-        k = max(1, int(flat.shape[1] * p))
-        hard = torch.topk(flat, k, dim=1).values.mean()
-        return hard + self.factor * flat.mean()
-
-
-# --------------------------------------------------------------------------------------
-# 2. Dense (one-to-many) target builder
-# --------------------------------------------------------------------------------------
 def _grid_points(h, w, stride, device, dtype):
     ys, xs = torch.meshgrid(torch.arange(h, device=device, dtype=dtype),
                             torch.arange(w, device=device, dtype=dtype), indexing="ij")
@@ -118,7 +88,7 @@ def build_dense_targets(pred, targets, stride, nc, reg_scale, radius=1.5):
 
 
 # --------------------------------------------------------------------------------------
-# 3. One-to-one Hungarian matching
+# One-to-one Hungarian matching
 # --------------------------------------------------------------------------------------
 @torch.no_grad()
 def hungarian_match(preds, targets, strides, nc, reg_scale, max_candidates=1600):
@@ -128,7 +98,6 @@ def hungarian_match(preds, targets, strides, nc, reg_scale, max_candidates=1600)
     B = preds[0]["cls"].shape[0]
     device = preds[0]["cls"].device
     per_scale: list[list] = [[] for _ in preds]
-    candidate_meta = [[] for _ in preds]      # (si, local flat idx) per global slot order
 
     for b in range(B):
         all_cls, all_obj, all_boxes, meta = [], [], [], []
@@ -189,7 +158,7 @@ def o2o_negative_count(total_cells: int, n_pos: int, ratio: float,
 
 
 # --------------------------------------------------------------------------------------
-# 4. Combined detection loss
+# Combined detection loss
 # --------------------------------------------------------------------------------------
 class DetectionLoss(nn.Module):
     def __init__(self, cfg):
@@ -229,10 +198,14 @@ class DetectionLoss(nn.Module):
                                                          reduction="none")
             losses["obj_o2m"] = losses["obj_o2m"] + (bce_obj * (1.0 + 3.0 * pos.float())).mean()
 
-            pm = pos.expand(B, 4, HW)
-            pred_d = (p["reg"].float() * self.reg_scale * stride).reshape(B, 4, HW)[pm].reshape(-1, 4)
-            tgt_d = t_reg[pm].reshape(-1, 4)
-            p_sel = pts[None].expand(B, HW, 2)[pos.squeeze(1)].reshape(-1, 2)
+            # Select cells in (batch, cell, coordinate) order, matching p_sel.
+            # Masking (B, 4, HW) first flattens channel-major: reshape(-1, 4)
+            # would mix l/t/r/b values from DIFFERENT cells whenever >1 is positive.
+            cell_pos = pos.squeeze(1)
+            pred_d = (p["reg"].float() * self.reg_scale * stride).reshape(
+                B, 4, HW).transpose(1, 2)[cell_pos]
+            tgt_d = t_reg.transpose(1, 2)[cell_pos]
+            p_sel = pts[None].expand(B, HW, 2)[cell_pos]
             if pred_d.numel():
                 pb = boxes_from_distances(p_sel, pred_d)
                 gb = boxes_from_distances(p_sel, tgt_d)

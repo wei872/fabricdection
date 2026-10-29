@@ -1,9 +1,6 @@
-"""Dual-scale PAN neck.
+"""PAN feature fusion on DINOv2-adapted stride 8/16/32 feature maps.
 
-Following YOLO27 n/s, we *fuse* on three scales (P3/P4/P5) but only *predict*
-on two (P3 for tiny defects, P5 for large ones). P4 exists to carry information
-between them and is never attached to a detection head; a fixed scalar keeps the
-two surviving scales balanced in the head.
+Only P3 and P5 carry predictions; the intermediate level fuses information.
 """
 from __future__ import annotations
 
@@ -33,7 +30,7 @@ class DualScalePAN(nn.Module):
         self.down4 = make_downsample(c4, c5, 3, 2, dw=dw)
         self.bot5 = CSPBlock(c5 + c5, c5, n, dw=dw)
 
-        # "fixed scaling on the fused features keeps the two scales balanced"
+        # Learnable scalar balance for the two prediction scales.
         self.bal3 = nn.Parameter(torch.tensor(float(m.balance_p3)))
         self.bal5 = nn.Parameter(torch.tensor(float(m.balance_p5)))
 

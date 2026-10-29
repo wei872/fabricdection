@@ -1,11 +1,6 @@
-"""Dataset readers for the two data sources in ``dataset/dataset.yaml``.
+"""YOLO defect data, fabric augmentation and optional normal-image FPR evaluation.
 
-* ``train`` / ``val``      — YOLO-format defect data (images + ``.txt`` labels)
-* ``normaltrain`` / ``normalval`` — normal images ONLY (no labels), used by
-  the unsupervised normality branch and for false-positive calibration.
-
-All file reads go through :mod:`jingwei.image_io`, so Chinese / Unicode image
-and folder names work on Windows as well as Linux.
+All image I/O supports Unicode paths on Windows and Linux.
 """
 from __future__ import annotations
 
@@ -18,7 +13,6 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .fabric import fabric_descriptor
 from .image_io import console_safe, imread_unicode
 
 IMG_EXTS = (
@@ -133,7 +127,7 @@ def fabric_photometric(img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
         x = cv2.addWeighted(x, 1.6, cv2.GaussianBlur(x, (0, 0), 1.2), -0.6, 0.0)
 
     # 布幅变化导致的边缘正常折入 / 卷边：只改亮度，不移动任何标注框。
-    # 让 normaltrain 与 detector 的 hard-negative 都见到这种“像缺陷但不是缺陷”的模式。
+    # 让 detector 的 hard-negative 都见到这种“像缺陷但不是缺陷”的模式。
     if rng.random() < 0.25:
         side = int(rng.integers(0, 2))
         band = int(rng.integers(max(4, w // 50), max(8, w // 18)))
@@ -266,11 +260,8 @@ class YOLODefectDataset(Dataset):
 # Normal-only image dataset
 # --------------------------------------------------------------------------------------
 class NormalImageDataset(Dataset):
-    def __init__(self, root, img_size=1280, augment=True, seed=0,
-                 with_descriptor=False, resize_for_descriptor=512):
+    def __init__(self, root, img_size=1280, augment=False, seed=0):
         self.img_size, self.augment = img_size, augment
-        self.with_descriptor = with_descriptor
-        self.resize_for_descriptor = resize_for_descriptor
         self.files = list_images(root)
         self.rng = np.random.default_rng(seed)
         if not self.files:
@@ -283,11 +274,6 @@ class NormalImageDataset(Dataset):
         path = self.files[idx]
         img = read_image(path)
         out = {"path": path}
-        if self.with_descriptor:
-            gray = cv2.cvtColor(cv2.resize(img, (self.resize_for_descriptor,
-                                                 self.resize_for_descriptor)),
-                                cv2.COLOR_RGB2GRAY)
-            out["descriptor"] = torch.from_numpy(fabric_descriptor(gray))
 
         if self.augment:
             empty = np.zeros((0, 4), np.float32)
@@ -301,8 +287,7 @@ class NormalImageDataset(Dataset):
 
 def collate(batch):
     out = {"image": torch.stack([b["image"] for b in batch], 0)}
-    for key in ("boxes", "labels", "path", "descriptor"):
+    for key in ("boxes", "labels", "path"):
         if key in batch[0]:
-            out[key] = ([b[key] for b in batch] if key in ("boxes", "labels", "path")
-                        else torch.stack([b[key] for b in batch], 0))
+            out[key] = [b[key] for b in batch]
     return out

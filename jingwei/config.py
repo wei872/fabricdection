@@ -33,23 +33,35 @@ class Cfg(dict):
 
 
 def load_config(path: str | Path) -> Cfg:
-    """Load a YAML config. Unknown/missing keys are the caller's responsibility."""
+    """Load and validate the single supported DINOv2 detector configuration."""
     path = Path(path)
     with path.open("r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh)
     if not isinstance(raw, dict):
         raise ValueError(f"{path} does not contain a YAML mapping")
+    retired = {"normality", "foreground", "fusion", "dino"}.intersection(raw)
+    model = raw.get("model")
+    if retired or (isinstance(model, dict) and model.get("backbone", "dinov2") != "dinov2"):
+        raise ValueError("Unsupported legacy configuration. Use configs/jingwei_dinov2.yaml; "
+                         "only direct pretrained DINOv2 detection is supported.")
+    for key in ("model", "train", "data", "inference"):
+        if not isinstance(raw.get(key), dict):
+            raise ValueError(f"missing configuration section: {key}")
+    size = raw.get("input_size", [])
+    if (not isinstance(size, (list, tuple)) or len(size) != 2 or any(not isinstance(v, int) or v <= 0 or v % 32 for v in size)
+            or size[0] != size[1]):
+        raise ValueError("input_size must be square, positive, and a multiple of 32")
+    nc, names = raw["data"].get("nc"), raw["data"].get("names")
+    if (not isinstance(nc, int) or nc < 1 or not isinstance(names, list)
+            or nc != len(names) or not all(isinstance(name, str) for name in names)):
+        raise ValueError("data.nc must be positive and match the list of class names")
+    if raw["train"].get("best_metric", "best_f1") not in ("mAP50", "precision", "f1", "best_f1"):
+        raise ValueError("train.best_metric must be mAP50, precision, f1 or best_f1")
+    if float(raw["train"].get("warmup_epochs", 0)) < 0:
+        raise ValueError("train.warmup_epochs must be nonnegative")
+    for section, key in (("model", "score_thresh"), ("inference", "final_score_thresh")):
+        if not 0 <= float(raw[section][key]) <= 1:
+            raise ValueError(f"{section}.{key} must be between 0 and 1")
     cfg = Cfg(raw)
     cfg["_config_path"] = str(path)
     return cfg
-
-
-def merge(defaults: dict, overrides: dict) -> Cfg:
-    """Recursive merge used by CLI overrides (``--opts model.width=0.75``)."""
-    out = Cfg({k: (Cfg(v) if isinstance(v, dict) else v) for k, v in defaults.items()})
-    for key, value in overrides.items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
-            out[key] = merge(out[key], value)
-        else:
-            out[key] = value
-    return out

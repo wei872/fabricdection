@@ -1,20 +1,8 @@
-"""Dual-scale, anchor-free, NMS-free detection head.
+"""Dual-scale supervised detector with shared class/box predictions.
 
-The head is decoupled (cls / reg / obj), DFL-free (YOLO26/27 lineage) and has
-**two objectness branches that share the same cls/reg predictions**:
-
-* ``obj``     — one-to-many, trained with dense IoU-aware targets. Rich dense
-                supervision for the shared features. TRAIN ONLY.
-* ``obj_o2o`` — one-to-one, trained with Hungarian matching. This is the branch
-                used at inference: one peak per object -> no NMS, deterministic
-                latency. (Same spirit as YOLOv10 / YOLO27's "foreground
-                alignment supervision", but implemented as an explicit branch
-                so the deployed graph is trivially exportable.)
-* ``fg``      — train-only foreground-alignment auxiliary head, removed on
-                export. Costs nothing at deployment.
-
-Only P3 (stride 8, tiny defects) and P5 (stride 32, large defects) carry a
-head; P4 is fusion-only (YOLO27 n/s "dual-scale detection").
+Dense objectness and Hungarian one-to-one objectness are trained together;
+inference uses the latter plus configurable class-aware NMS. A box-derived
+alignment auxiliary head is training-only. P3/P5 predict; P4 only fuses features.
 """
 from __future__ import annotations
 
@@ -23,15 +11,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .layers import DWConv
-from .utils import boxes_from_distances
+from .utils import boxes_from_distances, classwise_nms
 
 
 class DecoupledHead(nn.Module):
-    def __init__(self, c: int, nc: int, width: float, training_branch: bool = True):
+    def __init__(self, c: int, nc: int, width: float, training_branch: bool = True,
+                 reg_activation: str = "softplus"):
         super().__init__()
         h = max(16, int(c * width))
         stem = lambda: nn.Sequential(DWConv(c, h, 3), DWConv(h, h, 3))
         self.cls_stem, self.reg_stem = stem(), stem()
+        if reg_activation not in ("relu", "softplus"):
+            raise ValueError("reg_activation must be relu or softplus")
+        self.reg_activation = reg_activation
         self.cls_pred = nn.Conv2d(h, nc, 1)
         self.reg_pred = nn.Conv2d(h, 4, 1)
         self.obj_pred = nn.Conv2d(c, 1, 1)          # one-to-many (train only)
@@ -47,7 +39,8 @@ class DecoupledHead(nn.Module):
         f_cls, f_reg = self.cls_stem(x), self.reg_stem(x)
         out = {
             "cls": self.cls_pred(f_cls),
-            "reg": F.relu(self.reg_pred(f_reg)),
+            "reg": (F.softplus(self.reg_pred(f_reg)) if self.reg_activation == "softplus"
+                    else F.relu(self.reg_pred(f_reg))),
             "obj": self.obj_pred(x) if training else None,
             "obj_o2o": self.obj_o2o(x),
         }
@@ -55,7 +48,7 @@ class DecoupledHead(nn.Module):
         return out
 
 
-class NMSFreeDetect(nn.Module):
+class DualScaleDetect(nn.Module):
     def __init__(self, cfg, channels):
         super().__init__()
         m = cfg.model
@@ -65,9 +58,14 @@ class NMSFreeDetect(nn.Module):
         self.score_thresh = float(m.score_thresh)
         self.reg_scale = float(m.reg_scale)
         self.heads = nn.ModuleList([
-            DecoupledHead(channels[1], self.nc, m.head_width, m.fg_align),
-            DecoupledHead(channels[3], self.nc, m.head_width, m.fg_align),
+            DecoupledHead(channels[1], self.nc, m.head_width, m.fg_align,
+                          m.get("reg_activation", "softplus")),
+            DecoupledHead(channels[3], self.nc, m.head_width, m.fg_align,
+                          m.get("reg_activation", "softplus")),
         ])
+        self.nms_iou = float(m.get("detector_nms_iou", 0.0))
+        if not 0.0 <= self.nms_iou <= 1.0:
+            raise ValueError("detector_nms_iou must be between 0 and 1 (0 disables NMS)")
         self._points_cache: dict = {}
 
     def _points(self, h, w, stride, device):
@@ -86,9 +84,9 @@ class NMSFreeDetect(nn.Module):
 
     # ----------------------------------------------------------------------------------
     @torch.no_grad()
-    def decode(self, preds, img_size, anomaly_boost: torch.Tensor | None = None):
-        """top-k + threshold over the one-to-one branch. No NMS, no post-hoc
-        data-dependent loops -> fixed, bounded latency.
+    def decode(self, preds, img_size):
+        """top-k + threshold over the one-to-one branch; optional class-aware NMS.
+        Set detector_nms_iou=0 to skip NMS and its data-dependent work.
 
         Returns list[B] of dict(boxes(N,4) xyxy px, scores(N,), labels(N,),
                                 obj(N,), points(N,2), scale_idx(N,)).
@@ -105,11 +103,6 @@ class NMSFreeDetect(nn.Module):
                 cls = cls.reshape(self.nc, -1).T          # (HW, nc)
                 reg = reg.reshape(4, -1).T               # (HW, 4)
                 obj = obj.reshape(-1)
-
-                if anomaly_boost is not None:
-                    a = F.interpolate(anomaly_boost[b:b + 1], size=(H, W),
-                                      mode="bilinear", align_corners=False).reshape(-1)
-                    obj = obj + float(self.anomaly_logit_gain) * a
 
                 cls_prob = cls.sigmoid()
                 cscore, clabel = cls_prob.max(dim=-1)
@@ -149,13 +142,10 @@ class NMSFreeDetect(nn.Module):
             si = torch.cat(cand_si)[sel]
             boxes[..., 0::2] = boxes[..., 0::2].clamp(0, img_size[1])
             boxes[..., 1::2] = boxes[..., 1::2].clamp(0, img_size[0])
-            results.append(dict(boxes=boxes, scores=scores[sel], labels=labels,
-                                obj=obj, points=pts, scale_idx=si))
+            result = dict(boxes=boxes, scores=scores[sel], labels=labels,
+                          obj=obj, points=pts, scale_idx=si)
+            if self.nms_iou > 0:
+                keep = classwise_nms(boxes, result["scores"], labels, self.nms_iou)
+                result = {key: value[keep] for key, value in result.items()}
+            results.append(result)
         return results
-
-    @property
-    def anomaly_logit_gain(self):
-        return getattr(self, "_anomaly_logit_gain", 1.0)
-
-    def set_anomaly_logit_gain(self, value: float):
-        self._anomaly_logit_gain = float(value)
