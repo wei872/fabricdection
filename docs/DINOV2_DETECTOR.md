@@ -55,3 +55,14 @@
 
 已做的是 tiny hub 的训练→校准→预测→评估→测速失败门禁回归，以及官方源码随机 ViT-S 的前后向接口检查。
 **没有官方预训练权重的真实训练、跨布匹泛化、未知召回或1660速度实测结果。**
+
+## Native-detail extension
+
+Current defaults retain the 224 ViT pass but add a native RGB-to-P3 detail path
+(PixelUnshuffle, narrow depthwise-separable convolutions, gated residual).
+Unknown scoring also uses a fixed, native stride-8 grayscale texture descriptor
+bank alongside the frozen semantic prototypes. Joint image-max calibration is
+required again; the six-tensor ONNX artifact still excludes unknown processing.
+See TRAINING section 11 for migration, supervision changes and explicit limits.
+Interpolated DINO maps alone still cannot recover lost detail; these new routes
+supply additional original-pixel information, not a proof of recall or 1660 FPS.

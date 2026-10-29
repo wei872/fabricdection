@@ -9,7 +9,7 @@ from .dinov2_backbone import DINOv2Backbone
 from .head import DualScaleDetect
 from .losses import DetectionLoss
 from .neck import DualScalePAN
-from .novelty import NormalPrototypes
+from .novelty import NormalPrototypes, texture_descriptor
 
 
 class JingWei(nn.Module):
@@ -30,13 +30,21 @@ class JingWei(nn.Module):
         u = cfg.get("unknown", {})
         self.novelty = (NormalPrototypes(self.backbone.encoder.embed_dim,
                                         u.get("prototypes", 32), u.get("momentum", .95),
-                                        u.get("min_patches", 1), u.get("max_regions", 8))
+                                        u.get("min_patches", 1), u.get("max_regions", 8),
+                                        texture_detail=u.get("texture_detail", True))
                         if u.get("enabled", False) else None)
+
+    @property
+    def architecture_signature(self):
+        return dict(local_detail=self.backbone.local_detail is not None,
+                    texture_detail=self.novelty is not None and self.novelty.texture is not None)
 
     def forward(self, x, targets=None, normal_mask=None):
         backbone = self.backbone(x, return_raw=self.novelty is not None and (self.training or not self.known_only), include_detail=False)
         if self.training and self.novelty is not None and normal_mask is not None:
-            self.novelty.update(backbone["raw"][normal_mask.to(x.device).bool()])
+            mask = normal_mask.to(x.device).bool()
+            texture = texture_descriptor(x[mask]) if self.novelty.texture is not None else None
+            self.novelty.update(backbone["raw"][mask], texture)
         feats = self.neck(backbone)
         if self.training:
             preds = self.head(feats, training=True)
@@ -47,7 +55,9 @@ class JingWei(nn.Module):
             return out
         detections = self._decode(self.head(feats, training=False), x.shape[-2:])
         if self.novelty is not None and not self.known_only and bool(self.novelty.calibrated):
-            for detection, regions in zip(detections, self.novelty.regions(backbone["raw"], x.shape[-2:])):
+            texture = texture_descriptor(x) if self.novelty.texture is not None else None
+            for detection, regions in zip(detections, self.novelty.regions(
+                    backbone["raw"], x.shape[-2:], texture)):
                 detection.update(regions)
         return detections
 

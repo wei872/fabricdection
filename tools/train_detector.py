@@ -209,10 +209,14 @@ def main():
 
     init_path = args.resume or args.pretrained
     resume_state = load_checkpoint(init_path) if init_path else None
-    if args.resume and (resume_state.get("train") or {}).get("assignment_version") != model.det_loss.assignment_version:
-        raise ValueError("Checkpoint uses an older matching objective. Use --pretrained CHECKPOINT "
-                         "with a new --out directory to start the geometry-feasible schedule; "
-                         "old weights remain compatible but optimizer state is not reused silently.")
+    if args.resume:
+        saved_train = resume_state.get("train") or {}
+        if (saved_train.get("assignment_version") != model.det_loss.assignment_version or
+                saved_train.get("objective_version") != model.det_loss.objective_version or
+                saved_train.get("architecture") != model.architecture_signature):
+            raise ValueError("Checkpoint uses an older/different training objective. Use --pretrained CHECKPOINT "
+                             "with a new --out directory for balanced classification and IoU objectness; "
+                             "old weights remain compatible but optimizer state is not reused silently.")
     info = (resume_checkpoint(resume_state, model,
                               optimizer=opt if args.resume else None,
                               scheduler=sched, dataset=train_ds,
@@ -245,6 +249,9 @@ def main():
         f"seed={args.seed}")
     log(f"start_epoch={start_epoch + 1}/{epochs}  global_iter={it}  "
         f"save_interval={args.save_interval}  log_interval={args.log_interval}")
+    log(f"detail_architecture={model.architecture_signature}")
+    log(f"objective={model.det_loss.objective_version}  cls_min_neg={model.det_loss.cls_min_neg}  "
+        f"cls_neg_ratio={model.det_loss.cls_neg_ratio:g}  o2o_quality_floor={model.det_loss.o2o_quality_floor:g}")
     log(f"best_metric={cfg.train.get('best_metric', 'best_f1')}  "
         f"warmup_epochs={cfg.train.get('warmup_epochs', 0)}  "
         f"augment={not args.no_augment}  detector_nms_iou={model.head.nms_iou}")
@@ -393,6 +400,8 @@ def main():
                                            "backbone": "dinov2",
                                            "dino_name": cfg.model.dino_name,
                                            "assignment_version": model.det_loss.assignment_version,
+                                           "objective_version": model.det_loss.objective_version,
+                                           "architecture": model.architecture_signature,
                                            "best_metric": metric,
                                            "epoch": ep + 1,
                                            "best_score": best_score}},
@@ -411,6 +420,8 @@ def main():
                 "backbone": "dinov2",
                 "dino_name": cfg.model.dino_name,
                 "assignment_version": model.det_loss.assignment_version,
+                "objective_version": model.det_loss.objective_version,
+                "architecture": model.architecture_signature,
                 "best_metric": cfg.train.get("best_metric", "best_f1"),
                 "initialization_checkpoint": str(init_path) if init_path else None,
                 "format_version": 3,

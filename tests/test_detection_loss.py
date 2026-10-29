@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from jingwei.config import load_config
-from jingwei.losses import DetectionLoss, _grid_points, build_dense_targets
+from jingwei.losses import DetectionLoss, _grid_points, build_dense_targets, hungarian_match
 from jingwei.utils import box_ciou, boxes_from_distances, boxes_to_distances
 
 
@@ -62,9 +62,12 @@ class TestDenseBoxLoss(unittest.TestCase):
         expected = torch.zeros(())
         # Deliberately index one cell at a time rather than reusing the loss's
         # vectorised selection: this catches channel/cell layout regressions.
-        for p, stride in zip(preds, (8, 32)):
+        matches = hungarian_match(preds, self.targets, (8, 32), 19, self.criterion.reg_scale)
+        for p, stride, group in zip(preds, (8, 32), matches):
             _, _, _, _, pos, pts = build_dense_targets(
                 p, self.targets, stride, 19, self.criterion.reg_scale)
+            for b, flat, _ in group:
+                pos[b, 0, flat] = True  # union with deployed positives, one GT/image
             distances, gt_distances, points = [], [], []
             h, w = p["reg"].shape[-2:]
             for b, _, flat in pos.nonzero().tolist():

@@ -1,12 +1,14 @@
 """Losses: supervised dual-assignment detection and box alignment.
 
 Detection training uses two assignments:
-  - one-to-many dense assignment (IoU-aware varifocal targets) supervises the
+  - one-to-many dense assignment (balanced hard-label focal targets) supervises the
     shared cls/reg features;
   - one-to-one Hungarian matching supervises the deployed objectness branch,
     inference may additionally apply configurable class-aware NMS.
 """
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
@@ -23,7 +25,7 @@ def _grid_points(h, w, stride, device, dtype):
 
 
 @torch.no_grad()
-def build_dense_targets(pred, targets, stride, nc, reg_scale, radius=1.5):
+def build_dense_targets(pred, targets, stride, nc, reg_scale, radius=1.5, matches=None):
     """FCOS-style centre sampling with an IoU-aware quality target."""
     B, _, H, W = pred["cls"].shape
     device = pred["cls"].device
@@ -80,6 +82,20 @@ def build_dense_targets(pred, targets, stride, nc, reg_scale, radius=1.5):
         near = (((pts[:, 0:1] - cx[None, :]) ** 2 +
                  (pts[:, 1:2] - cy[None, :]) ** 2) <= (2.0 * stride) ** 2).any(1)
         t_fg[b, 0, near] = 1.0
+
+    # Shared cls/reg tensors must not receive a dense negative or a different
+    # GT at a cell chosen as a deployed positive (including outside the dense
+    # centre-sampling window). Override that cell consistently for both losses.
+    for b, flat, g in matches or ():
+        box = targets[b]["boxes"][g:g + 1].to(device=device, dtype=dtype)
+        label = targets[b]["labels"][g].to(device=device, dtype=torch.long)
+        t_cls[b, :, flat] = 0
+        t_cls[b, label, flat] = 1
+        t_reg[b, :, flat] = boxes_to_distances(pts[flat:flat + 1], box)[0]
+        pb = boxes_from_distances(pts[flat:flat + 1], pred_dist[b, :, flat][None])
+        t_qual[b, 0, flat] = box_ciou(pb, box)[0].clamp(0, 1)
+        pos[b, 0, flat] = True
+        t_fg[b, 0, flat] = 1
 
     return t_cls, t_reg, t_qual, t_fg, pos, pts
 
@@ -192,11 +208,59 @@ def o2o_negative_count(total_cells: int, n_pos: int, ratio: float,
     return max(1, min(available, floor))
 
 
+def balanced_class_focal_loss(logits, target, class_weights, min_neg=256, neg_ratio=3.):
+    """Hard-label focal classification, balanced separately for each image.
+
+    A correct class remains positive even when the box is initially inaccurate.
+    Average positives and hard negatives separately; a normal image must not
+    contribute an unnormalized sum over every background cell/class.
+    ``target`` is binary (B,C,N), independent of predicted box quality.
+    """
+    logits = logits.float()
+    ce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    weighted = ce * (logits.sigmoid() - target).square() * class_weights[None, :, None]
+    per_image = []
+    for b in range(len(logits)):
+        positive = target[b].bool()
+        n_pos = int(positive.sum())
+        pos_loss = weighted[b][positive].sum() / max(1, n_pos)
+        negatives = weighted[b][~positive]
+        k = min(negatives.numel(), max(int(min_neg), int(neg_ratio * n_pos)))
+        neg_loss = negatives.topk(k).values.mean() if k else negatives.sum()
+        per_image.append(pos_loss + neg_loss)
+    return torch.stack(per_image).mean()
+
+
+@torch.no_grad()
+def build_o2o_quality_targets(pred, matches, targets, stride, reg_scale, quality_floor=.05):
+    """Detached IoU targets and a SEPARATE binary assignment mask.
+
+    A low-quality match is still a positive assignment, never a hard negative.
+    Use the same unclipped box geometry as matching/regression. A small floor
+    bootstraps objectness for very inaccurate positive boxes, without training
+    all matched boxes to confidence one regardless of localization quality.
+    """
+    obj = pred["obj_o2o"].flatten(1)
+    quality = torch.zeros_like(obj, dtype=torch.float32)
+    positive = torch.zeros_like(obj, dtype=torch.bool)
+    h, w = pred["obj_o2o"].shape[-2:]
+    points = _grid_points(h, w, stride, obj.device, torch.float32)
+    reg = pred["reg"].float().flatten(2)
+    for b, flat, g in matches:
+        distance = reg[b, :, flat] * reg_scale * stride
+        predicted_box = boxes_from_distances(points[flat:flat + 1], distance[None])
+        gt = targets[b]["boxes"][g:g + 1].to(device=obj.device, dtype=torch.float32)
+        quality[b, flat] = box_iou(predicted_box, gt)[0, 0].clamp(min=quality_floor, max=1.)
+        positive[b, flat] = True
+    return quality, positive
+
+
 # --------------------------------------------------------------------------------------
 # Combined detection loss
 # --------------------------------------------------------------------------------------
 class DetectionLoss(nn.Module):
     assignment_version = "geometry_feasible_v1"
+    objective_version = "balanced_cls_iou_obj_v2"
 
     def __init__(self, cfg):
         super().__init__()
@@ -210,26 +274,37 @@ class DetectionLoss(nn.Module):
         self.o2o_candidates = int(cfg.train.get("o2o_candidates", 1600))
         self.o2o_neg_ratio = float(cfg.train.get("o2o_neg_ratio", 0.02))
         self.o2o_min_neg = int(cfg.train.get("o2o_min_neg", 2048))
+        self.cls_min_neg = int(cfg.train.get("cls_min_neg", 256))
+        self.cls_neg_ratio = float(cfg.train.get("cls_neg_ratio", 3.))
+        self.o2o_quality_floor = float(cfg.train.get("o2o_quality_floor", .05))
+        if self.cls_min_neg < 1 or not math.isfinite(self.cls_neg_ratio) or self.cls_neg_ratio < 0:
+            raise ValueError("cls_min_neg must be positive and cls_neg_ratio finite/nonnegative")
+        if not 0 <= self.o2o_quality_floor < 1:
+            raise ValueError("o2o_quality_floor must be in [0,1)")
 
     def forward(self, preds, targets, img_size):
         device = preds[0]["cls"].device
         losses = {k: torch.zeros((), device=device) for k in
                   ("cls_o2m", "box_o2m", "obj_o2m", "cls_o2o", "box_o2o", "obj_o2o", "fg_align")}
 
+        matches = hungarian_match(preds, targets, self.strides, self.nc,
+                                  self.reg_scale, self.o2o_candidates)
+        n_gt = sum(len(target["boxes"]) for target in targets)
+        n_assigned = sum(len(group) for group in matches)
+        self.last_assignment = {"matched_gt": n_assigned, "total_gt": n_gt,
+                                "unmatched_gt": n_gt - n_assigned}
+
         # ---------- one-to-many dense branch ----------
         for si, p in enumerate(preds):
             stride = self.strides[si]
             t_cls, t_reg, t_qual, t_fg, pos, pts = build_dense_targets(
-                p, targets, stride, self.nc, self.reg_scale)
+                p, targets, stride, self.nc, self.reg_scale, matches=matches[si])
             B, _, H, W = p["cls"].shape
             HW = H * W
 
             cls = p["cls"].reshape(B, self.nc, HW)
-            target = t_cls * t_qual
-            ce = F.binary_cross_entropy_with_logits(cls, target, reduction="none")
-            mod = (cls.sigmoid() - target).abs().pow(2)
-            cw = self.class_weights[None, :, None]
-            losses["cls_o2m"] = losses["cls_o2m"] + (ce * mod * cw).sum() / (pos.sum() + 1.0)
+            losses["cls_o2m"] = losses["cls_o2m"] + balanced_class_focal_loss(
+                cls, t_cls, self.class_weights, self.cls_min_neg, self.cls_neg_ratio)
 
             bce_obj = F.binary_cross_entropy_with_logits(p["obj"].reshape(B, 1, HW), t_qual,
                                                          reduction="none")
@@ -254,28 +329,20 @@ class DetectionLoss(nn.Module):
                     F.binary_cross_entropy_with_logits(p["fg"].reshape(B, 1, HW), t_fg)
 
         # ---------- one-to-one deployed branch ----------
-        matches = hungarian_match(preds, targets, self.strides, self.nc,
-                                  self.reg_scale, self.o2o_candidates)
-        n_gt = sum(len(target["boxes"]) for target in targets)
-        n_assigned = sum(len(group) for group in matches)
-        self.last_assignment = {"matched_gt": n_assigned, "total_gt": n_gt,
-                                "unmatched_gt": n_gt - n_assigned}
         for si, p in enumerate(preds):
             stride = self.strides[si]
             B, _, H, W = p["cls"].shape
             HW = H * W
             obj = p["obj_o2o"].reshape(B, -1)
-            t_obj = torch.zeros_like(obj)
-            for b, flat, _ in matches[si]:
-                t_obj[b, flat] = 1.0
+            t_obj, obj_positive = build_o2o_quality_targets(
+                p, matches[si], targets, stride, self.reg_scale, self.o2o_quality_floor)
             bce = F.binary_cross_entropy_with_logits(obj, t_obj, reduction="none")
             n_pos = len(matches[si])
             n_neg = o2o_negative_count(B * HW, n_pos, self.o2o_neg_ratio,
                                        self.o2o_min_neg)
-            pos_loss = (bce * t_obj).sum() / float(max(1, n_pos))
+            pos_loss = bce[obj_positive].sum() / float(max(1, n_pos))
             if n_neg:
-                neg_loss = torch.topk((bce * (1 - t_obj)).reshape(-1),
-                                      k=n_neg).values.mean()
+                neg_loss = bce[~obj_positive].topk(n_neg).values.mean()
             else:
                 neg_loss = obj.new_zeros(())
             losses["obj_o2o"] = losses["obj_o2o"] + pos_loss + neg_loss

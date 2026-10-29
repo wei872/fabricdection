@@ -194,6 +194,8 @@ def dinov2_vits14(pretrained=True):
             state = torch_load(out / "last.pt", map_location="cpu")
             self.assertEqual(state["train"]["backbone"], "dinov2")
             self.assertEqual(state["train"]["assignment_version"], "geometry_feasible_v1")
+            self.assertEqual(state["train"]["objective_version"], "balanced_cls_iou_obj_v2")
+            self.assertIn("objective=balanced_cls_iou_obj_v2", text)
             self.assertLess(state["train"]["iter"], 2)
             previous_best = (out / "best.pt").read_bytes()
             previous_last = (out / "last.pt").read_bytes()
@@ -216,6 +218,10 @@ def dinov2_vits14(pretrained=True):
             legacy = dict(state)
             legacy["train"] = dict(state["train"])
             legacy["train"].pop("assignment_version")
+            legacy["train"].pop("objective_version")
+            legacy["train"].pop("architecture")
+            legacy["model"] = {k: v for k, v in state["model"].items()
+                               if not k.startswith("backbone.local_detail.")}
             legacy_path = root / "legacy.pt"
             torch.save(legacy, legacy_path)
             rejected = subprocess.run([sys.executable, "tools/train_detector.py", "--cfg", str(config),
@@ -223,10 +229,11 @@ def dinov2_vits14(pretrained=True):
                                        "--val-interval", "0", "--resume", str(legacy_path), "--out", str(root / "reject")],
                                       cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
             self.assertNotEqual(rejected.returncode, 0)
-            self.assertIn("older matching objective", rejected.stderr)
+            self.assertIn("older/different training objective", rejected.stderr)
             self.assertIn("--pretrained", rejected.stderr)
             text = run(root / "warm", "--pretrained", str(legacy_path), "--lr", "0.0001")
             self.assertIn("mode=weights-only", text)
+            self.assertIn("initialized NEW detail branches", text)
             self.assertIn("global_iter=0", text)
             fresh = torch_load(root / "warm" / "last.pt", map_location="cpu")
             self.assertEqual(fresh["scheduler"]["base_lrs"], [.0001])

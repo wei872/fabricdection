@@ -8,4 +8,5 @@ scipy>=1.10              # one-to-one Hungarian assignment
 # DINOv2 source and official weights are loaded through torch.hub or local paths.
 # xFormers is optional; standard PyTorch attention works without it.
 # Optional, only for experimental tools/export.py:
-# onnx>=1.14
+# Install together to preserve torch 2.2 / NumPy 1.x ABI compatibility:
+# pip install "numpy<2" "ml_dtypes<0.6" onnx onnxruntime

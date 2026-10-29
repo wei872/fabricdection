@@ -1,8 +1,8 @@
 """Direct, pretrained DINOv2 detection backbone (NOT offline distillation).
 
 A frozen ViT supplies four intermediate maps to trainable pyramid adapters.
-The encoder remains in the inference graph. Resize interpolates features; it
-cannot recover small details lost at the configured encoder input resolution.
+The encoder remains in the inference graph. A separate native RGB detail
+branch augments P3; interpolation of ViT maps alone cannot recover lost detail.
 """
 from contextlib import nullcontext
 from pathlib import Path
@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .detail import LocalDetail
 from .layers import ConvBNAct
 from .utils import torch_load
 
@@ -58,6 +59,7 @@ class DINOv2Backbone(nn.Module):
         self.out_channels = tuple(int(m[k] * m.width)
                                   for k in ("detail_ch", "p3_ch", "p4_ch", "p5_ch"))
         self.strides = (4, 8, 16, 32)
+        self.local_detail = LocalDetail(self.out_channels[1]) if m.get("local_detail", True) else None
         self.adapters = nn.ModuleList(ConvBNAct(dim, c, 1) for c in self.out_channels)
         self.register_buffer("mean", torch.tensor([.485, .456, .406]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([.229, .224, .225]).view(1, 3, 1, 1))
@@ -84,6 +86,9 @@ class DINOv2Backbone(nn.Module):
                   for i, (name, adapter, feat, stride) in enumerate(
                       zip(("d", "p3", "p4", "p5"), self.adapters, maps, self.strides))
                   if include_detail or i > 0}
+        if self.local_detail is not None:
+            # Real native pixels, not another interpolation of 16x16 ViT maps.
+            output["p3"] = output["p3"] + self.local_detail((x - self.mean) / self.std)
         if return_raw:
             output["raw"] = maps[1]  # intermediate texture features; same ViT pass
         return output

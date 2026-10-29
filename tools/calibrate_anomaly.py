@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader
 
 from _common import data_paths, load_model, resolve, save_checkpoint
 from jingwei.data import NormalImageDataset, collate
+from jingwei.novelty import texture_descriptor
 
 
 def conformal_threshold(scores, target_fpr):
@@ -35,6 +36,8 @@ def main():
     model, cfg = load_model(args.cfg, args.ckpt, args.device)
     if model.novelty is None or model.novelty.updates.item() == 0:
         ap.error("Need unknown.enabled and prototypes trained on normaltrain")
+    if model.novelty.texture is not None and int(model.novelty.texture.updates) == 0:
+        ap.error("Native texture prototypes are untrained; first train with normaltrain, not normalcal")
     if args.half and not args.device.startswith("cuda"):
         ap.error("--half requires CUDA")
     model.eval()
@@ -56,7 +59,8 @@ def main():
         if args.half:
             x = x.half()
         features = model.backbone(x, return_raw=True, include_detail=False)["raw"]
-        scores.extend(model.novelty.score(features).flatten(1).amax(1).cpu().tolist())
+        texture = texture_descriptor(x) if model.novelty.texture is not None else None
+        scores.extend(model.novelty.score(features, texture).flatten(1).amax(1).cpu().tolist())
     threshold = conformal_threshold(scores, args.target_fpr)
     model.novelty.threshold.fill_(threshold)
     model.novelty.calibration_shape.copy_(torch.tensor([model.backbone.encoder_size, int(cfg.input_size[0])], device=model.novelty.calibration_shape.device))

@@ -33,7 +33,7 @@ def main():
     try:
         import onnx
     except ImportError as exc:
-        raise SystemExit("ONNX export requires: pip install onnx") from exc
+        raise SystemExit('ONNX export requires: pip install "numpy<2" "ml_dtypes<0.6" onnx') from exc
     model, cfg = load_model(args.cfg, args.ckpt, args.device)
     if model.novelty is not None and not args.known_only:
         ap.error("Six-tensor ONNX contains known detection only; explicitly pass --known-only")

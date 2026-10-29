@@ -1,4 +1,4 @@
-"""Bounded online normal prototypes on SHARED frozen DINOv2 patch features.
+"""Bounded normal prototypes on shared DINOv2 and fixed native texture features.
 
 This is a novelty heuristic, not a guarantee of open-set recall. No second ViT,
 full patch memory bank, fabricated unknown class labels or anomaly training GT.
@@ -10,9 +10,27 @@ from torch import nn
 import torch.nn.functional as F
 
 
+def texture_descriptor(x):
+    """Frozen stride-8, 65-D native-pixel descriptor for unknown textures.
+
+    Retain all 64 grayscale samples per 8x8 patch, subtract patch brightness,
+    and add a reference coordinate so flat normal patches are nonzero vectors.
+    Normalize by image contrast with a noise floor. Brightness offsets and
+    non-clipped global contrast changes above that floor are normalized; this
+    is NOT general illumination/fabric-domain invariance. Validate separately.
+    """
+    gray = x.detach().float().mean(1, keepdim=True)
+    patches = F.pixel_unshuffle(gray, 8)
+    scale = (gray - gray.mean((2, 3), keepdim=True)).square().mean((2, 3), keepdim=True).sqrt().clamp(min=.05)
+    contrast = (patches - patches.mean(1, keepdim=True)) / scale
+    return torch.cat((contrast, torch.ones_like(patches[:, :1])), 1)
+
+
 class NormalPrototypes(nn.Module):
-    def __init__(self, dim, k=32, momentum=.95, min_patches=1, max_regions=8):
+    def __init__(self, dim, k=32, momentum=.95, min_patches=1, max_regions=8, texture_detail=False):
         super().__init__()
+        self.texture = (NormalPrototypes(65, k, momentum, min_patches, max_regions)
+                        if texture_detail else None)
         self.momentum = float(momentum)
         self.min_patches, self.max_regions = int(min_patches), int(max_regions)
         self.register_buffer("centers", torch.zeros(k, dim))
@@ -32,9 +50,11 @@ class NormalPrototypes(nn.Module):
         return self
 
     @torch.no_grad()
-    def update(self, features):
+    def update(self, features, texture=None):
         if features.numel() == 0:
             return
+        if self.texture is not None and texture is None:
+            raise ValueError("Native texture features are required for this novelty model")
         patches = F.normalize(features.detach().float().permute(0, 2, 3, 1).reshape(-1, features.shape[1]), dim=1)
         # Bound training-time initialization/update work, without retaining images.
         if len(patches) > 2048:
@@ -56,21 +76,34 @@ class NormalPrototypes(nn.Module):
             means = sums[used] / counts[used, None]
             self.centers[used] = F.normalize(self.momentum * self.centers[used].float()
                                             + (1 - self.momentum) * means, dim=1).to(self.centers.dtype)
+        if self.texture is not None:
+            self.texture.update(texture)
         self.updates.add_(1)
         # Any update invalidates a previously calibrated threshold.
         self.calibrated.fill_(False)
 
-    def score(self, features):
+    def score(self, features, texture=None):
         if self.updates.item() == 0:
             raise RuntimeError("Normal prototypes are untrained; supply normaltrain during training")
         z = F.normalize(features.float(), dim=1)
         similarity = torch.einsum("bchw,kc->bkhw", z, F.normalize(self.centers.float(), dim=1))
-        return (1 - similarity.amax(1)).clamp(0, 2)
+        semantic = (1 - similarity.amax(1)).clamp(0, 2)
+        if self.texture is None:
+            return semantic
+        if texture is None:
+            raise ValueError("Native texture features are required for this novelty model")
+        fine = self.texture.score(texture)
+        semantic = F.interpolate(semantic[:, None], size=fine.shape[-2:],
+                                 mode="bilinear", align_corners=False)[:, 0]
+        # Fixed score function; calibrate its IMAGE MAX jointly, not two
+        # separately calibrated alerts (which would inflate the union FPR).
+        return torch.maximum(semantic, fine)
 
     @torch.no_grad()
-    def regions(self, features, img_size):
-        maps = self.score(features)
-        # One small device->host transfer per batch, not a full-resolution map.
+    def regions(self, features, img_size, texture=None):
+        maps = self.score(features, texture)
+        # One stride-8 (or legacy semantic-grid) transfer per batch, not a
+        # full-resolution image. Include this and connected components in FPS.
         maps_np = maps.detach().float().cpu().numpy()
         threshold = float(self.threshold)
         result = []

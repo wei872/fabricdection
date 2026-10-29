@@ -249,6 +249,41 @@ def restore_rng_state(state: dict, dataset=None) -> None:
                     "training continues with the seeded generator")
 
 
+def restore_detector_weights(model, weights, allow_detail_upgrade=False):
+    """Strict restore except for explicit, complete new-detail additions.
+
+    Never permit a partly missing branch or missing old encoder/head tensors.
+    Evaluation and full resume remain strict: random detail weights must not
+    silently enter an inference artifact or reuse an incompatible optimizer.
+    """
+    current = model.state_dict()
+    missing = set(current) - set(weights)
+    unexpected = set(weights) - set(current)
+    allowed = set()
+    upgraded = []
+    for prefix in ("backbone.local_detail.", "novelty.texture."):
+        branch = {k for k in current if k.startswith(prefix)}
+        if branch and branch <= missing:
+            allowed.update(branch)
+            upgraded.append(prefix)
+    if allow_detail_upgrade and missing and missing == allowed and not unexpected:
+        # Check shapes before loading anything, including old tensors.
+        if any(current[k].shape != weights[k].shape for k in weights):
+            raise RuntimeError("Checkpoint tensor shapes differ; detail-only migration refused")
+        model.load_state_dict(weights, strict=False)
+        if getattr(model, "novelty", None) is not None:
+            model.novelty.calibrated.fill_(False)
+        log("--pretrained: initialized NEW detail branches: " + ", ".join(upgraded) +
+            "; old encoder/adapters/head restored; unknown must be recalibrated")
+    else:
+        try:
+            model.load_state_dict(weights, strict=True)
+        except RuntimeError as exc:
+            raise RuntimeError(str(exc) + "\nUse --pretrained with a NEW --out for detail-branch migration. "
+                               "For legacy inference use a config with model.local_detail=false and "
+                               "unknown.texture_detail=false; never silently initialize inference weights.") from exc
+
+
 def resume_checkpoint(state_or_path, model, optimizer=None, scheduler=None,
                       dataset=None, device="cpu", scaler=None) -> dict:
     """Strict detector restore. Passing an optimizer requires full train state.
@@ -272,7 +307,7 @@ def resume_checkpoint(state_or_path, model, optimizer=None, scheduler=None,
         if meta.get("backbone") != "dinov2":
             raise ValueError("--resume requires a direct DINOv2 detector checkpoint")
 
-    model.load_state_dict(state.get("model", state), strict=True)
+    restore_detector_weights(model, state.get("model", state), allow_detail_upgrade=not full)
     if full:
         optimizer.load_state_dict(state["optimizer"])
         for st in optimizer.state.values():
@@ -313,7 +348,7 @@ def load_model(cfg_path: str, ckpt: str | None = None, device="cpu",
         cfg.model.dino_pretrained = original
     if ckpt:
         state = load_checkpoint(ckpt)
-        model.load_state_dict(state.get("model", state), strict=True)
+        restore_detector_weights(model, state.get("model", state))
     return model.to(device), cfg
 
 
@@ -349,6 +384,9 @@ def configure_inference(model, known_only=False, half=False):
         if not bool(novelty.calibrated) or int(novelty.updates) == 0:
             raise ValueError("Unknown detection is not calibrated. Run tools/calibrate_anomaly.py "
                              "or explicitly use --known-only (no unknown detection).")
+        if novelty.texture is not None and int(novelty.texture.updates) == 0:
+            raise ValueError("Native texture prototypes are untrained; warm-start training on normaltrain "
+                             "and recalibrate before enabling unknown detection")
         if novelty.calibration_shape.tolist() != [model.backbone.encoder_size, int(model.img_size[0])]:
             raise ValueError("Input sizes differ from novelty calibration; recalibrate for this configuration")
         if int(novelty.precision_bits) != (16 if half else 32):

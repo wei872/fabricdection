@@ -263,3 +263,63 @@ python tools/train_detector.py --data configs/fabric19.yaml --resume runs/dinov2
 早期版本没有这项保护：若已在旧目录重新运行，新训练首轮的 `best_score` 从 -1 开始，
 即使验证 F1=0 也可能覆盖旧 `best.pt`，`last.pt` 则每轮覆盖。
 本次保护不能找回已经覆盖的权重；应从先前备份或轮次快照恢复，而不是假定原 best 仍在。
+
+## 11. 原图细节支路与质量监督（新训练版本）
+
+### 为什么不只把 224 插值为 640
+
+ViT-S/14 在 224 输入下输出 16×16 patch 特征，插值不能恢复被缩放丢掉的细纹理。
+默认保持官方 ViT-S/14、224 输入和一次 ViT 前向，同时增加两条真实原图信息通路：
+
+- **已知检测**：`model.local_detail=true`。640 RGB 先用无损 `PixelUnshuffle(2)`
+  打包原始 2×2 邻域，再用 16/24/32 通道深度可分离卷积降到 stride 8。
+  经过小幅可学习残差门，与 DINO P3 融合；不增加检测尺度，输出格式不变。
+  默认 P3=48 通道时新增 **4,857 参数**；640 下卷积 **57,702,400 MAC**。
+  后续卷积降采样不是无损的，不能声称任意小疵点都保留／都可检出。
+- **未知检测**：`unknown.texture_detail=true`。在冻结 DINO 正常原型之外，增加
+  原图 stride-8 的 65 维固定灰度纹理描述子原型。每个 8×8 patch 的全部 64 个灰度样本
+  经去局部均值、图像对比度归一化（噪声下限 0.05），再附加参考维，避免平坦块成为零向量。
+  该描述子不依赖训练中的 CNN 参数，因此原型不会因检测支路学习而漂移。
+  两个距离图取逐点最大值，再对合并图的**图像最大分数统一独立校准**，不是两个告警分别校准后直接 OR。
+  640 下未知图从 16×16 提高为 80×80；32 原型的新增相似度计算约 13.3M MAC，区域后处理也增加工作量。
+  去均值／对比度归一化不等于对阴影、饱和、局部照明和不同经纬密度具有泛化保证。
+
+`--known-only` 不计算未知纹理描述子／原型分数。校准、预测、评估和设备基准使用同一新未知路径。
+ONNX 仍仅导出已知检测的六个张量（含原图 CNN），不包含未知描述子／原型／区域提取。
+可选 ONNX 工具安装：`pip install "numpy<2" "ml_dtypes<0.6" onnx onnxruntime`，避免新依赖拉入
+与旧 torch 二进制不兼容的 NumPy 2。ONNX 的本地轻量假 encoder 测试不代表官方 ViT 导出已经验收。
+
+### 同时修正监督冲突
+
+- Dense 分类使用明确的类别 0/1 目标，不再乘当前预测 CIoU；初始框差也不能把正确类别变成负样本。
+- 逐图分别归一化分类正样本和 hard negatives；正常图不再按全部网格／全部类别累加未归一化负损失。
+  默认 `cls_min_neg=256`、`cls_neg_ratio=3.0`。
+- Hungarian 正样本覆盖对应 dense 单元的类别／回归目标，避免中心采样之外的 deployed 正样本被 dense 当成负样本，
+  或同一单元在两个分支上回归不同 GT。
+- 部署 objectness 的匹配正样本目标改为 detached **IoU**，不是无论定位好坏都置为 1。
+  默认 `o2o_quality_floor=0.05` 帮助初期启动；使用独立布尔正样本 mask，低质量匹配绝不混进负样本挖掘。
+- 回归公式、匹配几何约束、学习率、推理分数乘积、默认阈值和 NMS 均未因此更改。
+  损失定义／尺度已变化，新旧 loss 数字不能直接当作精度提升比较。
+
+### 从已有权重迁移：不覆盖旧实验
+
+```bat
+python tools/train_detector.py --data configs/fabric19.yaml --pretrained runs/dinov2s/best.pt --epochs 30 --batch 2 --val-batch 1 --amp off --save-interval 5 --out runs/dinov2s_detail
+```
+
+权重迁移**只**允许完整缺失的新 `backbone.local_detail.*` 和／或 `novelty.texture.*`：
+旧 encoder、适配器和 head 必须完整且形状一致。启动日志明确报告新初始化支路，并撤销旧未知校准。
+缺失旧 head／encoder、只缺一部分新支路、形状不同均拒绝，不使用宽泛的 `strict=False` 掩盖坏 checkpoint。
+旧架构不能直接推理为新架构；若只想评估旧 checkpoint，应在配置副本设置
+`model.local_detail=false`、`unknown.texture_detail=false`，保留旧架构推理。
+
+`objective_version=balanced_cls_iou_obj_v2` 与 `architecture` 签名保存在 best/last。
+旧目标或不同细节开关的 full `--resume` 拒绝；使用 `--pretrained` 新目录启动。
+新版本同架构的 `last.pt` 可正常完整续训。
+
+新模型必须在 `normaltrain` 更新两个正常原型库后，用独立 `normalcal` **重新校准**；
+不能继承旧 unknown 阈值。校准后仍需验证 normalval、held-out unknownval、不同布卷／光照。
+
+**测试验证信息通路／梯度／迁移／导出一致性，不验证真实精确率。** 当前环境没有 CUDA，
+没有 GTX1660 实测；新增成本小不意味着完整已知＋未知链路已达到 30 FPS。
+验收仍必须包含原图处理、传输、模型、NMS、两个原型评分及未知区域后处理，不能只报 ViT 耗时。

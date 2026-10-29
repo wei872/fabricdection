@@ -76,6 +76,10 @@ def load_config(path: str | Path) -> Cfg:
             raise ValueError("unknown.momentum must be in [0,1)")
     if not 0 < float(raw["train"].get("normal_ratio", .5)) < 1:
         raise ValueError("train.normal_ratio must be between 0 and 1")
+    if not isinstance(raw["model"].get("local_detail", True), bool):
+        raise ValueError("model.local_detail must be a boolean")
+    if not isinstance(u.get("texture_detail", True), bool):
+        raise ValueError("unknown.texture_detail must be a boolean")
     cfg = Cfg(raw)
     cfg["_config_path"] = str(path)
     return cfg
