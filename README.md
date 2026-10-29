@@ -104,6 +104,10 @@ python tools/evaluate.py --data configs/fabric19.yaml --ckpt runs/dinov2s/best.p
 
 ## 恢复、文档与测试
 
+启动前会拒绝在非空 `--out` 中新训练／warm start，防止覆盖旧权重。中断续训用
+`--resume runs/dinov2s/last.pt --out runs/dinov2s`；不传初始化参数不是自动续训。
+同目录续训只允许该目录的 `last.pt`；从旧快照分支继续请另开目录。详见训练手册第 10 节。
+
 `--resume runs/dinov2s/last.pt` 恢复完整训练状态；`--pretrained` 是完整检测权重的显式 warm start。
 当前 ViT-S＋新尺寸／未知原型的结构不兼容此前 ViT-B 检测 checkpoint，需要重新训练。
 数据和旧权重文件不删除。

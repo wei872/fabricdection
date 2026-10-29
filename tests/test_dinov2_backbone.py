@@ -195,10 +195,23 @@ def dinov2_vits14(pretrained=True):
             self.assertEqual(state["train"]["backbone"], "dinov2")
             self.assertEqual(state["train"]["assignment_version"], "geometry_feasible_v1")
             self.assertLess(state["train"]["iter"], 2)
+            previous_best = (out / "best.pt").read_bytes()
+            previous_last = (out / "last.pt").read_bytes()
+            refused = subprocess.run([sys.executable, "tools/train_detector.py", "--cfg", str(config),
+                                      "--smoke", "2", "--epochs", "2", "--device", "cpu", "--out", str(out)],
+                                     cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("Refusing to overwrite", refused.stderr)
+            self.assertNotIn("FIXTURE", refused.stdout)  # no hub/model initialization
+            self.assertEqual((out / "best.pt").read_bytes(), previous_best)
+            self.assertEqual((out / "last.pt").read_bytes(), previous_last)
             text = run(root / "resume", "--resume", str(out / "last.pt"))
             self.assertIn("FIXTURE pretrained=False", text)
             self.assertIn("mode=full", text)
             self.assertIn("start_epoch=2/2", text)
+            in_place = run(out, "--resume", str(out / "last.pt"))
+            self.assertIn("mode=full", in_place)
+            self.assertIn("start_epoch=2/2", in_place)
             # Old objective metadata must not silently reuse optimizer state.
             legacy = dict(state)
             legacy["train"] = dict(state["train"])

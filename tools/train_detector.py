@@ -9,16 +9,16 @@ from __future__ import annotations
 
 import argparse
 import time
-from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from _common import (ROOT, SyntheticFabricDataset, collect_rng_state, data_paths,
+from _common import (SyntheticFabricDataset, collect_rng_state, data_paths,
                      format_eta, iter_speed, load_checkpoint, load_model, log,
                      make_dataset, resolve, resume_checkpoint, save_checkpoint,
                      set_global_seed, subset_indices)
 from evaluate import validate_detector
+from _run_dir import validate_output_dir
 from jingwei.data import MixedFabricDataset, collate, make_worker_init_fn
 from jingwei.utils import count_parameters
 
@@ -31,7 +31,8 @@ def main():
     ap.add_argument("--batch", type=int, default=None)
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--out", default="runs/detector_dinov2")
+    ap.add_argument("--out", default="runs/detector_dinov2",
+                    help="new/empty output directory, or the same run directory with --resume last.pt")
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--prefetch", type=int, default=2,
                     help="batches prefetched per worker (0 uses the torch default)")
@@ -72,6 +73,13 @@ def main():
     ap.add_argument("--val-iou", type=float, default=0.5,
                     help="IoU threshold for val TP matching")
     args = ap.parse_args()
+
+    # Fail before hub downloads, dataset workers and optimizer construction.
+    # Starting at epoch 1 in a reused run used to overwrite stronger best.pt.
+    try:
+        out = validate_output_dir(resolve(args.out), resolve(args.resume) if args.resume else None)
+    except (ValueError, OSError) as exc:
+        ap.error(str(exc))
 
     set_global_seed(args.seed)
     if str(args.device).startswith("cuda") and torch.cuda.is_available():
@@ -197,7 +205,6 @@ def main():
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, T_max=max(1, epochs * n_batches))
 
-    out = Path(args.out) if Path(args.out).is_absolute() else ROOT / args.out
     out.mkdir(parents=True, exist_ok=True)
 
     init_path = args.resume or args.pretrained
